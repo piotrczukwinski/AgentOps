@@ -145,4 +145,4 @@ def commit(repo: Path, message: str) -> str | None:
 
 
 def push(repo: Path, remote: str, branch: str) -> None:
-    run_git(repo, ["push", "origin", f"HEAD:{branch}"])
+    run_git(repo, ["push", remote, f"HEAD:{branch}"])
