@@ -3,7 +3,7 @@
   "roadmap_id": "local-shell-smoke",
   "repo": {
     "id": "agentops-smoke",
-    "path": "./examples/repos/local-shell-smoke",
+    "path": "/tmp/agentops-smoke",
     "base_branch": "HEAD"
   },
   "defaults": {

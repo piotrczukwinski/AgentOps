@@ -22,10 +22,14 @@ class TaskState(StrEnum):
     REVIEW_PACKET_READY = "review_packet_ready"
     CODEX_REVIEWING = "codex_reviewing"
     REVIEW_COMPLETED = "review_completed"
+    AWAITING_REVIEW = "awaiting_review"
+    AWAITING_HUMAN = "awaiting_human"
     REPAIR_PROMPT_READY = "repair_prompt_ready"
     REPAIR_RUNNING = "repair_running"
     ACCEPTED = "accepted"
     PUSHED = "pushed"
+    MERGED = "merged"
+    MERGE_FAILED = "merge_failed"
     BLOCKED = "blocked"
     SKIPPED = "skipped"
     FAILED = "failed"
@@ -34,6 +38,10 @@ class TaskState(StrEnum):
 TERMINAL_STATES = {
     TaskState.ACCEPTED,
     TaskState.PUSHED,
+    TaskState.MERGED,
+    TaskState.MERGE_FAILED,
+    TaskState.AWAITING_REVIEW,
+    TaskState.AWAITING_HUMAN,
     TaskState.BLOCKED,
     TaskState.SKIPPED,
     TaskState.FAILED,
@@ -53,6 +61,32 @@ class ReviewConfig:
     codex: str = "auto"  # auto|required|never|milestone_only
     risk_threshold: int = 4
     schema_path: str | None = None
+    # If true and codex is missing/disabled, route to heuristic reviewer.
+    fallback_heuristic: bool = False
+
+
+@dataclass(frozen=True)
+class MergePolicy:
+    """Roadmap-level merge gate for the integration branch.
+
+    The default is conservative: never merge to main/master/audit/* and never
+    fast-forward. Cherry-pick/FF into the integration branch is the MVP path
+    so the operator can review integration history.
+    """
+
+    auto_merge: bool = False
+    strategy: str = "cherry_pick"  # cherry_pick|ff|no_ff
+    require_clean_validations: bool = True
+    require_safe_to_merge: bool = True
+    protected_branches: tuple[str, ...] = ("main", "master", "audit/**", "release/**")
+
+
+@dataclass(frozen=True)
+class RoadmapPolicies:
+    forbidden_globs: tuple[str, ...] = ()
+    forbidden_branches: tuple[str, ...] = ("main", "master", "audit/**", "release/**")
+    merge: MergePolicy = field(default_factory=MergePolicy)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
 
 
 @dataclass(frozen=True)
@@ -77,6 +111,7 @@ class TaskConfig:
     auto_push: bool = False
     review: ReviewConfig = field(default_factory=ReviewConfig)
     executor_command: str | None = None
+    executor_options: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -90,6 +125,14 @@ class RoadmapConfig:
     policies: dict[str, Any] = field(default_factory=dict)
     runtime_budget: dict[str, Any] = field(default_factory=dict)
     path: Path | None = None
+    # Gated-roadmap runner settings.
+    integration_branch: str | None = None
+    merge_policy: MergePolicy = field(default_factory=MergePolicy)
+    continue_on_blocked: bool = False
+    max_tasks: int | None = None
+    max_attempts_per_task: int | None = None
+    review: ReviewConfig = field(default_factory=ReviewConfig)
+    reviewer: str = "codex"  # codex|heuristic
 
 
 @dataclass(frozen=True)
@@ -158,4 +201,6 @@ class ReviewVerdict:
     summary: str = ""
     blocking_issues: tuple[dict[str, Any], ...] = ()
     repair_prompt: str = ""
+    safe_to_push: bool = False
+    safe_to_merge: bool = False
     raw: dict[str, Any] = field(default_factory=dict)

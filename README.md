@@ -16,6 +16,42 @@ AgentOps deterministic control plane
 
 This is optimized for the observed failure mode where Codex token usage explodes when it polls logs, tails process output, or manually supervises a long-running executor.
 
+## Gated autonomous roadmap runner
+
+Roadmap files describe a graph of tasks; AgentOps is the executor of that graph.
+Per task attempt the runner is:
+
+```
+preflight -> workspace -> executor -> diff -> policy -> validation
+          -> review packet -> codex/heuristic -> verdict
+          -> repair (REQUEST_CHANGES) or finalize (ACCEPT) or block (BLOCK)
+          -> commit -> push -> merge into integration branch -> next task
+```
+
+Codex is **not** a live watcher. AgentOps owns the workspace, the logs, the
+diff, the policy, the review-packet assembly, the budget, the retry, the
+commit, the push, and the integration-branch merge. Codex only sees a
+bounded review packet and returns a structured JSON verdict
+(`ACCEPT` / `REQUEST_CHANGES` / `BLOCK`).
+
+```bash
+agentops run --roadmap examples/roadmaps/gated-shell-review-smoke.json --autonomous
+```
+
+The `--autonomous` flag falls back to a deterministic heuristic reviewer
+when codex is missing or the budget is exhausted, so a roadmap can run end
+to end without a human in the loop. Without `--autonomous`, tasks needing
+codex that have no available codex binary are moved to `awaiting_review`
+instead of being silently accepted. The operator can apply a verdict with:
+
+```bash
+agentops decide T1 --roadmap examples/roadmaps/gated-shell-review-smoke.json \
+    --verdict ACCEPT --safe-to-merge
+```
+
+See `docs/gated-roadmap-runner.md` for the full state machine, the verdict
+schema, and the integration-branch merge gate.
+
 ## Current MVP scope
 
 Implemented in this repository:
@@ -26,20 +62,36 @@ Implemented in this repository:
 - `worktree_branch` execution mode.
 - `gitless_mirror` execution mode scaffold with allowed-file copyback.
 - OpenCode/MiniMax runner that runs inside the executor workspace with secrets stripped.
+- Optional `--dangerously-skip-permissions` (yolo) flag for the opencode
+  executor; **disabled by default** and only enabled when the task (or its
+  roadmap defaults) explicitly set
+  `executor_options.dangerously_skip_permissions: true` (or the
+  `metadata.x_dangerously_skip_permissions` shorthand). Yolo never enables
+  itself from risk, kind, branch, or any other implicit signal.
 - Shell runner for local tests and deterministic harnesses.
-- Codex review runner using non-interactive `codex exec`.
+- Codex review runner using non-interactive `codex exec` with
+  `--sandbox read-only --ask-for-approval never` and a default
+  `--output-schema` pointing at `schemas/review_verdict.schema.json`
+  (overridable per-task or per-roadmap via `review.schema_path` or
+  `review.schema`).
 - Prompt compiler for executor, review, and repair prompts.
 - Allowed/forbidden file policy checks, including untracked-file detection.
 - Empty-diff detection: implementation tasks that produce no file changes are blocked.
-- Branch safety checks.
+- Branch safety checks, including protected-branch glob matching and protected
+  integration-branch merge blocking.
 - Validation command runner.
-- Review routing based on task risk and review policy.
-- CLI commands: `init`, `run`, `status`, `logs`, `artifacts`, `attempts`, `review-queue`, `export-summary`, `plan`, `doctor`.
+- Review routing based on task risk, validation outcome, and review policy.
+- Durability across attempts: workspace, branch, log, and verdict are all
+  recorded in SQLite and replayed on resume.
+- Integration-branch merge gate (`cherry_pick` / `ff` / `no_ff`) with
+  reviewer `safe_to_merge` enforcement and protected-branch refusal.
+- CLI commands: `init`, `run`, `status`, `logs`, `artifacts`, `attempts`,
+  `review-queue`, `export-summary`, `plan`, `doctor`, `review`, `decide`, `serve`.
 - Offline `plan` command for preflight linting of roadmaps.
+- Local browser UI over the same CLI/state (`agentops serve`, default `127.0.0.1:8765`).
 
 Not implemented yet:
 
-- Web UI.
 - GitHub PR creation and connector-based review.
 - Full budget pricing ledger.
 - Parallel scheduling.
@@ -74,7 +126,32 @@ agentops export-summary
 
 For a real MiniMax/OpenCode task, set `executor` to `opencode` and `model` to `minimax/MiniMax-M3` in the roadmap.
 
-See `docs/usability-mvp.md` for the full CLI reference and `docs/operator-runbook.md` for triage procedures.
+The gated runner smoke test:
+
+```bash
+agentops run --roadmap examples/roadmaps/gated-shell-review-smoke.json --no-codex
+agentops review-queue
+```
+
+See `docs/usability-mvp.md` for the full CLI reference, `docs/operator-runbook.md` for triage procedures, and `docs/gated-roadmap-runner.md` for the gated runner reference.
+
+## Local browser UI
+
+A small local-only dashboard is included as a thin layer over the CLI and
+the SQLite state. It runs on the Python standard library, binds to
+`127.0.0.1:8765` by default, and never executes arbitrary shell.
+
+```bash
+python -m agentops serve
+# AgentOps UI: http://127.0.0.1:8765
+```
+
+The UI shows task status, latest events, active run subprocesses, and
+per-task logs/artifacts. The "Run" button always passes `--no-codex`; to
+run with Codex, use the CLI directly.
+
+See `docs/local-web-ui.md` for the full description, safety notes, and
+recommended workflow.
 
 ## Safety defaults
 
@@ -83,7 +160,14 @@ See `docs/usability-mvp.md` for the full CLI reference and `docs/operator-runboo
 - `XDG_DATA_HOME` is removed from the executor environment rather than rewritten to `/tmp`.
 - AgentOps, not the executor, should own commit/push by default.
 - Protected branches and force-push/merge workflows are blocked by policy.
+- The integration branch default is non-protected; merging into
+  `main`/`master`/`audit/**`/`release/**` is refused at the merge gate.
 - Review model calls are read-only by default.
+- The OpenCode executor's `--dangerously-skip-permissions` (yolo) flag is
+  **off by default**. It is only set when the task (or its roadmap
+  defaults) explicitly opt in via `executor_options.dangerously_skip_permissions`
+  or `metadata.x_dangerously_skip_permissions`. **Do not enable yolo in any
+  environment that touches production data, secrets, or shared infrastructure.**
 
 ## Repository layout
 
@@ -92,7 +176,7 @@ agentops/
   artifacts.py       artifact paths and writes
   cli.py             argparse CLI
   config.py          JSON/YAML roadmap loading
-  git_ops.py         git worktree, diff, commit, push helpers
+  git_ops.py         git worktree, diff, commit, push, integration merge
   models.py          dataclasses and enums
   orchestrator.py    durable task loop
   policy.py          file and branch policy checks
@@ -101,12 +185,17 @@ agentops/
   runners.py         shell, OpenCode, and Codex subprocess runners
   state.py           SQLite schema and event log
   validation.py      validation command runner
+  web.py             local HTTP server and dashboard
 
 docs/
   architecture.md
   two-agent-strategy.md
   security.md
   roadmap-format.md
+  operator-runbook.md
+  usability-mvp.md
+  gated-roadmap-runner.md
+  local-web-ui.md
 
 examples/
   roadmaps/
@@ -114,6 +203,7 @@ examples/
 
 schemas/
   codex_review.schema.json
+  review_verdict.schema.json
 
 tests/
 ```
