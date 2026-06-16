@@ -21,7 +21,7 @@ from typing import Any
 from agentops.config import load_roadmap
 from agentops.models import ReviewVerdict, TaskState
 from agentops.orchestrator import Orchestrator, RunOptions
-from agentops.review import ReviewRouter
+from agentops.review import HeuristicReviewer, ReviewRouter
 from agentops.runners import build_codex_command
 from agentops.state import StateStore
 
@@ -125,6 +125,32 @@ class UnavailableCodexService(FakeCodexService):
     def __init__(self) -> None:
         super().__init__(verdicts=[])
         self.available = False
+
+
+class RecordingHeuristicReviewer(HeuristicReviewer):
+    """HeuristicReviewer subclass that records every call for test assertions.
+
+    The orchestrator falls back to the heuristic reviewer whenever the
+    :class:`ReviewRouter` decides ``run_codex=False``. Tests that want
+    to assert on the routing distribution (e.g. ``codex=required`` tasks
+    go to codex while ``codex=auto`` low-risk tasks go to heuristic)
+    can inject this subclass to observe which tasks were actually
+    triaged heuristically.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict[str, Any]] = []
+
+    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds):
+        self.calls.append(
+            {
+                "prompt": str(prompt_path) if prompt_path is not None else None,
+                "cwd": str(cwd),
+                "artifact_dir": str(artifact_dir),
+            }
+        )
+        return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -1563,6 +1589,311 @@ class StubCodexBinaryTests(unittest.TestCase):
             self.assertNotIn("task.accepted_by_review", events)
             self.assertNotIn("task.merged_to_integration", events)
             self.assertIn("task.awaiting_review", events)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end smoke for the committed example roadmap
+# ---------------------------------------------------------------------------
+
+
+class CommittedExampleRoadmapTests(unittest.TestCase):
+    """Run the committed ``gated-shell-review-smoke.json`` roadmap end-to-end.
+
+    The example references ``repo.path="."`` (the AgentOps checkout). To keep
+    the test offline and isolated, we copy the roadmap into a temp dir and
+    rewrite ``repo.path`` to point at a fresh throwaway git repository. The
+    prompts are loaded from the committed location so the test exercises the
+    real prompt files too.
+
+    The fake codex service replaces the real codex binary; no network is
+    touched.
+    """
+
+    def test_gated_shell_review_smoke_runs_to_accepted(self) -> None:
+        from dataclasses import replace
+
+        repo_root = Path(__file__).resolve().parent.parent
+        example_roadmap = repo_root / "examples" / "roadmaps" / "gated-shell-review-smoke.json"
+        self.assertTrue(example_roadmap.exists(), f"missing example roadmap: {example_roadmap}")
+        # The example must use the committed prompts by relative path.
+        example_prompt_a = repo_root / "examples" / "prompts" / "gated-task-001.md"
+        example_prompt_b = repo_root / "examples" / "prompts" / "gated-task-002.md"
+        self.assertTrue(example_prompt_a.exists(), f"missing committed prompt: {example_prompt_a}")
+        self.assertTrue(example_prompt_b.exists(), f"missing committed prompt: {example_prompt_b}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_repo = _init_repo(root)
+            # Load the committed roadmap directly so the relative ``../prompts/...``
+            # references resolve against the AgentOps checkout. We then override
+            # ``repo.path`` to the throwaway repo so the test stays isolated.
+            loaded = load_roadmap(example_roadmap)
+            self.assertEqual(loaded.roadmap_id, "gated-shell-review-smoke")
+            self.assertEqual(len(loaded.tasks), 2)
+            # Sanity: the task ids and prompts match the committed prompt files.
+            self.assertEqual(loaded.tasks[0].id, "GATED-001")
+            self.assertEqual(loaded.tasks[1].id, "GATED-002")
+            self.assertEqual(loaded.tasks[0].prompt_path.resolve(), example_prompt_a.resolve())
+            self.assertEqual(loaded.tasks[1].prompt_path.resolve(), example_prompt_b.resolve())
+            # The example auto-merges into the integration branch.
+            self.assertTrue(loaded.merge_policy.auto_merge)
+            self.assertEqual(loaded.integration_branch, "agentops/integration/smoke")
+
+            # Override repo.path to the throwaway repo so the test does not
+            # touch the AgentOps checkout. dataclasses.replace returns a new
+            # frozen instance.
+            target_repo_config = replace(loaded.repo, path=target_repo)
+            roadmap = replace(loaded, repo=target_repo_config)
+
+            state = StateStore(root / "state.sqlite")
+            fake = FakeCodexService(
+                [
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            # GATED-002 declares review.codex="auto" with risk=3 < threshold=4,
+            # a small diff, and no sensitive files; the ReviewRouter routes it
+            # to the deterministic heuristic reviewer instead of codex. Inject
+            # a recording heuristic so we can assert the exact routing
+            # distribution for the example.
+            rec_heuristic = RecordingHeuristicReviewer()
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+                heuristic_reviewer=rec_heuristic,
+            )
+            count = orch.run_roadmap(roadmap)
+            self.assertEqual(count, 2)
+            # GATED-001 is review.codex="required" -> exactly one codex call.
+            # GATED-002 is review.codex="auto" with low risk -> exactly one
+            # heuristic call.
+            self.assertEqual(
+                len(fake.calls),
+                1,
+                "GATED-001 (review.codex=required) must invoke codex exactly once",
+            )
+            self.assertEqual(
+                len(rec_heuristic.calls),
+                1,
+                "GATED-002 (review.codex=auto, low risk) must route to heuristic exactly once",
+            )
+
+            rows = {row["id"]: row for row in state.task_rows("gated-shell-review-smoke")}
+            # Both tasks must end up merged into the integration branch.
+            self.assertEqual(rows["GATED-001"]["state"], TaskState.MERGED.value)
+            self.assertEqual(rows["GATED-002"]["state"], TaskState.MERGED.value)
+
+            # The integration branch must exist on the throwaway repo and
+            # contain both output files.
+            git(target_repo, "checkout", "--quiet", "agentops/integration/smoke")
+            self.assertEqual(
+                (target_repo / "gated_out_001.txt").read_text(encoding="utf-8"),
+                "one\n",
+            )
+            self.assertEqual(
+                (target_repo / "gated_out_002.txt").read_text(encoding="utf-8"),
+                "two\n",
+            )
+            # Return to the seed branch so the temp dir teardown is clean.
+            git(target_repo, "checkout", "--quiet", "master" if (target_repo / ".git" / "refs" / "heads" / "master").exists() else "main")
+            # The base branch HEAD must still be the original seed commit
+            # (no spurious changes were merged into the protected branch).
+            head_files = git(target_repo, "ls-tree", "--name-only", "HEAD").split()
+            self.assertIn("README.md", head_files)
+            self.assertNotIn("gated_out_001.txt", head_files)
+            self.assertNotIn("gated_out_002.txt", head_files)
+
+            # Each task must have a documented artifact trail: prompt, diff,
+            # validations, and the review result. The recorded ``kind`` column
+            # is the short identifier (no file extension); the on-disk
+            # filename differs for codex (``review.result.json``) vs
+            # heuristic (``review.heuristic.json``) but the kind is the same.
+            for task_id in ("GATED-001", "GATED-002"):
+                artifact_kinds = {a["kind"] for a in state.artifacts_for_task(task_id)}
+                self.assertIn("executor_prompt", artifact_kinds, f"missing prompt artifact for {task_id}")
+                self.assertIn("diff_patch", artifact_kinds, f"missing diff for {task_id}")
+                self.assertIn("validation_result", artifact_kinds, f"missing validation result for {task_id}")
+                self.assertIn("review_result", artifact_kinds, f"missing review result for {task_id}")
+                self.assertIn("review_prompt", artifact_kinds, f"missing review prompt for {task_id}")
+
+            # Both integration-merge events must be present.
+            event_types = [
+                e["type"]
+                for e in state.latest_events(50)
+                if e["roadmap_id"] == "gated-shell-review-smoke"
+            ]
+            self.assertIn("task.merged_to_integration", event_types)
+
+            # The reviewer recorded in the DB must match the routing decision:
+            # GATED-001 (required) -> codex, GATED-002 (auto, low risk) -> heuristic.
+            with state.connect() as conn:
+                reviewer_rows = {
+                    row["task_id"]: row["reviewer"]
+                    for row in conn.execute(
+                        "SELECT task_id, reviewer FROM reviews WHERE roadmap_id=?",
+                        ("gated-shell-review-smoke",),
+                    ).fetchall()
+                }
+            self.assertEqual(reviewer_rows.get("GATED-001"), "codex")
+            self.assertEqual(reviewer_rows.get("GATED-002"), "heuristic")
+
+
+# ---------------------------------------------------------------------------
+# local-shell-smoke example: deterministic offline plan smoke
+# ---------------------------------------------------------------------------
+
+
+class LocalShellSmokeExampleTests(unittest.TestCase):
+    """The committed ``local-shell-smoke.json`` example hardcodes its
+    ``repo.path`` at ``/tmp/agentops-smoke`` (it must NOT live under
+    ``examples/`` to keep a ``.git`` directory out of the repo). The
+    docs include a setup snippet; this test mirrors that snippet in a
+    hermetic way so CI catches drift between the example, the docs, and
+    the lint rules.
+
+    A throwaway git repo is created inside a temp directory. If
+    ``/tmp/agentops-smoke`` does not already exist, it is symlinked at
+    the temp repo for the duration of the test and removed in
+    tearDownClass. The /tmp path is therefore never permanently
+    polluted. If ``/tmp/agentops-smoke`` already exists (e.g. an
+    operator set it up before running the tests), the test uses it as
+    is and does not touch it.
+    """
+
+    _shared_tmp: tempfile.TemporaryDirectory | None = None
+    _tmp_repo: Path | None = None
+    target: Path = Path("/tmp/agentops-smoke")
+    _existed_before: bool = False
+    _created_symlink: bool = False
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._shared_tmp = tempfile.TemporaryDirectory()
+        cls.tmp_repo = Path(cls._shared_tmp.name) / "agentops-smoke"
+        cls.tmp_repo.mkdir()
+        git(cls.tmp_repo, "init")
+        git(cls.tmp_repo, "config", "user.email", "agentops@example.invalid")
+        git(cls.tmp_repo, "config", "user.name", "AgentOps Test")
+        (cls.tmp_repo / "README.md").write_text("seed\n", encoding="utf-8")
+        git(cls.tmp_repo, "add", "README.md")
+        git(cls.tmp_repo, "commit", "-m", "initial")
+        cls._existed_before = cls.target.exists() or cls.target.is_symlink()
+        cls._created_symlink = False
+        if not cls._existed_before:
+            try:
+                cls.target.symlink_to(cls.tmp_repo)
+                cls._created_symlink = True
+            except FileExistsError:
+                # Race: another process created it between our checks.
+                cls._existed_before = True
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            if cls._created_symlink:
+                try:
+                    if cls.target.is_symlink() or cls.target.exists():
+                        cls.target.unlink()
+                except OSError:
+                    pass
+        finally:
+            if cls._shared_tmp is not None:
+                cls._shared_tmp.cleanup()
+                cls._shared_tmp = None
+
+    def setUp(self) -> None:
+        # In case a prior test method in this class deleted the symlink
+        # and never restored it (e.g. on a failed assert), re-create it.
+        if self._created_symlink and not (self.target.exists() or self.target.is_symlink()):
+            self.target.symlink_to(self.tmp_repo)
+
+    def _example_roadmap(self) -> Path:
+        repo_root = Path(__file__).resolve().parent.parent
+        return repo_root / "examples" / "roadmaps" / "local-shell-smoke.json"
+
+    def test_example_roadmap_exists(self) -> None:
+        self.assertTrue(
+            self._example_roadmap().exists(),
+            f"missing example roadmap: {self._example_roadmap()}",
+        )
+
+    def test_example_roadmap_loads_with_expected_shape(self) -> None:
+        roadmap = load_roadmap(self._example_roadmap())
+        self.assertEqual(roadmap.roadmap_id, "local-shell-smoke")
+        self.assertEqual(len(roadmap.tasks), 1)
+        task = roadmap.tasks[0]
+        self.assertEqual(task.id, "LOCAL-SHELL-SMOKE-001")
+        self.assertEqual(task.executor, "shell")
+        self.assertTrue(task.executor_command, "executor_command must be set")
+        # The prompt file should resolve to the committed docs.
+        self.assertEqual(
+            str(task.prompt_path),
+            str(self._example_roadmap().parent.parent / "prompts" / "local-shell-smoke.md"),
+        )
+
+    def test_lint_roadmap_passes_after_setup(self) -> None:
+        from agentops.plan import lint_roadmap
+
+        report = lint_roadmap(self._example_roadmap())
+        self.assertTrue(
+            report.ok,
+            f"plan failed: {report.to_dict()}",
+        )
+
+    def test_lint_roadmap_fails_loudly_when_repo_missing(self) -> None:
+        """If /tmp/agentops-smoke is removed mid-test, plan must report
+        a clear ``repo.missing`` error rather than silently succeeding."""
+        from agentops.plan import lint_roadmap
+
+        # Temporarily hide the target so plan must report repo.missing.
+        # This only happens when the test itself created the symlink;
+        # if /tmp/agentops-smoke existed before the test we must not
+        # delete it.
+        if not self._created_symlink:
+            self.skipTest("/tmp/agentops-smoke pre-existed; cannot safely hide it")
+        self.target.unlink()
+        try:
+            report = lint_roadmap(self._example_roadmap())
+            self.assertFalse(report.ok)
+            codes = {issue.code for issue in report.issues}
+            self.assertIn("repo.missing", codes)
+        finally:
+            # Restore the symlink so the rest of the class still works.
+            if not (self.target.exists() or self.target.is_symlink()):
+                self.target.symlink_to(self.tmp_repo)
+
+    def test_docs_contain_setup_command(self) -> None:
+        """The prompt docs must document the exact setup command so
+        operators do not need to guess why plan reports repo.missing."""
+        repo_root = Path(__file__).resolve().parent.parent
+        prompt_md = repo_root / "examples" / "prompts" / "local-shell-smoke.md"
+        self.assertTrue(prompt_md.exists(), f"missing prompt: {prompt_md}")
+        text = prompt_md.read_text(encoding="utf-8")
+        # The setup command must show every step needed to bootstrap
+        # the throwaway repo at the hardcoded path.
+        for needle in (
+            "/tmp/agentops-smoke",
+            "git init",
+            "git config user.email",
+            "git config user.name",
+            "git commit",
+            "agentops plan",
+            "agentops run",
+        ):
+            self.assertIn(needle, text, f"docs missing setup hint: {needle!r}")
+
+    def test_no_git_under_examples(self) -> None:
+        """The example must never depend on a .git directory inside
+        examples/ (that would be checked into the repo)."""
+        repo_root = Path(__file__).resolve().parent.parent
+        examples = repo_root / "examples"
+        offenders = [str(p) for p in examples.rglob(".git")]
+        self.assertEqual(offenders, [], f"unexpected .git under examples/: {offenders}")
 
 
 if __name__ == "__main__":

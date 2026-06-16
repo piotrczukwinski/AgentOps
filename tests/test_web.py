@@ -381,6 +381,113 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(resp.status, 400)
         self.assertIn("invalid JSON", data["error"])
 
+    def test_runs_endpoint_empty(self) -> None:
+        status, data = self._get("/api/runs")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["runs"], [])
+
+    def test_plan_endpoint_requires_roadmap(self) -> None:
+        status, data = self._post("/api/plan", {})
+        self.assertEqual(status, 400)
+        self.assertIn("roadmap is required", data["error"])
+
+    def test_run_endpoint_requires_roadmap(self) -> None:
+        status, data = self._post("/api/run", {"no_codex": True})
+        self.assertEqual(status, 400)
+        self.assertIn("roadmap is required", data["error"])
+
+    def test_index_html_does_not_contain_shell_endpoint(self) -> None:
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", "/")
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8")
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertIn("text/html", resp.getheader("Content-Type", ""))
+        # The dashboard must not advertise a generic shell/exec endpoint.
+        for forbidden in ("/api/exec", "/api/shell", "/api/command", "/api/run_command"):
+            self.assertNotIn(forbidden, body)
+        # It must reference the safe endpoints actually used by the
+        # dashboard JavaScript so the static contract is locked in.
+        for required in (
+            "/api/status",
+            "/api/roadmaps",
+            "/api/plan",
+            "/api/run",
+            "/api/logs",
+            "/api/artifacts",
+            "/api/runs",
+        ):
+            self.assertIn(required, body)
+        # The dashboard must never call the unsafe /codex/... endpoints
+        # (operator can still run with codex via the CLI).
+        self.assertNotIn("/api/codex", body)
+
+
+class WebApiMissingStateDbTests(unittest.TestCase):
+    """Lock down behavior when the state DB does not exist on disk yet.
+
+    The web UI must still return valid JSON for status/health so a fresh
+    checkout can boot the dashboard before the first roadmap run.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        # Intentionally do NOT create the SQLite file. StateStore is created
+        # but never .init()'d in setUp; the request handler is expected to
+        # call init() and create the schema on first request.
+        self.db = self.tmp / "state.sqlite"
+        self.store = StateStore(self.db)
+        self.port = _free_port()
+        self.server = web.make_server("127.0.0.1", self.port, state=self.store)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._stop_server)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                conn = HTTPConnection("127.0.0.1", self.port, timeout=1)
+                conn.connect()
+                conn.close()
+                return
+            except OSError:
+                time.sleep(0.05)
+        self.fail("server did not start")
+
+    def _stop_server(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _get(self, path: str) -> tuple[int, dict]:
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read()
+            return resp.status, json.loads(body.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def test_status_creates_db_and_returns_json(self) -> None:
+        self.assertFalse(self.db.exists(), "state DB must not exist before first request")
+        status, data = self._get("/api/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["task_count"], 0)
+        self.assertEqual(data["tasks"], [])
+        self.assertEqual(data["events"], [])
+        # The handler should have created the DB as a side effect.
+        self.assertTrue(self.db.exists(), "state DB should be created on first /api/status call")
+
+    def test_health_works_without_db(self) -> None:
+        status, data = self._get("/api/health")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+
 
 class WebEnvSafetyTests(unittest.TestCase):
     def test_safe_subprocess_env_strips_tokens(self) -> None:
