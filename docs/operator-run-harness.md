@@ -257,3 +257,199 @@ In short:
   dependencies. It adds a new module (`agentops.operator_run`) and
   four new subcommands to the CLI; it does not touch the existing
   runners, orchestrator, or state machine.
+
+## Transient failure recovery
+
+Long OpenCode/MiniMax runs can die because of a terminal disconnect,
+a computer reboot, an internet drop, an API timeout, a 429/502/503/504
+response, a temporary provider outage, or any other short-lived
+network failure. AgentOps should preserve the prompt, the logs, the
+status, and (when possible) the structured result, and should let
+the operator resume the work instead of losing the run.
+
+The Operator Run Harness supports two complementary recovery modes:
+
+1. **In-process retry.** When the operator passes
+   `--retry-on-transient`, the foreground runner classifies each
+   attempt's failure and, if it looks transient, sleeps for the
+   configured backoff and re-runs the same command. The CLI exits
+   0 on eventual success, 75 on a transient budget exhaustion.
+2. **Operator-driven retry.** When the original run finished
+   (transient or otherwise), the operator can use
+   `operator-retry <run-id>` to start a new attempt. The original
+   prompt, the original argv, the previous logs, and the previous
+   status are all preserved; the new attempt is written to its own
+   subdirectory.
+
+### Status model
+
+The harness records one of these statuses in `status.json`:
+
+| Status | Meaning |
+|---|---|
+| `pending` | The run directory was created but the executor has not started yet. (Legacy alias: `created`.) |
+| `running` | The executor subprocess is running. |
+| `retry_waiting` | A transient failure was classified and the harness is sleeping for the backoff. |
+| `retrying` | A retry attempt is in progress. |
+| `succeeded` | The last attempt exited 0 and an `AGENTOPS_RESULT_JSON` block was extracted (when present). (Legacy alias: `exited` with `exit_code=0`.) |
+| `failed` | The last attempt exited non-zero and the failure was classified as non-transient. (Legacy alias: `exited` with non-zero `exit_code`.) |
+| `transient_failed` | The retry budget was exhausted on a transient failure. |
+| `needs_operator` | Same as `transient_failed`; the operator asked for the explicit "needs attention" label via `operator-retry --needs-operator`. |
+| `exited` | Legacy alias. `operator-status` reports it as `succeeded` or `failed` based on `exit_code`. |
+
+`operator-status` overlays a `canonical_status` field on the
+persisted payload and a `runtime_status` that checks whether the
+recorded pid is still alive. A status of `running` with a dead pid
+is reported as `exited` (or `succeeded`/`failed` when `exit_code`
+is known). A status of `retrying` with a dead pid is reported as
+`exited_or_stale` with a note that the retry was interrupted.
+
+### Transient error classifier
+
+The classifier is a small, deterministic set of regex patterns
+applied to the executor's combined stdout and stderr. Non-transient
+patterns are checked first so that, for example, a "permission
+denied" line that also mentions a timeout is reported as a hard
+failure rather than a transient one.
+
+Transient:
+
+* DNS: `ENOTFOUND`
+* TCP: `ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `socket hang up`
+* HTTP: `429`, `502`, `503`, `504`, `rate limit`, `too many requests`,
+  `quota exceeded`, `temporarily unavailable`, `provider unavailable`,
+  `service unavailable`, `gateway timeout`, `upstream timeout`
+* Timeouts: `timeout`, `timed out`, `deadline exceeded`
+* Generic: `network error`, `API connection error`, `connection error/closed/dropped/failed`
+
+Non-transient:
+
+* Auth: `invalid API key`, `invalid authentication`, `unauthorized`,
+  `missing authentication header`, `no authentication header`,
+  `authentication required`
+* Permissions: `permission denied`, `forbidden`, `access denied`, `403 Forbidden`
+* Validation: `validation failed`, `schema validation error`,
+  `invalid request/input/arguments/parameters`
+* Code: `syntax error`, `parse error`, `indentation error`
+* Tests: `test(s) failed`, `N tests/assertions failed`, `pytest ... FAILED`,
+  `FAILED tests/...`, `assertionerror`
+* Policy: `policy violation/check failed`, `blocked by policy`,
+  `not allowed by policy`
+* Git: `git merge conflict`, `could not merge`, `merge conflict`
+* Prompt: `prompt too long`, `context length exceeded`
+
+If no pattern matches, the classifier falls back to the exit code:
+`0` is reported as a non-transient success, anything else as
+`unclassified_failure`. `operator-retry` will not auto-retry
+unclassified failures; the operator can still kick off a manual
+retry with `operator-retry`.
+
+### In-process retry examples
+
+```bash
+# Retry the same prompt up to 3 times on transient failure, with
+# 5s, 15s, 45s backoff between attempts. Default schedule.
+python -m agentops operator-run \
+  --name schema-recovery \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --retry-on-transient
+
+# Tighter budget: 2 retries, 1s between each. Useful for fast iteration.
+python -m agentops operator-run \
+  --name quick-retry \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --retry-on-transient \
+  --max-retries 2 \
+  --backoff 1,1
+
+# Detached mode: the retry policy is persisted in retry.json and
+# applied by future `operator-retry` invocations.
+python -m agentops operator-run \
+  --name detached-recovery \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --detach \
+  --retry-on-transient \
+  --max-retries 5 \
+  --backoff 10,30,60,120,300
+```
+
+When `--retry-on-transient` is set and the run ends with
+`transient_failed` (budget exhausted), the CLI exits with code 75
+(the conventional "temp fail" exit code). The status.json carries
+the `transient_reason`, the `attempt` counter, and the `max_retries`
+used.
+
+### `operator-retry`
+
+```bash
+python -m agentops operator-retry <run-id> --dir /home/czuki/AgentOps
+```
+
+Behaviour:
+
+* loads the original `prompt.md` and `command.json`,
+* computes the next attempt number and creates
+  `<run-dir>/attempts/<n>/`,
+* writes a per-attempt `prompt.md` (a verbatim copy of the original,
+  with an optional resume hint appended),
+* writes a per-attempt `command.json` (the exact argv the harness
+  used for this attempt),
+* runs the same command in the foreground, with the same retry
+  policy if `--retry-on-transient` is passed,
+* preserves every previous attempt's logs in `attempts/<n-1>/` etc.
+
+When the target workdir is a git repo with uncommitted changes,
+the retry appends a resume hint to the new prompt:
+
+```
+--- AgentOps resume hint ---
+Continue from the current working tree. Inspect `git status` first; do not restart from scratch.
+Previous attempt #N failed before this retry.
+Resume the same task; do not re-derive earlier work.
+```
+
+Pass `--no-resume-hint` to suppress the hint, or `--needs-operator`
+to rewrite the terminal status from `transient_failed` to
+`needs_operator` when the retry budget is exhausted.
+
+### Recovery after a terminal disconnect vs a full reboot
+
+* **Terminal disconnect / SSH drop.** The controlling terminal is
+  gone, but the process and the `.operator-runs/<run-id>/` directory
+  are still on disk. A detached subprocess is still running. The
+  operator can reattach with `operator-status`, `operator-tail`,
+  `operator-result`. To recover from a transient failure the operator
+  can run `operator-retry <run-id>`.
+* **Full reboot.** The subprocess and its tee threads are reaped by
+  the OS. `combined.log` is frozen at the last write. `operator-status`
+  reports the run as `exited` (because the recorded pid is no longer
+  alive). `operator-tail` still prints the captured output.
+  `operator-result` extracts the JSON if the executor had time to
+  print the marker before the reboot; if not, the operator should run
+  `operator-retry <run-id>` to start a new attempt with the same
+  prompt and the same argv.
+
+The workspace is preserved on disk: the per-run `prompt.md` and
+`command.json` survive a reboot, and each attempt's logs are kept in
+`attempts/<n>/` so the operator can review what the previous attempts
+actually did.
+
+### Why the recovery feature does not weaken any safety check
+
+* The retry policy is opt-in. The harness never retries unless the
+  operator passes `--retry-on-transient` (or the same flag on
+  `operator-retry`). The default CLI behaviour is unchanged.
+* The argv is still a list of strings, the env is still sanitized,
+  and the subprocess is still launched with `shell=False`.
+* The per-attempt `command.json` is the same shape as the original;
+  `operator-retry` never adds `--yolo` or any other flag the
+  operator did not pass originally.
+* The transient classifier is read-only and never blocks the run.
+  It only labels the failure; the operator decides whether to
+  retry.
+* The per-attempt directory layout (`attempts/<n>/`) keeps the
+  old logs untouched; nothing is overwritten and nothing is deleted.
+
