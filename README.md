@@ -25,15 +25,17 @@ Implemented in this repository:
 - Per-task artifacts under `.agentops/runs/<roadmap>/<task>/<attempt>/`.
 - `worktree_branch` execution mode.
 - `gitless_mirror` execution mode scaffold with allowed-file copyback.
-- OpenCode/MiniMax runner.
+- OpenCode/MiniMax runner that runs inside the executor workspace with secrets stripped.
 - Shell runner for local tests and deterministic harnesses.
 - Codex review runner using non-interactive `codex exec`.
 - Prompt compiler for executor, review, and repair prompts.
-- Allowed/forbidden file policy checks.
+- Allowed/forbidden file policy checks, including untracked-file detection.
+- Empty-diff detection: implementation tasks that produce no file changes are blocked.
 - Branch safety checks.
 - Validation command runner.
 - Review routing based on task risk and review policy.
-- CLI commands: `init`, `run`, `status`, `logs`, `export-summary`, `doctor`.
+- CLI commands: `init`, `run`, `status`, `logs`, `artifacts`, `attempts`, `review-queue`, `export-summary`, `plan`, `doctor`.
+- Offline `plan` command for preflight linting of roadmaps.
 
 Not implemented yet:
 
@@ -63,12 +65,16 @@ pip install -e '.[yaml]'
 ```bash
 agentops init
 agentops doctor
+agentops plan --roadmap examples/roadmaps/demo-shell.json   # offline lint
 agentops run --roadmap examples/roadmaps/demo-shell.json --no-codex
 agentops status
+agentops logs DEMO-SHELL-001
 agentops export-summary
 ```
 
 For a real MiniMax/OpenCode task, set `executor` to `opencode` and `model` to `minimax/MiniMax-M3` in the roadmap.
+
+See `docs/usability-mvp.md` for the full CLI reference and `docs/operator-runbook.md` for triage procedures.
 
 ## Safety defaults
 

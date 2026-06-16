@@ -50,8 +50,21 @@ class PolicyEngine:
         issues: list[PolicyIssue] = []
         allowed = task.allowed_files
         forbidden = self.global_forbidden + task.forbidden_globs
+        allow_any_files = bool(task.metadata.get("x_allow_any_files"))
+        allow_empty_diff = bool(task.metadata.get("x_allow_empty_diff"))
 
-        if not allowed and diff.changed_files and not task.metadata.get("x_allow_any_files"):
+        if not diff.changed_files and not allow_empty_diff:
+            # Review-only / analysis / observation tasks opt in explicitly via x_allow_empty_diff.
+            # Normal implementation tasks must produce at least one changed file.
+            issues.append(
+                PolicyIssue(
+                    "files.empty_diff",
+                    "critical",
+                    "Executor produced no file changes. Set x_allow_empty_diff: true on review-only tasks.",
+                )
+            )
+
+        if not allowed and diff.changed_files and not allow_any_files:
             issues.append(PolicyIssue("files.allowed_missing", "critical", "Task changed files but allowed_files is empty"))
 
         for path in diff.changed_files:

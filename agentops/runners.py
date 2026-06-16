@@ -19,6 +19,12 @@ TOKEN_ENV_NAMES = {
     "GIT_TOKEN",
     "CODEX_API_KEY",
     "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "HUGGINGFACE_API_KEY",
+    "HF_TOKEN",
 }
 
 
@@ -34,7 +40,7 @@ def executor_env() -> dict[str, str]:
 
 
 def reviewer_env() -> dict[str, str]:
-    # Reviewer can receive Codex/OpenAI auth via the parent process, but should never receive GitHub write tokens.
+    # Reviewer can keep model API keys, but must never receive GitHub write tokens.
     env = dict(os.environ)
     for name in {"GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PAT", "GIT_TOKEN"}:
         env.pop(name, None)

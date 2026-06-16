@@ -40,8 +40,16 @@ class Orchestrator:
         self.options = options or RunOptions()
 
     def run_roadmap(self, roadmap: RoadmapConfig) -> int:
+        if not roadmap.repo.path.exists():
+            raise FileNotFoundError(
+                f"Repo path does not exist: {roadmap.repo.path}. "
+                f"Run 'agentops plan --roadmap <path>' to validate the roadmap first."
+            )
         if not is_git_repo(roadmap.repo.path):
-            raise RuntimeError(f"Repo path is not a git repository: {roadmap.repo.path}")
+            raise RuntimeError(
+                f"Repo path is not a git repository: {roadmap.repo.path}. "
+                f"Initialize it with 'git init' and commit at least once before running AgentOps."
+            )
         self.state.init()
         self.state.import_roadmap(roadmap)
         policy = PolicyEngine(roadmap)
