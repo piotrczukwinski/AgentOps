@@ -42,14 +42,17 @@ def codex_command_for(
 
     The default shape is::
 
-        codex exec --sandbox read-only --ask-for-approval never
+        codex exec --sandbox read-only
                  [--output-schema <schema>] [-o <result>]
                  <prompt_path>
 
-    If the local Codex CLI uses different flags the orchestrator can override
-    the argv at runner construction time; this function is the single source
-    of truth for the conceptual command and is also what the unit tests
-    assert on.
+    The read-only sandbox is the safety contract. The older
+    ``--ask-for-approval never`` flag is not accepted by current codex-cli
+    builds (0.140.0+); the default approval policy on those builds is
+    ``never`` already, so the behaviour is equivalent. If the local Codex
+    CLI uses different flags the orchestrator can override the argv at
+    runner construction time; this function is the single source of truth
+    for the conceptual command and is also what the unit tests assert on.
     """
     return build_codex_command(
         prompt_path,

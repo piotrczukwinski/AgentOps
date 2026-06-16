@@ -70,10 +70,13 @@ Implemented in this repository:
   itself from risk, kind, branch, or any other implicit signal.
 - Shell runner for local tests and deterministic harnesses.
 - Codex review runner using non-interactive `codex exec` with
-  `--sandbox read-only --ask-for-approval never` and a default
-  `--output-schema` pointing at `schemas/review_verdict.schema.json`
-  (overridable per-task or per-roadmap via `review.schema_path` or
-  `review.schema`).
+  `--sandbox read-only` and a default `--output-schema` pointing at
+  `schemas/review_verdict.schema.json` (overridable per-task or per-roadmap
+  via `review.schema_path` or `review.schema`). The read-only sandbox is
+  the safety contract; on current `codex-cli` builds (0.140.0+) the default
+  approval policy is already `never`, so the older `--ask-for-approval
+  never` flag is omitted because the CLI rejects it as an unexpected
+  argument.
 - Prompt compiler for executor, review, and repair prompts.
 - Allowed/forbidden file policy checks, including untracked-file detection.
 - Empty-diff detection: implementation tasks that produce no file changes are blocked.
