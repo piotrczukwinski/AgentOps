@@ -17,8 +17,7 @@ def run_git(repo: Path, args: list[str], *, check: bool = True) -> subprocess.Co
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if check and result.returncode != 0:
@@ -136,10 +135,10 @@ def collect_diff(repo: Path, base_ref: str = "HEAD") -> DiffSnapshot:
 
         content = file_path.read_text(encoding="utf-8", errors="replace")
         untracked_patches.append(
-            "diff --git a/{0} b/{0}\n"
+            f"diff --git a/{path} b/{path}\n"
             "new file mode 100644\n"
             "--- /dev/null\n"
-            "+++ b/{0}\n".format(path)
+            f"+++ b/{path}\n"
             + _simple_added_patch(content)
         )
 

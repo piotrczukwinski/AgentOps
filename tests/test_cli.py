@@ -14,8 +14,7 @@ def git(repo: Path, *args: str) -> None:
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if result.returncode != 0:
@@ -28,9 +27,9 @@ class _Runner:
         self.stderr = ""
         self.returncode = 0
 
-    def run(self, argv: list[str]) -> "_Runner":
+    def run(self, argv: list[str]) -> _Runner:
         import io
-        from contextlib import redirect_stdout, redirect_stderr
+        from contextlib import redirect_stderr, redirect_stdout
 
         out, err = io.StringIO(), io.StringIO()
         try:

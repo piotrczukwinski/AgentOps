@@ -12,7 +12,7 @@ from agentops.state import StateStore
 
 
 def git(repo: Path, *args: str) -> None:
-    result = subprocess.run(["git", "-C", str(repo), *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    result = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, check=False)
     if result.returncode != 0:
         raise AssertionError(f"git {' '.join(args)} failed: {result.stderr}")
 

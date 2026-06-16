@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from .models import DiffSnapshot, PolicyResult, TaskConfig, ValidationResult
 from .policy import PolicyEngine
-
 
 EXECUTOR_CONTRACT = """# AgentOps executor contract
 
