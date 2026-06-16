@@ -361,6 +361,7 @@ def _task_to_jsonable(task: TaskConfig) -> dict[str, Any]:
             "schema_path": task.review.schema_path,
         },
         "executor_command": task.executor_command,
+        "executor_options": dict(task.executor_options or {}),
         "metadata": task.metadata,
     }
 

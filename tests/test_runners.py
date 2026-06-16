@@ -179,6 +179,109 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertTrue(result.timed_out)
             self.assertFalse(result.ok)
 
+    def test_yolo_flag_absent_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            artifact_dir = Path(tmp) / "artifacts"
+            artifact_dir.mkdir()
+            captured: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+                captured["command"] = command
+                return _FakeProc(returncode=0)
+
+            with mock.patch("agentops.runners.subprocess.run", side_effect=fake_run):
+                OpenCodeRunner().run(
+                    self._task(),
+                    prompt="x",
+                    cwd=workspace,
+                    artifact_dir=artifact_dir,
+                )
+            cmd = captured["command"]
+            self.assertNotIn("--dangerously-skip-permissions", cmd)
+
+    def test_yolo_flag_present_only_when_explicitly_configured_via_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            artifact_dir = Path(tmp) / "artifacts"
+            artifact_dir.mkdir()
+            captured: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+                captured["command"] = command
+                return _FakeProc(returncode=0)
+
+            task = self._task()
+            task = TaskConfig(**{**task.__dict__, "executor_options": {"dangerously_skip_permissions": True}})
+
+            with mock.patch("agentops.runners.subprocess.run", side_effect=fake_run):
+                OpenCodeRunner().run(
+                    task,
+                    prompt="x",
+                    cwd=workspace,
+                    artifact_dir=artifact_dir,
+                )
+            cmd = captured["command"]
+            self.assertIn("--dangerously-skip-permissions", cmd)
+            # cwd and --dir are still the workspace
+            self.assertIn("--dir", cmd)
+            dir_index = cmd.index("--dir")
+            self.assertEqual(cmd[dir_index + 1], str(workspace))
+            # subprocess cwd is the workspace, no shell=True
+            self.assertIsInstance(captured["command"], list)
+
+    def test_yolo_flag_present_when_metadata_x_dangerously_skip_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            artifact_dir = Path(tmp) / "artifacts"
+            artifact_dir.mkdir()
+            captured: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+                captured["command"] = command
+                return _FakeProc(returncode=0)
+
+            task = self._task()
+            task = TaskConfig(**{**task.__dict__, "metadata": {"x_dangerously_skip_permissions": True}})
+
+            with mock.patch("agentops.runners.subprocess.run", side_effect=fake_run):
+                OpenCodeRunner().run(
+                    task,
+                    prompt="x",
+                    cwd=workspace,
+                    artifact_dir=artifact_dir,
+                )
+            cmd = captured["command"]
+            self.assertIn("--dangerously-skip-permissions", cmd)
+
+    def test_yolo_flag_absent_when_executor_options_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            artifact_dir = Path(tmp) / "artifacts"
+            artifact_dir.mkdir()
+            captured: dict[str, object] = {}
+
+            def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+                captured["command"] = command
+                return _FakeProc(returncode=0)
+
+            task = self._task()
+            task = TaskConfig(**{**task.__dict__, "executor_options": {"dangerously_skip_permissions": False}})
+
+            with mock.patch("agentops.runners.subprocess.run", side_effect=fake_run):
+                OpenCodeRunner().run(
+                    task,
+                    prompt="x",
+                    cwd=workspace,
+                    artifact_dir=artifact_dir,
+                )
+            cmd = captured["command"]
+            self.assertNotIn("--dangerously-skip-permissions", cmd)
+
 
 class ShellRunnerTests(unittest.TestCase):
     def test_shell_runner_runs_executor_command(self) -> None:
@@ -246,6 +349,46 @@ class RunnerForTests(unittest.TestCase):
     def test_unknown_executor_raises(self) -> None:
         with self.assertRaises(ValueError):
             runner_for(TaskConfig(id="T", kind="x", prompt_path=Path("p"), executor="nope"))
+
+
+class YoloEnabledTests(unittest.TestCase):
+    def _task(self, **overrides) -> TaskConfig:
+        base = dict(
+            id="T",
+            kind="x",
+            prompt_path=Path("p"),
+            executor="opencode",
+        )
+        base.update(overrides)
+        return TaskConfig(**base)
+
+    def test_yolo_disabled_by_default(self) -> None:
+        from agentops.runners import yolo_enabled
+        self.assertFalse(yolo_enabled(self._task()))
+
+    def test_yolo_enabled_via_executor_options(self) -> None:
+        from agentops.runners import yolo_enabled
+        self.assertTrue(
+            yolo_enabled(self._task(executor_options={"dangerously_skip_permissions": True}))
+        )
+
+    def test_yolo_enabled_via_metadata_x_prefix(self) -> None:
+        from agentops.runners import yolo_enabled
+        self.assertTrue(
+            yolo_enabled(self._task(metadata={"x_dangerously_skip_permissions": True}))
+        )
+
+    def test_yolo_disabled_when_explicit_false(self) -> None:
+        from agentops.runners import yolo_enabled
+        self.assertFalse(
+            yolo_enabled(self._task(executor_options={"dangerously_skip_permissions": False}))
+        )
+
+    def test_yolo_does_not_use_risk_or_kind_to_enable(self) -> None:
+        """Implicit signals (risk, kind) must never enable yolo mode."""
+        from agentops.runners import yolo_enabled
+        self.assertFalse(yolo_enabled(self._task(risk=5, kind="implementation")))
+        self.assertFalse(yolo_enabled(self._task(kind="docs")))
 
 
 if __name__ == "__main__":

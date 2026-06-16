@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "roadmap_id": "gated-shell-review-smoke",
+  "repo": {
+    "id": "agentops",
+    "path": ".",
+    "base_branch": "HEAD"
+  },
+  "integration_branch": "agentops/integration/smoke",
+  "merge_policy": {
+    "auto_merge": true,
+    "strategy": "cherry_pick",
+    "require_clean_validations": true,
+    "require_safe_to_merge": true,
+    "protected_branches": ["main", "master", "audit/**", "release/**"]
+  },
+  "review": {
+    "codex": "auto",
+    "risk_threshold": 4,
+    "fallback_heuristic": false,
+    "schema": "../../schemas/review_verdict.schema.json"
+  },
+  "reviewer": "codex",
+  "defaults": {
+    "executor": "shell",
+    "execution_mode": "worktree_branch",
+    "branch_prefix": "agentops",
+    "max_attempts": 2,
+    "timeout_seconds": 600,
+    "auto_commit": false,
+    "auto_push": false
+  },
+  "tasks": [
+    {
+      "id": "GATED-001",
+      "kind": "implementation",
+      "prompt": "../prompts/gated-task-001.md",
+      "executor_command": "python3 -c \"from pathlib import Path; Path('gated_out_001.txt').write_text('one\\n', encoding='utf-8')\"",
+      "allowed_files": ["gated_out_001.txt"],
+      "validations": [
+        "python3 -c \"from pathlib import Path; assert Path('gated_out_001.txt').read_text(encoding='utf-8') == 'one\\n'\"",
+        "git diff --check"
+      ],
+      "review": {
+        "codex": "required"
+      }
+    },
+    {
+      "id": "GATED-002",
+      "kind": "implementation",
+      "depends_on": ["GATED-001"],
+      "prompt": "../prompts/gated-task-002.md",
+      "executor_command": "python3 -c \"from pathlib import Path; Path('gated_out_002.txt').write_text('two\\n', encoding='utf-8')\"",
+      "allowed_files": ["gated_out_002.txt"],
+      "validations": [
+        "python3 -c \"from pathlib import Path; assert Path('gated_out_002.txt').read_text(encoding='utf-8') == 'two\\n'\"",
+        "git diff --check"
+      ],
+      "review": {
+        "codex": "auto"
+      }
+    }
+  ]
+}
