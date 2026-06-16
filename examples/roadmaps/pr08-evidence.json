@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "roadmap_id": "businessagent-pr08-evidence-001",
+  "repo": {
+    "id": "BusinessAgent",
+    "path": "/home/czuki/BusinessAgent",
+    "base_branch": "audit/pr08-evidence-sweep-chapter-pack"
+  },
+  "defaults": {
+    "executor": "opencode",
+    "model": "minimax/MiniMax-M3",
+    "execution_mode": "worktree_branch",
+    "branch_prefix": "agentops",
+    "max_attempts": 2,
+    "timeout_seconds": 5400,
+    "auto_commit": false,
+    "auto_push": false
+  },
+  "policies": {
+    "forbidden_branches": ["main", "master", "audit/**"],
+    "forbidden_globs": ["app/**", "config/**", "data/**", "evidence/**", "exports/**", "migrations/**", "alembic/**", ".env", ".env.*", "package.json", "package-lock.json", "pnpm-lock.yaml"]
+  },
+  "tasks": [
+    {
+      "id": "PR08-GUARD-EVIDENCE-001",
+      "kind": "guard",
+      "risk": 3,
+      "prompt": "../prompts/PR08-GUARD-EVIDENCE-001.md",
+      "allowed_files": [
+        "scripts/verify_pr08_evidence_retention.py",
+        "tests/test_pr08_evidence_retention_guards.py",
+        "docs/audits/2026-06-15-pr08v-evidence-retention-guard.md",
+        "agent-work/02-execution/reports/PR08-GUARD-EVIDENCE-001-review.md"
+      ],
+      "validations": [
+        "python3 -m pytest tests/test_pr08_evidence_retention_guards.py -q",
+        "python3 scripts/verify_pr08_evidence_retention.py --json",
+        "python3 scripts/verify_pr08_no_data_reduction.py --json",
+        "python3 scripts/verify_pr08_source_coverage.py --json",
+        "python3 scripts/verify_pr08_antidetect_non_regression.py --json",
+        "ruff check scripts/verify_pr08_evidence_retention.py tests/test_pr08_evidence_retention_guards.py",
+        "git diff --check"
+      ],
+      "review": {"codex": "auto", "risk_threshold": 4, "schema": "../../schemas/codex_review.schema.json"},
+      "commit_message": "test(audit): add PR-08 evidence retention guard"
+    }
+  ]
+}

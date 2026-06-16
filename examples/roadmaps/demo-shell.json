@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "roadmap_id": "demo-shell-roadmap",
+  "repo": {
+    "id": "agentops-self",
+    "path": ".",
+    "base_branch": "HEAD"
+  },
+  "defaults": {
+    "execution_mode": "worktree_branch",
+    "branch_prefix": "agentops",
+    "max_attempts": 1,
+    "timeout_seconds": 120,
+    "auto_commit": false,
+    "auto_push": false
+  },
+  "policies": {
+    "forbidden_branches": ["main", "master", "audit/**"],
+    "forbidden_globs": [".env", ".env.*", "data/**", "evidence/**", "exports/**", "migrations/**", "alembic/**"]
+  },
+  "tasks": [
+    {
+      "id": "DEMO-SHELL-001",
+      "kind": "demo",
+      "risk": 1,
+      "executor": "shell",
+      "executor_command": "python3 -c \"from pathlib import Path; Path('agentops-demo-output.txt').write_text('agentops demo ok\\n', encoding='utf-8')\"",
+      "prompt": "../prompts/DEMO-SHELL-001.md",
+      "allowed_files": ["agentops-demo-output.txt"],
+      "validations": [
+        "python3 -c \"from pathlib import Path; assert Path('agentops-demo-output.txt').read_text(encoding='utf-8') == 'agentops demo ok\\n'\"",
+        "git diff --check"
+      ],
+      "review": {"codex": "never"}
+    }
+  ]
+}
