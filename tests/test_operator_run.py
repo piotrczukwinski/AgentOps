@@ -15,6 +15,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -24,21 +25,35 @@ from unittest import mock
 
 from agentops import cli
 from agentops.operator_run import (
+    TRANSIENT_FAILED_STATUS,
     ResultNotFound,
+    attempt_dir,
+    backoff_for_attempt,
     build_argv,
+    build_resume_hint,
+    classify_transient,
     extract_result,
     format_status_line,
     generate_run_id,
+    is_git_repo_with_changes,
+    latest_attempt_no,
+    latest_combined_log,
     list_status,
+    normalize_status,
+    parse_backoff,
     pid_alive,
+    prepare_retry_run,
     read_pid,
+    read_retry_config,
     resolve_run,
     run_detached,
     run_foreground,
+    run_foreground_with_retries,
     runs_root,
     start_run,
     tail_combined,
     write_result,
+    write_retry_config,
 )
 
 
@@ -557,10 +572,26 @@ class OperatorStatusTests(unittest.TestCase):
             }
         )
         self.assertIn("run_id=abc", line)
-        self.assertIn("status=exited", line)
+        # exit_code 0 is reported under the canonical name (succeeded).
+        self.assertIn("status=succeeded", line)
         self.assertIn("pid=1234", line)
         self.assertIn("exit_code=0", line)
         self.assertIn("duration=10s", line)
+
+    def test_format_status_line_marks_failed_exit_code(self) -> None:
+        line = format_status_line(
+            {
+                "run_id": "abc",
+                "name": "demo",
+                "status": "exited",
+                "pid": 1234,
+                "exit_code": 2,
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "ended_at": "2026-01-01T00:00:10+00:00",
+            }
+        )
+        self.assertIn("status=failed", line)
+        self.assertIn("exit_code=2", line)
 
     def test_resolve_run_raises_for_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -698,7 +729,8 @@ class CliOperatorRunTests(unittest.TestCase):
                     ]
                 )
             self.assertEqual(rc2, 0, msg=err2)
-            self.assertIn("status=exited", out2)
+            # exit_code 0 maps to the canonical ``succeeded`` name in the CLI output.
+            self.assertIn("status=succeeded", out2)
             self.assertIn("combined_log=", out2)
 
     def test_cli_operator_tail_prints_last_n(self) -> None:
@@ -843,6 +875,962 @@ class CliOperatorRunTests(unittest.TestCase):
                 if pid is not None:
                     with contextlib.suppress(ProcessLookupError):
                         os.kill(pid, 15)
+
+
+# ---------------------------------------------------------------------------
+# Transient recovery tests
+# ---------------------------------------------------------------------------
+
+
+def _write_stateful_fake_opencode(
+    bindir: Path,
+    *,
+    state_path: Path,
+    stdout: str = "",
+    stderr: str = "",
+    sleep_seconds: float = 0.0,
+    succeed_after: int = 0,
+    print_result_json: dict | None = None,
+) -> Path:
+    """Create a fake opencode that fails the first ``succeed_after`` calls.
+
+    Each invocation increments a counter at ``state_path``. The first
+    ``succeed_after`` invocations exit non-zero with the supplied
+    ``stdout`` / ``stderr``; subsequent invocations exit 0 and (if
+    provided) print an ``AGENTOPS_RESULT_JSON`` block. The success
+    branch does *not* re-print the failure stderr, otherwise the
+    classifier would misclassify a successful attempt as transient.
+
+    The script also appends its argv to ``$AGENTOPS_FAKE_CMD_LOG`` so the
+    test can assert on the exact argv the harness produced for each
+    attempt.
+    """
+    bindir.mkdir(parents=True, exist_ok=True)
+    script = bindir / "opencode"
+    body_lines = [
+        "#!/bin/sh",
+        "set -eu",
+        "printf '%s\\n' \"$@\" >> \"$AGENTOPS_FAKE_CMD_LOG\"",
+        f"COUNT=$(cat {json.dumps(str(state_path))} 2>/dev/null || echo 0)",
+        "COUNT=$((COUNT + 1))",
+        f"printf '%s' \"$COUNT\" > {json.dumps(str(state_path))}",
+        f"if [ \"$COUNT\" -le {int(succeed_after)} ]; then",
+    ]
+    if sleep_seconds > 0:
+        body_lines.append(f"  sleep {sleep_seconds}")
+    if stdout:
+        for line in stdout.splitlines() or [""]:
+            body_lines.append(f"  printf '%s\\n' {json.dumps(line)}")
+    if stderr:
+        for line in stderr.splitlines() or [""]:
+            body_lines.append(f"  printf '%s\\n' {json.dumps(line)} 1>&2")
+    body_lines.append("  exit 1")
+    body_lines.append("fi")
+    if sleep_seconds > 0:
+        body_lines.append(f"sleep {sleep_seconds}")
+    if stdout:
+        for line in stdout.splitlines() or [""]:
+            body_lines.append(f"printf '%s\\n' {json.dumps(line)}")
+    # Note: we intentionally do NOT print ``stderr`` in the success
+    # branch. Otherwise the success output would be misclassified as
+    # transient and the retry loop would never settle.
+    if print_result_json is not None:
+        body_lines.append("printf '\\n%s\\n' AGENTOPS_RESULT_JSON")
+        body_lines.append(
+            f"printf '%s\\n' {json.dumps(json.dumps(print_result_json))}"
+        )
+    body_lines.append("exit 0")
+    script.write_text("\n".join(body_lines) + "\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+class ClassifyTransientTests(unittest.TestCase):
+    def test_detects_network_timeout(self) -> None:
+        c = classify_transient(1, "GET /v1/chat", "ETIMEDOUT: read timed out")
+        self.assertEqual(c.transient, True)
+        self.assertIn(c.reason, {"connection_timeout", "timeout"})
+
+    def test_detects_rate_limit_429(self) -> None:
+        c = classify_transient(429, "Too many requests", "HTTP 429 rate_limit_exceeded")
+        self.assertEqual(c.transient, True)
+        self.assertEqual(c.reason, "rate_limit")
+
+    def test_detects_503_service_unavailable(self) -> None:
+        c = classify_transient(503, "", "503 Service Temporarily Unavailable")
+        self.assertEqual(c.transient, True)
+        self.assertEqual(c.reason, "service_unavailable")
+
+    def test_detects_504_gateway_timeout(self) -> None:
+        c = classify_transient(504, "504 upstream_timeout", "")
+        self.assertEqual(c.transient, True)
+        self.assertEqual(c.reason, "service_unavailable")
+
+    def test_detects_dns_failure(self) -> None:
+        c = classify_transient(None, "ENOTFOUND api.example.com", "")
+        self.assertEqual(c.transient, True)
+        self.assertEqual(c.reason, "dns_failure")
+
+    def test_detects_socket_hangup(self) -> None:
+        c = classify_transient(None, "socket hang up", "")
+        self.assertEqual(c.transient, True)
+        self.assertEqual(c.reason, "socket_hangup")
+
+    def test_invalid_api_key_is_non_transient(self) -> None:
+        c = classify_transient(401, "", "Invalid API key: please check credentials")
+        self.assertEqual(c.transient, False)
+        self.assertEqual(c.reason, "auth_invalid")
+
+    def test_missing_authentication_header_is_non_transient(self) -> None:
+        c = classify_transient(401, "", "Missing authentication header")
+        self.assertEqual(c.transient, False)
+        self.assertEqual(c.reason, "auth_missing")
+
+    def test_permission_denied_is_non_transient(self) -> None:
+        c = classify_transient(403, "", "Permission denied")
+        self.assertEqual(c.transient, False)
+        self.assertEqual(c.reason, "permission_denied")
+
+    def test_syntax_error_is_non_transient(self) -> None:
+        c = classify_transient(1, "File 'foo.py', line 3\nSyntaxError: invalid syntax", "")
+        self.assertEqual(c.transient, False)
+        self.assertEqual(c.reason, "syntax_error")
+
+    def test_test_failure_is_non_transient(self) -> None:
+        c = classify_transient(1, "FAILED tests/test_x.py::test_y - assert 1 == 2", "")
+        self.assertEqual(c.transient, False)
+        self.assertEqual(c.reason, "test_failure")
+
+    def test_unclassified_failure_with_nonzero_exit(self) -> None:
+        c = classify_transient(1, "weird unknown error", "")
+        self.assertIsNone(c.transient)
+        self.assertEqual(c.reason, "unclassified_failure")
+
+    def test_success_with_exit_zero(self) -> None:
+        c = classify_transient(0, "all good", "")
+        self.assertEqual(c.transient, False)
+        self.assertEqual(c.reason, "success")
+
+    def test_no_output_no_exit_code(self) -> None:
+        c = classify_transient(None, "", "")
+        self.assertIsNone(c.transient)
+        self.assertIsNone(c.reason)
+
+    def test_non_transient_wins_over_transient_in_same_output(self) -> None:
+        # "permission denied" must beat "timeout" because the former is
+        # a hard failure and the latter may appear as a side-effect.
+        c = classify_transient(1, "request timed out", "Permission denied for this resource")
+        self.assertEqual(c.transient, False)
+        self.assertEqual(c.reason, "permission_denied")
+
+
+class BackoffParsingTests(unittest.TestCase):
+    def test_parse_string(self) -> None:
+        self.assertEqual(parse_backoff("5,15,45"), [5.0, 15.0, 45.0])
+
+    def test_parse_list(self) -> None:
+        self.assertEqual(parse_backoff(["5", "15", "45"]), [5.0, 15.0, 45.0])
+
+    def test_parse_none(self) -> None:
+        self.assertEqual(parse_backoff(None), [])
+
+    def test_parse_invalid(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_backoff("5,abc,15")
+
+    def test_parse_empty_string(self) -> None:
+        self.assertEqual(parse_backoff(""), [])
+
+    def test_backoff_for_attempt_reuses_last(self) -> None:
+        self.assertEqual(backoff_for_attempt([1.0, 2.0], 0), 1.0)
+        self.assertEqual(backoff_for_attempt([1.0, 2.0], 1), 2.0)
+        self.assertEqual(backoff_for_attempt([1.0, 2.0], 10), 2.0)
+        self.assertEqual(backoff_for_attempt([], 5), 0.0)
+        self.assertEqual(backoff_for_attempt([-1.0, 5.0], 0), 0.0)
+        self.assertEqual(backoff_for_attempt([-1.0, 5.0], 1), 5.0)
+
+
+class NormalizeStatusTests(unittest.TestCase):
+    def test_created_maps_to_pending(self) -> None:
+        self.assertEqual(normalize_status("created"), "pending")
+
+    def test_exited_zero_maps_to_succeeded(self) -> None:
+        self.assertEqual(normalize_status("exited", 0), "succeeded")
+
+    def test_exited_nonzero_maps_to_failed(self) -> None:
+        self.assertEqual(normalize_status("exited", 2), "failed")
+
+    def test_exited_no_exit_code_maps_to_unknown(self) -> None:
+        self.assertEqual(normalize_status("exited"), "unknown")
+
+    def test_succeeded_passes_through(self) -> None:
+        self.assertEqual(normalize_status("succeeded", 0), "succeeded")
+
+    def test_transient_failed_passes_through(self) -> None:
+        self.assertEqual(normalize_status("transient_failed", 1), "transient_failed")
+
+    def test_needs_operator_passes_through(self) -> None:
+        self.assertEqual(normalize_status("needs_operator", 1), "needs_operator")
+
+    def test_retry_statuses_pass_through(self) -> None:
+        self.assertEqual(normalize_status("retry_waiting"), "retry_waiting")
+        self.assertEqual(normalize_status("retrying"), "retrying")
+
+    def test_none_maps_to_unknown(self) -> None:
+        self.assertEqual(normalize_status(None), "unknown")
+
+
+class RunForegroundWithRetriesTests(unittest.TestCase):
+    def _setup_repo(self, tmp: str, *, succeed_after: int, exit_msg: str = "ETIMEDOUT read timed out") -> tuple[Path, Path, Path, Path]:
+        bindir = Path(tmp) / "bin"
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        prompt = root / "prompt.md"
+        prompt.write_text("hi", encoding="utf-8")
+        log = Path(tmp) / "cmd.log"
+        log.write_text("", encoding="utf-8")
+        state = Path(tmp) / "state"
+        state.write_text("0", encoding="utf-8")
+        _write_stateful_fake_opencode(
+            bindir,
+            state_path=state,
+            stdout="",
+            stderr=exit_msg,
+            succeed_after=succeed_after,
+            sleep_seconds=0.0,
+            print_result_json={"status": "done", "summary": "x"},
+        )
+        return bindir, root, prompt, log
+
+    def test_retries_until_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup_repo(tmp, succeed_after=2)
+            sleeps: list[float] = []
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                spec, target, argv = start_run(
+                    root=root,
+                    name="retry-ok",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                payload = run_foreground_with_retries(
+                    spec,
+                    target,
+                    argv,
+                    max_retries=3,
+                    backoff=[0.01, 0.01, 0.01],
+                    retry_on_transient=True,
+                    sleep_fn=sleeps.append,
+                )
+            self.assertEqual(payload.get("status"), "exited")
+            self.assertEqual(payload.get("exit_code"), 0)
+            self.assertEqual(payload.get("attempt"), 3)
+            # We slept twice (between attempts 1->2 and 2->3) and the
+            # final attempt 3 succeeded.
+            self.assertEqual(len(sleeps), 2)
+            # Top-level logs are the *initial* attempt's logs.
+            self.assertIn("ETIMEDOUT", (target / "stderr.log").read_text(encoding="utf-8"))
+            # Each retry has its own attempts/N/ subdir.
+            self.assertTrue((attempt_dir(target, 2) / "stderr.log").exists())
+            self.assertTrue((attempt_dir(target, 3) / "stderr.log").exists())
+            # result.json is at the top level, written from the last attempt.
+            self.assertTrue((target / "result.json").exists())
+
+    def test_max_retries_exhausted_marks_transient_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup_repo(tmp, succeed_after=10, exit_msg="ETIMEDOUT")
+            sleeps: list[float] = []
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                spec, target, argv = start_run(
+                    root=root,
+                    name="retry-exhausted",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                payload = run_foreground_with_retries(
+                    spec,
+                    target,
+                    argv,
+                    max_retries=2,
+                    backoff=[0.01, 0.01],
+                    retry_on_transient=True,
+                    sleep_fn=sleeps.append,
+                )
+            self.assertEqual(payload.get("status"), TRANSIENT_FAILED_STATUS)
+            self.assertEqual(payload.get("exit_code"), 1)
+            self.assertEqual(payload.get("attempt"), 3)
+            self.assertEqual(payload.get("transient_reason"), "connection_timeout")
+            self.assertEqual(payload.get("max_retries"), 2)
+            # 1 + max_retries attempts total, so 2 sleeps between them.
+            self.assertEqual(len(sleeps), 2)
+
+    def test_non_transient_failure_does_not_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # A stateful fake that always fails with "permission denied"
+            # which is non-transient.
+            bindir, root, prompt, log = self._setup_repo(
+                tmp, succeed_after=10, exit_msg="Permission denied"
+            )
+            sleeps: list[float] = []
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                spec, target, argv = start_run(
+                    root=root,
+                    name="no-retry",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                payload = run_foreground_with_retries(
+                    spec,
+                    target,
+                    argv,
+                    max_retries=3,
+                    backoff=[0.0, 0.0, 0.0],
+                    retry_on_transient=True,
+                    sleep_fn=sleeps.append,
+                )
+            self.assertEqual(payload.get("status"), "exited")
+            self.assertEqual(payload.get("exit_code"), 1)
+            self.assertEqual(payload.get("attempt"), 1)
+            # No retries happened because the failure was non-transient.
+            self.assertEqual(len(sleeps), 0)
+
+    def test_retry_off_does_not_retry_even_when_transient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup_repo(tmp, succeed_after=10, exit_msg="ETIMEDOUT")
+            sleeps: list[float] = []
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                spec, target, argv = start_run(
+                    root=root,
+                    name="no-retry-off",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                payload = run_foreground_with_retries(
+                    spec,
+                    target,
+                    argv,
+                    max_retries=3,
+                    backoff=[0.0, 0.0, 0.0],
+                    retry_on_transient=False,
+                    sleep_fn=sleeps.append,
+                )
+            self.assertEqual(payload.get("status"), "exited")
+            self.assertEqual(payload.get("exit_code"), 1)
+            self.assertEqual(payload.get("attempt"), 1)
+            self.assertEqual(len(sleeps), 0)
+
+    def test_writes_retry_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup_repo(tmp, succeed_after=1)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                spec, target, argv = start_run(
+                    root=root,
+                    name="retry-config",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                run_foreground_with_retries(
+                    spec,
+                    target,
+                    argv,
+                    max_retries=3,
+                    backoff=[0.0, 0.0, 0.0],
+                    retry_on_transient=True,
+                    sleep_fn=lambda _seconds: None,
+                )
+            cfg = read_retry_config(target)
+            self.assertIsNotNone(cfg)
+            self.assertEqual(cfg["max_retries"], 3)
+            self.assertEqual(cfg["retry_on_transient"], True)
+            self.assertEqual(cfg["last_attempt"], 2)
+
+
+class PrepareRetryRunTests(unittest.TestCase):
+    def _seed_run(self, tmp: str) -> tuple[Path, Path, str, Path]:
+        bindir = Path(tmp) / "bin"
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        prompt = root / "prompt.md"
+        prompt.write_text("do the original work", encoding="utf-8")
+        log = Path(tmp) / "cmd.log"
+        log.write_text("", encoding="utf-8")
+        _write_fake_opencode(bindir, stdout="ok", stderr="503 service unavailable", exit_code=0)
+        with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+            spec, target, argv = start_run(
+                root=root,
+                name="retry-prep",
+                prompt_path=prompt,
+                workdir=root,
+                model="minimax/MiniMax-M3",
+                runner="opencode",
+                yolo=False,
+                detach=False,
+            )
+            run_foreground(spec, target, argv)
+        return bindir, root, spec.run_id, target
+
+    def test_prepares_retry_preserves_prompt_and_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, root, run_id, target = self._seed_run(tmp)
+            spec, _, argv, attempt_no = prepare_retry_run(
+                root, run_id, resume_hint=None, max_retries=3, backoff=[0.0], retry_on_transient=True
+            )
+            self.assertEqual(attempt_no, 2)
+            self.assertEqual(spec.run_id, run_id)
+            # The original argv is preserved; only the prompt path is
+            # updated to point at the per-attempt prompt file.
+            self.assertEqual(argv[0], "opencode")
+            self.assertIn("run", argv)
+            self.assertIn("--dir", argv)
+            self.assertIn("--model", argv)
+            # argv's last element now points at the per-attempt
+            # prompt.md so the executor reads from a stable location.
+            self.assertEqual(argv[-1], str(attempt_dir(target, 2) / "prompt.md"))
+            # The per-attempt prompt is a verbatim copy of the original.
+            self.assertEqual(
+                (attempt_dir(target, 2) / "prompt.md").read_text(encoding="utf-8"),
+                "do the original work",
+            )
+            # attempt_dir 2 is created and pre-populated with empty log files.
+            self.assertTrue((attempt_dir(target, 2) / "stdout.log").exists())
+            self.assertTrue((attempt_dir(target, 2) / "stderr.log").exists())
+            self.assertTrue((attempt_dir(target, 2) / "combined.log").exists())
+            self.assertTrue((attempt_dir(target, 2) / "command.json").exists())
+            # Original logs are untouched.
+            self.assertTrue((target / "stdout.log").exists())
+            self.assertTrue((target / "stderr.log").exists())
+
+    def test_prepares_retry_appends_resume_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, root, run_id, target = self._seed_run(tmp)
+            hint = build_resume_hint(attempt_no=2, reason="rate_limit")
+            spec, _, argv, _ = prepare_retry_run(
+                root, run_id, resume_hint=hint, max_retries=3, backoff=[0.0], retry_on_transient=True
+            )
+            # The argv's last element should now point at the new prompt
+            # file under attempts/2/ and that file should contain the
+            # original prompt + the resume hint.
+            new_prompt_path = Path(argv[-1])
+            self.assertEqual(new_prompt_path.parent, attempt_dir(target, 2))
+            content = new_prompt_path.read_text(encoding="utf-8")
+            self.assertIn("do the original work", content)
+            self.assertIn("Continue from the current working tree", content)
+            self.assertIn("rate_limit", content)
+            # Original prompt is still intact.
+            self.assertEqual((target / "prompt.md").read_text(encoding="utf-8"), "do the original work")
+
+    def test_prepare_retry_rejects_missing_command_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            run = runs_root(root) / "ghost"
+            run.mkdir(parents=True)
+            # No command.json
+            with self.assertRaises(FileNotFoundError):
+                prepare_retry_run(root, "ghost", resume_hint=None)
+
+    def test_attempt_dir_counters_increment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, root, run_id, target = self._seed_run(tmp)
+            self.assertEqual(latest_attempt_no(target), 1)
+            prepare_retry_run(root, run_id, resume_hint=None, max_retries=3, backoff=[0.0], retry_on_transient=True)
+            self.assertEqual(latest_attempt_no(target), 2)
+            prepare_retry_run(root, run_id, resume_hint=None, max_retries=3, backoff=[0.0], retry_on_transient=True)
+            self.assertEqual(latest_attempt_no(target), 3)
+
+
+class GitRepoChangesTests(unittest.TestCase):
+    def test_returns_false_for_non_git_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(is_git_repo_with_changes(Path(tmp)))
+
+    def test_returns_false_for_clean_git_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            subprocess.run(["git", "add", "a.txt"], cwd=str(root), check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init", "-q"],
+                cwd=str(root),
+                check=True,
+            )
+            self.assertFalse(is_git_repo_with_changes(root))
+
+    def test_returns_true_for_git_repo_with_uncommitted_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            self.assertTrue(is_git_repo_with_changes(root))
+
+
+class StatusOverlayTests(unittest.TestCase):
+    def _seed(self, tmp: str, *, status_payload: dict) -> Path:
+        root = Path(tmp) / "repo"
+        root.mkdir(exist_ok=True)
+        run = runs_root(root) / "r"
+        run.mkdir(parents=True, exist_ok=True)
+        (run / "status.json").write_text(json.dumps(status_payload), encoding="utf-8")
+        return run
+
+    def test_canonical_status_field_is_added(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._seed(tmp, status_payload={"run_id": "r", "status": "exited", "exit_code": 0})
+            entries = list_status(root)
+            self.assertEqual(entries[0][1].get("canonical_status"), "succeeded")
+
+    def test_canonical_status_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._seed(tmp, status_payload={"run_id": "r", "status": "exited", "exit_code": 1})
+            entries = list_status(root)
+            self.assertEqual(entries[0][1].get("canonical_status"), "failed")
+
+    def test_canonical_status_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._seed(tmp, status_payload={"run_id": "r", "status": "created"})
+            entries = list_status(root)
+            self.assertEqual(entries[0][1].get("canonical_status"), "pending")
+
+    def test_stale_pid_with_no_exit_code_reports_exited(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._seed(
+                tmp,
+                status_payload={"run_id": "r", "status": "running", "pid": 99999999},
+            )
+            entries = list_status(root)
+            self.assertEqual(entries[0][1].get("runtime_status"), "exited")
+
+    def test_stale_pid_with_nonzero_exit_code_reports_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._seed(
+                tmp,
+                status_payload={"run_id": "r", "status": "running", "pid": 99999999, "exit_code": 7},
+            )
+            entries = list_status(root)
+            self.assertEqual(entries[0][1].get("runtime_status"), "failed")
+
+    def test_stale_pid_with_zero_exit_code_reports_succeeded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._seed(
+                tmp,
+                status_payload={"run_id": "r", "status": "running", "pid": 99999999, "exit_code": 0},
+            )
+            entries = list_status(root)
+            self.assertEqual(entries[0][1].get("runtime_status"), "succeeded")
+
+    def test_stale_pid_during_retrying_reports_exited_or_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            self._seed(
+                tmp,
+                status_payload={"run_id": "r", "status": "retrying", "pid": 99999999, "attempt": 2},
+            )
+            entries = list_status(root)
+            payload = entries[0][1]
+            self.assertEqual(payload.get("runtime_status"), "exited_or_stale")
+            self.assertIn("retrying", payload.get("runtime_status_note", ""))
+
+    def test_status_enriched_with_retry_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            run = self._seed(
+                tmp,
+                status_payload={"run_id": "r", "status": "transient_failed", "exit_code": 1, "attempt": 3},
+            )
+            write_retry_config(
+                run,
+                max_retries=3,
+                backoff_seconds=[1.0, 2.0, 4.0],
+                retry_on_transient=True,
+                last_attempt=3,
+            )
+            entries = list_status(root)
+            payload = entries[0][1]
+            self.assertEqual(payload.get("max_retries"), 3)
+            self.assertEqual(payload.get("backoff_seconds"), [1.0, 2.0, 4.0])
+            self.assertEqual(payload.get("retry_on_transient"), True)
+            self.assertEqual(payload.get("attempt"), 3)
+
+    def test_format_status_line_shows_attempt_and_reason(self) -> None:
+        line = format_status_line(
+            {
+                "run_id": "abc",
+                "name": "demo",
+                "status": "transient_failed",
+                "exit_code": 1,
+                "attempt": 3,
+                "max_retries": 3,
+                "transient_reason": "rate_limit",
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "ended_at": "2026-01-01T00:00:10+00:00",
+            }
+        )
+        self.assertIn("status=transient_failed", line)
+        self.assertIn("attempt=3/4", line)
+        self.assertIn("transient_reason=rate_limit", line)
+
+
+class TailAndResultLatestAttemptTests(unittest.TestCase):
+    def test_tail_uses_latest_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            # Initial attempt: short log
+            (target / "stdout.log").write_text("first\n", encoding="utf-8")
+            (target / "stderr.log").write_text("", encoding="utf-8")
+            (target / "combined.log").write_text("first\n", encoding="utf-8")
+            # Retry attempt 2: longer log
+            d = attempt_dir(target, 2)
+            d.mkdir(parents=True)
+            (d / "stdout.log").write_text("retry-2 line\n", encoding="utf-8")
+            (d / "stderr.log").write_text("", encoding="utf-8")
+            (d / "combined.log").write_text("retry-2 line\n", encoding="utf-8")
+            tail = tail_combined(target, lines=10)
+            self.assertEqual(tail, ["retry-2 line"])
+
+    def test_latest_combined_log_falls_back_when_no_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text("initial\n", encoding="utf-8")
+            self.assertEqual(latest_combined_log(target), target / "combined.log")
+
+
+class CliOperatorRetryTests(unittest.TestCase):
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = cli.main(argv)
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+        return int(rc), out.getvalue(), err.getvalue()
+
+    def _seed_run(self, tmp: str) -> tuple[Path, Path, str, Path]:
+        bindir = Path(tmp) / "bin"
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        prompt = root / "prompt.md"
+        prompt.write_text("do something", encoding="utf-8")
+        log = Path(tmp) / "cmd.log"
+        log.write_text("", encoding="utf-8")
+        _write_fake_opencode(
+            bindir,
+            stdout="",
+            stderr="ETIMEDOUT",
+            exit_code=1,
+        )
+        with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+            spec, target, argv = start_run(
+                root=root,
+                name="retry-cli",
+                prompt_path=prompt,
+                workdir=root,
+                model="minimax/MiniMax-M3",
+                runner="opencode",
+                yolo=False,
+                detach=False,
+            )
+            run_foreground(spec, target, argv)
+        return bindir, root, spec.run_id, target
+
+    def test_operator_retry_writes_attempt_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, run_id, target = self._seed_run(tmp)
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            # The retry's run uses a fake that succeeds.
+            _write_fake_opencode(
+                bindir,
+                stdout="",
+                print_result_json={"status": "done", "summary": "retried"},
+                exit_code=0,
+            )
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-retry",
+                        run_id,
+                        "--dir",
+                        str(root),
+                    ]
+                )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertIn("operator-retry: attempt=2", out)
+            # attempt 2 dir was created and contains the success result.
+            d = attempt_dir(target, 2)
+            self.assertTrue((d / "command.json").exists())
+            self.assertTrue((d / "stdout.log").exists())
+            # Original attempt 1 logs are still there.
+            self.assertTrue((target / "stdout.log").exists())
+            self.assertIn("ETIMEDOUT", (target / "stderr.log").read_text(encoding="utf-8"))
+            # Top-level result.json was updated to the new attempt's JSON.
+            self.assertTrue((target / "result.json").exists())
+            result = json.loads((target / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["summary"], "retried")
+
+    def test_operator_retry_uses_git_resume_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, run_id, target = self._seed_run(tmp)
+            # Make the workdir a git repo with uncommitted changes so the
+            # resume hint gets added.
+            (root / ".git").mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+            subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(root), check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=str(root), check=True)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            _write_fake_opencode(bindir, stdout="ok", exit_code=0)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-retry",
+                        run_id,
+                        "--dir",
+                        str(root),
+                    ]
+                )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertIn("resume from current working tree", out)
+            d = attempt_dir(target, 2)
+            new_prompt = (d / "prompt.md").read_text(encoding="utf-8")
+            self.assertIn("Continue from the current working tree", new_prompt)
+
+    def test_operator_retry_no_resume_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, run_id, target = self._seed_run(tmp)
+            (root / ".git").mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            _write_fake_opencode(bindir, stdout="ok", exit_code=0)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-retry",
+                        run_id,
+                        "--dir",
+                        str(root),
+                        "--no-resume-hint",
+                    ]
+                )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertNotIn("resume from current working tree", out)
+            d = attempt_dir(target, 2)
+            # With --no-resume-hint, the new prompt is a verbatim copy of
+            # the original prompt.md.
+            self.assertEqual(
+                (d / "prompt.md").read_text(encoding="utf-8"),
+                (target / "prompt.md").read_text(encoding="utf-8"),
+            )
+
+    def test_operator_retry_missing_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            rc, out, err = self._run_cli(["operator-retry", "ghost", "--dir", str(root)])
+            self.assertEqual(rc, 2)
+            self.assertIn("ghost", err)
+
+    def test_operator_retry_uses_retry_on_transient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, run_id, target = self._seed_run(tmp)
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            # The fake always fails with a transient error, but the
+            # retry CLI should also keep failing. With max_retries=1 and
+            # one transient failure, we should end with
+            # ``transient_failed``.
+            _write_fake_opencode(
+                bindir,
+                stdout="",
+                stderr="ETIMEDOUT",
+                exit_code=1,
+            )
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-retry",
+                        run_id,
+                        "--dir",
+                        str(root),
+                        "--retry-on-transient",
+                        "--max-retries",
+                        "1",
+                        "--backoff",
+                        "0",
+                    ]
+                )
+            self.assertEqual(rc, 75, msg=err)
+            self.assertIn("transient_failed", out.lower())
+            # 2 attempts (1 initial + 1 retry); both their logs exist.
+            self.assertEqual(latest_attempt_no(target), 2)
+
+
+class CliOperatorRunWithRetryTests(unittest.TestCase):
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = cli.main(argv)
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+        return int(rc), out.getvalue(), err.getvalue()
+
+    def test_operator_run_with_retry_on_transient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            prompt = root / "prompt.md"
+            prompt.write_text("hi", encoding="utf-8")
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            state = Path(tmp) / "state"
+            state.write_text("0", encoding="utf-8")
+            _write_stateful_fake_opencode(
+                bindir,
+                state_path=state,
+                stdout="",
+                stderr="ETIMEDOUT",
+                succeed_after=1,
+                sleep_seconds=0.0,
+                print_result_json={"status": "done", "summary": "from-retry"},
+            )
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-run",
+                        "--prompt-file",
+                        str(prompt),
+                        "--dir",
+                        str(root),
+                        "--retry-on-transient",
+                        "--max-retries",
+                        "3",
+                        "--backoff",
+                        "0,0,0",
+                    ]
+                )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertIn("retry_on_transient", out)
+
+    def test_operator_run_exhausts_retries_returns_75(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            prompt = root / "prompt.md"
+            prompt.write_text("hi", encoding="utf-8")
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            _write_fake_opencode(bindir, stdout="", stderr="ETIMEDOUT", exit_code=1)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-run",
+                        "--prompt-file",
+                        str(prompt),
+                        "--dir",
+                        str(root),
+                        "--retry-on-transient",
+                        "--max-retries",
+                        "1",
+                        "--backoff",
+                        "0,0",
+                    ]
+                )
+            self.assertEqual(rc, 75, msg=err)
+            self.assertIn("transient_failed", out.lower())
+
+
+class CliOperatorResultTransientHintTests(unittest.TestCase):
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = cli.main(argv)
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+        return int(rc), out.getvalue(), err.getvalue()
+
+    def test_operator_result_prints_transient_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            prompt = root / "prompt.md"
+            prompt.write_text("hi", encoding="utf-8")
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            _write_fake_opencode(bindir, stdout="", stderr="ETIMEDOUT", exit_code=1)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                rc1, out1, err1 = self._run_cli(
+                    [
+                        "operator-run",
+                        "--prompt-file",
+                        str(prompt),
+                        "--dir",
+                        str(root),
+                        "--retry-on-transient",
+                        "--max-retries",
+                        "0",
+                        "--backoff",
+                        "0",
+                    ]
+                )
+            self.assertEqual(rc1, 75, msg=err1)
+            run_id = out1.split("run_id=", 1)[1].split()[0]
+            run_dir = root / ".operator-runs" / run_id
+            # Manually upgrade the persisted status to transient_failed
+            # so the operator-result hint is triggered.
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+            status["status"] = "transient_failed"
+            status["transient_reason"] = "rate_limit"
+            status["max_retries"] = 0
+            (run_dir / "status.json").write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            rc2, out2, err2 = self._run_cli(
+                [
+                    "operator-result",
+                    run_id,
+                    "--dir",
+                    str(root),
+                ]
+            )
+            self.assertEqual(rc2, 1, msg=err2)
+            self.assertIn("transient_failed", err2)
+            self.assertIn("rate_limit", err2)
+            self.assertIn("operator-retry", err2)
 
 
 if __name__ == "__main__":

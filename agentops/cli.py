@@ -136,6 +136,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the executor in the foreground and wait for it to exit (default).",
     )
     operator_run_cmd.set_defaults(detach=False)
+    operator_run_cmd.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help=(
+            "Maximum number of additional attempts after the first one when "
+            "--retry-on-transient is set. Default: 3."
+        ),
+    )
+    operator_run_cmd.add_argument(
+        "--retry-on-transient",
+        action="store_true",
+        help=(
+            "When the executor exits with a classified transient failure "
+            "(network error, 429, 502/503/504, timeout, etc.), sleep for "
+            "the next backoff value and re-run the same command. Detached "
+            "mode records the policy and lets ``operator-retry`` apply it."
+        ),
+    )
+    operator_run_cmd.add_argument(
+        "--backoff",
+        default=None,
+        help=(
+            "Comma-separated list of seconds to sleep between attempts. "
+            "Used positionally: the i-th retry waits backoff[i] seconds. "
+            "If shorter than --max-retries, the last value is reused. "
+            "Default: '5,15,45'."
+        ),
+    )
 
     operator_status_cmd = sub.add_parser(
         "operator-status",
@@ -177,6 +206,66 @@ def build_parser() -> argparse.ArgumentParser:
     )
     operator_result_cmd.add_argument("run_id", help="Run id to extract (the directory name under .operator-runs/).")
     operator_result_cmd.add_argument("--dir", default=".", help="Working directory that owns .operator-runs/. Default: current directory.")
+
+    operator_retry_cmd = sub.add_parser(
+        "operator-retry",
+        help="Re-run a previously failed operator run from its stored prompt and argv.",
+        description=(
+            "Load the original prompt.md and command.json from .operator-runs/<run-id>/, "
+            "optionally inject a resume hint when the working directory is a git repo "
+            "with uncommitted changes, and start a new attempt. Previous attempt logs "
+            "are preserved in <run-dir>/attempts/<n>/. The new attempt's stdout, "
+            "stderr and combined logs are written to a fresh subdirectory and the "
+            "top-level status.json is updated."
+        ),
+    )
+    operator_retry_cmd.add_argument("run_id", help="Run id to retry (the directory name under .operator-runs/).")
+    operator_retry_cmd.add_argument("--dir", default=".", help="Working directory that owns .operator-runs/. Default: current directory.")
+    operator_retry_cmd.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help=(
+            "Maximum number of additional attempts (including this one) when "
+            "--retry-on-transient is set. Default: 3."
+        ),
+    )
+    operator_retry_cmd.add_argument(
+        "--retry-on-transient",
+        action="store_true",
+        help=(
+            "Classify each attempt's failure; on transient failures, sleep and "
+            "try again until --max-retries is exhausted or the run succeeds."
+        ),
+    )
+    operator_retry_cmd.add_argument(
+        "--backoff",
+        default=None,
+        help=(
+            "Comma-separated list of seconds to sleep between attempts. "
+            "Default: '5,15,45'."
+        ),
+    )
+    operator_retry_cmd.add_argument(
+        "--needs-operator",
+        action="store_true",
+        help=(
+            "When the retry budget is exhausted on a transient failure, mark the "
+            "run with the 'needs_operator' status instead of 'transient_failed' "
+            "to make the operator-attention intent explicit."
+        ),
+    )
+    operator_retry_cmd.add_argument(
+        "--no-resume-hint",
+        dest="resume_hint",
+        action="store_false",
+        default=True,
+        help=(
+            "Do not append the 'continue from current working tree' hint to the "
+            "retry prompt, even if the working directory is a git repo with "
+            "uncommitted changes. Default: append the hint."
+        ),
+    )
 
     serve = sub.add_parser("serve", help="Start the local AgentOps web UI (local-only, default 127.0.0.1:8765).")
     serve.add_argument("--host", default="127.0.0.1", help="Host to bind the local UI on. Default: 127.0.0.1 (local-only).")
@@ -315,6 +404,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "operator-result":
             return _cmd_operator_result(args)
+
+        if args.command == "operator-retry":
+            return _cmd_operator_retry(args)
 
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
@@ -935,9 +1027,14 @@ def _operator_run_root(args: argparse.Namespace) -> Path:
 
 def _cmd_operator_run(args: argparse.Namespace) -> int:
     from .operator_run import (
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BACKOFF,
+        parse_backoff,
         run_detached,
         run_foreground,
+        run_foreground_with_retries,
         start_run,
+        write_retry_config,
     )
 
     root = _operator_run_root(args)
@@ -949,6 +1046,19 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
     if not prompt_path.is_file():
         print(f"Prompt file not found: {prompt_path}", file=sys.stderr)
         return 2
+
+    if int(args.max_retries or 0) < 0:
+        print("--max-retries must be >= 0", file=sys.stderr)
+        return 2
+
+    try:
+        backoff = parse_backoff(args.backoff) if args.backoff else list(DEFAULT_RETRY_BACKOFF)
+    except ValueError as exc:
+        print(f"Invalid --backoff: {exc}", file=sys.stderr)
+        return 2
+    if not backoff:
+        backoff = list(DEFAULT_RETRY_BACKOFF)
+    retry_on_transient = bool(args.retry_on_transient)
 
     # Build the run directory and the immutable metadata before launching the
     # subprocess. This means a Ctrl-C between ``start_run`` and ``launch_run``
@@ -964,16 +1074,46 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
         detach=bool(args.detach),
     )
 
+    # Persist the retry policy up-front so detached runs and future
+    # ``operator-retry`` invocations can reuse the same configuration.
+    write_retry_config(
+        target,
+        max_retries=int(args.max_retries or DEFAULT_MAX_RETRIES),
+        backoff_seconds=backoff,
+        retry_on_transient=retry_on_transient,
+        last_attempt=0,
+        extra={"max_retries_extra": False} if args.retry_on_transient else {"max_retries_extra": False},
+    )
+
     print(f"operator-run: run_id={spec.run_id}")
     print(f"operator-run: run_dir={target}")
     print(f"operator-run: argv={argv}")
+    if retry_on_transient:
+        print(
+            f"operator-run: retry_on_transient max_retries={args.max_retries} "
+            f"backoff={','.join(str(s) for s in backoff)}s"
+        )
 
     if spec.detach:
         run_detached(spec, target, argv)
-        print(f"operator-run: detached pid written; use 'agentops operator-status --run-id {spec.run_id}' to monitor.")
+        print(
+            f"operator-run: detached pid written; use 'agentops operator-status --run-id {spec.run_id}' "
+            "to monitor, and 'agentops operator-retry' to resume after a transient failure."
+        )
         return 0
 
-    payload = run_foreground(spec, target, argv)
+    if retry_on_transient:
+        payload = run_foreground_with_retries(
+            spec,
+            target,
+            argv,
+            max_retries=int(args.max_retries or 0),
+            backoff=backoff,
+            retry_on_transient=True,
+        )
+    else:
+        payload = run_foreground(spec, target, argv)
+
     # Always print the final result (or a clear "not found" note) so the
     # operator can copy/paste it into a status report without rerunning
     # ``operator-result``.
@@ -982,15 +1122,27 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
         print(f"operator-run: exit_code={payload.get('exit_code')} result={result_path}")
         print(result_path.read_text(encoding="utf-8"))
     else:
-        print(
-            f"operator-run: exit_code={payload.get('exit_code')} no AGENTOPS_RESULT_JSON found in combined.log. "
-            f"Run 'agentops operator-result {spec.run_id}' to retry extraction."
-        )
+        transient_reason = payload.get("transient_reason")
+        if payload.get("status") == "transient_failed":
+            print(
+                f"operator-run: status=transient_failed exit_code={payload.get('exit_code')} "
+                f"transient_reason={transient_reason or 'unknown'} "
+                f"attempts={payload.get('attempt')}/{int(args.max_retries or 0) + 1}. "
+                f"Inspect the log with 'agentops operator-tail {spec.run_id}' and try "
+                f"'agentops operator-retry {spec.run_id}' once the upstream is healthy."
+            )
+        else:
+            print(
+                f"operator-run: exit_code={payload.get('exit_code')} no AGENTOPS_RESULT_JSON found in combined.log. "
+                f"Run 'agentops operator-result {spec.run_id}' to retry extraction."
+            )
+    if payload.get("status") == "transient_failed":
+        return 75  # conventional "temp fail" exit code
     return 0 if payload.get("exit_code") == 0 else 1
 
 
 def _cmd_operator_status(args: argparse.Namespace) -> int:
-    from .operator_run import format_status_line, list_status
+    from .operator_run import format_status_line, latest_combined_log, list_status
 
     root = _operator_run_root(args)
     if not root.exists():
@@ -1013,14 +1165,18 @@ def _cmd_operator_status(args: argparse.Namespace) -> int:
     for run_dir_path, payload in entries:
         print(format_status_line(payload))
         result_path = run_dir_path / "result.json"
+        combined_log = latest_combined_log(run_dir_path)
         print(f"  prompt={payload.get('prompt_path', '-')}")
-        print(f"  combined_log={run_dir_path / 'combined.log'}")
+        print(f"  combined_log={combined_log}")
         print(f"  result_json={'present' if result_path.exists() else 'absent'}")
+        note = payload.get("runtime_status_note")
+        if note:
+            print(f"  note={note}")
     return 0
 
 
 def _cmd_operator_tail(args: argparse.Namespace) -> int:
-    from .operator_run import resolve_run, tail_combined
+    from .operator_run import latest_combined_log, resolve_run, tail_combined
 
     root = _operator_run_root(args)
     if not root.exists():
@@ -1033,9 +1189,10 @@ def _cmd_operator_tail(args: argparse.Namespace) -> int:
         print(f"operator-tail: {exc}", file=sys.stderr)
         return 2
 
+    log_path = latest_combined_log(target)
     lines = tail_combined(target, lines=int(args.lines))
     if not lines:
-        print(f"(empty) {target / 'combined.log'}")
+        print(f"(empty) {log_path}")
         return 0
     for line in lines:
         print(line)
@@ -1043,7 +1200,12 @@ def _cmd_operator_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_operator_result(args: argparse.Namespace) -> int:
-    from .operator_run import ResultNotFound, extract_result, resolve_run, write_result
+    from .operator_run import (
+        ResultNotFound,
+        latest_combined_log,
+        resolve_run,
+        write_result,
+    )
 
     root = _operator_run_root(args)
     if not root.exists():
@@ -1056,9 +1218,32 @@ def _cmd_operator_result(args: argparse.Namespace) -> int:
         print(f"operator-result: {exc}", file=sys.stderr)
         return 2
 
+    # Try the most recent attempt first, then fall back to the top-level
+    # combined.log. The status overlay helps us give the operator useful
+    # hints when the result is missing because the run failed transiently.
     try:
-        payload = extract_result(target)
+        payload = _extract_latest_result(target)
     except ResultNotFound as exc:
+        status_payload = _read_status_or_none(target)
+        if status_payload is not None and status_payload.get("status") in {"transient_failed", "needs_operator"}:
+            print(f"operator-result: {exc}", file=sys.stderr)
+            print(
+                f"  run_status={status_payload.get('status')} exit_code={status_payload.get('exit_code')} "
+                f"transient_reason={status_payload.get('transient_reason') or 'unknown'} "
+                f"attempts={status_payload.get('attempt')}/{int(status_payload.get('max_retries') or 0) + 1}",
+                file=sys.stderr,
+            )
+            print(
+                f"  combined_log={latest_combined_log(target)}",
+                file=sys.stderr,
+            )
+            print(
+                "Hint: the run ended in a transient failure before AGENTOPS_RESULT_JSON was printed. "
+                "Inspect the log with 'agentops operator-tail <run-id>' and resume with "
+                "'agentops operator-retry <run-id>' once the upstream is healthy.",
+                file=sys.stderr,
+            )
+            return 1
         print(f"operator-result: {exc}", file=sys.stderr)
         print(
             "Hint: the executor must print 'AGENTOPS_RESULT_JSON' on its own line (or as part of a banner), "
@@ -1071,6 +1256,211 @@ def _cmd_operator_result(args: argparse.Namespace) -> int:
     print(f"operator-result: wrote {result_path}")
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
+
+
+def _extract_latest_result(run_dir_path: Path) -> dict[str, Any]:
+    """Try the latest attempt's combined.log first, then the top-level one."""
+    from .operator_run import (
+        ResultNotFound,
+        extract_result,
+        latest_attempt_dir,
+    )
+
+    latest = latest_attempt_dir(run_dir_path)
+    if latest is not None:
+        try:
+            return extract_result(latest)
+        except ResultNotFound:
+            pass
+    return extract_result(run_dir_path)
+
+
+def _read_status_or_none(run_dir_path: Path) -> dict[str, Any] | None:
+    status_path = run_dir_path / "status.json"
+    if not status_path.exists():
+        return None
+    try:
+        return json.loads(status_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def _cmd_operator_retry(args: argparse.Namespace) -> int:
+    from .operator_run import (
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BACKOFF,
+        TRANSIENT_FAILED_STATUS,
+        _finalize_attempts,
+        attempt_dir,
+        build_resume_hint,
+        is_git_repo_with_changes,
+        latest_attempt_no,
+        parse_backoff,
+        prepare_retry_run,
+        resolve_run,
+        run_attempt_foreground,
+        run_foreground_with_retries,
+        write_retry_config,
+        write_status,
+    )
+
+    root = _operator_run_root(args)
+    if not root.exists():
+        print(f"Workdir does not exist: {root}", file=sys.stderr)
+        return 2
+
+    if int(args.max_retries or 0) < 0:
+        print("--max-retries must be >= 0", file=sys.stderr)
+        return 2
+
+    try:
+        backoff = parse_backoff(args.backoff) if args.backoff else list(DEFAULT_RETRY_BACKOFF)
+    except ValueError as exc:
+        print(f"Invalid --backoff: {exc}", file=sys.stderr)
+        return 2
+    if not backoff:
+        backoff = list(DEFAULT_RETRY_BACKOFF)
+    retry_on_transient = bool(args.retry_on_transient)
+
+    # Compute the upcoming attempt number up front so the resume hint
+    # references the right number without us having to call
+    # ``prepare_retry_run`` twice (which would itself create the new
+    # attempt directory and bump the counter).
+    try:
+        target_for_preview = resolve_run(root, args.run_id)
+    except FileNotFoundError as exc:
+        print(f"operator-retry: {exc}", file=sys.stderr)
+        return 2
+    next_attempt_no = latest_attempt_no(target_for_preview) + 1
+
+    resume_hint: str | None = None
+    if bool(args.resume_hint):
+        # We need the workdir to decide whether the target is a git
+        # repo with uncommitted changes. The workdir is stored in the
+        # existing command.json; read it without invoking the helper.
+        from .operator_run import read_command_workdir
+
+        workdir_hint = read_command_workdir(target_for_preview)
+        if workdir_hint is not None and is_git_repo_with_changes(workdir_hint):
+            resume_hint = build_resume_hint(
+                attempt_no=next_attempt_no,
+                reason=None,
+            )
+
+    try:
+        spec, target, argv, attempt_no = prepare_retry_run(
+            root,
+            args.run_id,
+            resume_hint=resume_hint,
+            max_retries=int(args.max_retries or DEFAULT_MAX_RETRIES),
+            backoff=backoff,
+            retry_on_transient=retry_on_transient,
+        )
+    except FileNotFoundError as exc:
+        print(f"operator-retry: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"operator-retry: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"operator-retry: run_id={spec.run_id}")
+    print(f"operator-retry: run_dir={target}")
+    print(f"operator-retry: attempt={attempt_no}")
+    print(f"operator-retry: argv={argv}")
+    if resume_hint:
+        print("operator-retry: appended a 'resume from current working tree' hint to the prompt")
+
+    # Run the attempt in the foreground. The retry loop, if enabled,
+    # handles backoff and additional attempts; the per-attempt logs go to
+    # ``attempts/<n>/`` and the top-level status.json is updated.
+    if retry_on_transient:
+        # The retry function counts ``max_retries`` as *additional*
+        # attempts after ``start_attempt_no``. For operator-retry the
+        # first retry attempt (attempt_no) is already included in the
+        # budget the operator asked for, so we decrement here so the
+        # budget matches the operator's ``--max-retries``.
+        retry_budget = max(0, int(args.max_retries or 0) - 1)
+        payload = run_foreground_with_retries(
+            spec,
+            target,
+            argv,
+            max_retries=retry_budget,
+            backoff=backoff,
+            retry_on_transient=True,
+            start_log_dir=attempt_dir(target, attempt_no),
+            start_attempt_no=attempt_no,
+        )
+    else:
+        # Single attempt: use run_attempt_foreground with the per-attempt
+        # log directory so this retry's stdout/stderr/combined are
+        # written under attempts/<n>/ rather than overwriting the
+        # original run's top-level logs.
+        result = run_attempt_foreground(
+            spec,
+            target,
+            argv,
+            attempt_no=attempt_no,
+            log_dir=attempt_dir(target, attempt_no),
+            env=None,
+            attempt_status="running",
+        )
+        payload = _finalize_attempts(
+            spec,
+            target,
+            argv,
+            result,
+            max_retries=int(args.max_retries or 0),
+            backoff=backoff,
+            retry_on_transient=False,
+        )
+
+    # If the operator asked for ``needs_operator`` semantics, rewrite the
+    # terminal status from ``transient_failed`` to ``needs_operator``.
+    if bool(args.needs_operator) and payload.get("status") == TRANSIENT_FAILED_STATUS:
+        payload = write_status(
+            target,
+            status="needs_operator",
+            spec=spec,
+            exit_code=payload.get("exit_code"),
+            ended_at=payload.get("ended_at"),
+            attempt=payload.get("attempt"),
+            max_retries=payload.get("max_retries"),
+            backoff_seconds=payload.get("backoff_seconds"),
+            retry_on_transient=payload.get("retry_on_transient"),
+            transient_reason=payload.get("transient_reason"),
+            transient=payload.get("transient"),
+            result_path=payload.get("result_path"),
+        )
+        write_retry_config(
+            target,
+            max_retries=int(args.max_retries or 0),
+            backoff_seconds=backoff,
+            retry_on_transient=retry_on_transient,
+            last_attempt=payload.get("attempt"),
+            extra={"last_retry_kind": "operator-retry", "needs_operator": True},
+        )
+
+    # Always print the final result (or a useful "not found" note) so the
+    # operator can copy/paste it into a status report.
+    result_path = target / "result.json"
+    if result_path.exists():
+        print(f"operator-retry: exit_code={payload.get('exit_code')} result={result_path}")
+        print(result_path.read_text(encoding="utf-8"))
+    else:
+        if payload.get("status") in {"transient_failed", "needs_operator"}:
+            print(
+                f"operator-retry: status={payload.get('status')} exit_code={payload.get('exit_code')} "
+                f"transient_reason={payload.get('transient_reason') or 'unknown'}. "
+                f"Inspect the log with 'agentops operator-tail {spec.run_id}' and try again later."
+            )
+        else:
+            print(
+                f"operator-retry: exit_code={payload.get('exit_code')} no AGENTOPS_RESULT_JSON found in combined.log. "
+                f"Run 'agentops operator-result {spec.run_id}' to retry extraction."
+            )
+    if payload.get("status") in {"transient_failed", "needs_operator"}:
+        return 75
+    return 0 if payload.get("exit_code") == 0 else 1
 
 
 if __name__ == "__main__":

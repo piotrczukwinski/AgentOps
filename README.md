@@ -89,7 +89,9 @@ Implemented in this repository:
 - Integration-branch merge gate (`cherry_pick` / `ff` / `no_ff`) with
   reviewer `safe_to_merge` enforcement and protected-branch refusal.
 - CLI commands: `init`, `run`, `status`, `logs`, `artifacts`, `attempts`,
-  `review-queue`, `export-summary`, `plan`, `doctor`, `review`, `decide`, `serve`.
+  `review-queue`, `export-summary`, `plan`, `doctor`, `review`, `decide`,
+  `serve`, `operator-run`, `operator-status`, `operator-tail`,
+  `operator-result`, `operator-retry`.
 - Offline `plan` command for preflight linting of roadmaps.
 - Local browser UI over the same CLI/state (`agentops serve`, default `127.0.0.1:8765`).
 
@@ -174,7 +176,32 @@ not lose the logs, only the in-flight process. The harness uses
 `shell=False`, sanitized env, and `GIT_TERMINAL_PROMPT=0` so the
 safety contract from the gated-roadmap runner is preserved.
 
-See `docs/operator-run-harness.md` for the full procedure.
+Transient network and API failures (timeout, 429, 502/503/504,
+connection reset, DNS, etc.) can be retried automatically or
+manually without losing the run:
+
+```bash
+# Automatic retry on transient failure (foreground)
+python -m agentops operator-run \
+  --name schema-recovery \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --retry-on-transient
+
+# Manual retry after a reboot or a hard failure
+python -m agentops operator-status --dir /home/czuki/AgentOps
+python -m agentops operator-tail <run-id> --dir /home/czuki/AgentOps
+python -m agentops operator-retry <run-id> --dir /home/czuki/AgentOps \
+  --retry-on-transient
+```
+
+`operator-status` reports the canonical status (`succeeded`,
+`failed`, `transient_failed`, `needs_operator`, `retry_waiting`,
+`retrying`, etc.), the attempt counter, the last transient reason,
+and the most recent attempt's log path. `operator-result` extracts
+the `AGENTOPS_RESULT_JSON` from the latest attempt's `combined.log`
+and falls back to the top-level log for old runs. See
+`docs/operator-run-harness.md` for the full procedure.
 
 ## Local browser UI
 
@@ -209,6 +236,13 @@ recommended workflow.
   defaults) explicitly opt in via `executor_options.dangerously_skip_permissions`
   or `metadata.x_dangerously_skip_permissions`. **Do not enable yolo in any
   environment that touches production data, secrets, or shared infrastructure.**
+- The Operator Run Harness's transient retry is opt-in
+  (`--retry-on-transient`). When enabled, only classifier-matched
+  transient failures (network errors, 429/502/503/504, timeouts) are
+  retried; non-transient failures (auth, validation, tests, policy)
+  are never auto-retried. The retry budget is bounded by
+  `--max-retries` (default 3) and the per-attempt sleep is bounded
+  by `--backoff` (default `5,15,45` seconds).
 
 ## Repository layout
 
