@@ -224,12 +224,14 @@ class ScenarioAAcceptTests(unittest.TestCase):
             count = orch.run_roadmap(roadmap)
             self.assertEqual(count, 2)
             self.assertEqual(len(fake.calls), 2)
-            # Sandbox + ask-for-approval defaults enforced
+            # Read-only sandbox is the safety contract on current
+            # codex-cli builds; --ask-for-approval was removed because
+            # the local codex CLI (0.140.0+) rejects it as an unexpected
+            # argument.
             for call in fake.calls:
                 self.assertIn("--sandbox", call["argv"])
                 self.assertIn("read-only", call["argv"])
-                self.assertIn("--ask-for-approval", call["argv"])
-                self.assertIn("never", call["argv"])
+                self.assertNotIn("--ask-for-approval", call["argv"])
 
             rows = {row["id"]: row for row in state.task_rows("gated-accept")}
             self.assertEqual(rows["T1"]["state"], TaskState.MERGED.value)
@@ -1023,7 +1025,7 @@ class HeuristicReviewerTests(unittest.TestCase):
 
 
 class BuildCodexCommandTests(unittest.TestCase):
-    def test_command_is_read_only_and_never_ask(self) -> None:
+    def test_command_is_read_only(self) -> None:
         from agentops.review import codex_command_for
 
         cmd = codex_command_for(
@@ -1032,10 +1034,15 @@ class BuildCodexCommandTests(unittest.TestCase):
             output_path=Path("/tmp/r.json"),
         )
         self.assertEqual(cmd[0], "codex")
+        # Safety contract: read-only sandbox is the only flag that matters
+        # on current codex-cli builds; --ask-for-approval was removed
+        # because the local codex CLI (0.140.0+) rejects it as an
+        # unexpected argument. The default approval policy is already
+        # ``never`` on those builds, so the behaviour is preserved.
         self.assertIn("--sandbox", cmd)
         self.assertIn("read-only", cmd)
-        self.assertIn("--ask-for-approval", cmd)
-        self.assertIn("never", cmd)
+        self.assertNotIn("--ask-for-approval", cmd)
+        self.assertNotIn("never", cmd)
         self.assertIn("--output-schema", cmd)
         self.assertIn("/tmp/s.json", cmd)
         self.assertIn("-o", cmd)
@@ -1484,11 +1491,13 @@ class StubCodexBinaryTests(unittest.TestCase):
             self.assertEqual(len(calls), 1, "stub codex should be called once")
             argv = calls[0]["argv"]
             cwd = calls[0]["cwd"]
-            # Safety flags present.
+            # Safety flag present. --ask-for-approval was removed from
+            # the argv because the local codex CLI (0.140.0+) rejects it
+            # as an unexpected argument; the read-only sandbox is the
+            # only safety flag we need.
             self.assertIn("--sandbox", argv)
             self.assertIn("read-only", argv)
-            self.assertIn("--ask-for-approval", argv)
-            self.assertIn("never", argv)
+            self.assertNotIn("--ask-for-approval", argv)
             # --output-schema present and points at the bundled default.
             self.assertIn("--output-schema", argv)
             schema_idx = argv.index("--output-schema")
@@ -1521,8 +1530,11 @@ class StubCodexBinaryTests(unittest.TestCase):
         self.assertIn("/tmp/s.json", cmd)
         self.assertIn("--sandbox", cmd)
         self.assertIn("read-only", cmd)
-        self.assertIn("--ask-for-approval", cmd)
-        self.assertIn("never", cmd)
+        # --ask-for-approval was removed from the argv because the local
+        # codex CLI (0.140.0+) rejects it as an unexpected argument; the
+        # read-only sandbox is the actual safety contract.
+        self.assertNotIn("--ask-for-approval", cmd)
+        self.assertNotIn("never", cmd)
         # No shell=True is possible because we are passing argv.
         self.assertNotIn("--shell", cmd)
 

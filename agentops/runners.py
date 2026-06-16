@@ -173,11 +173,19 @@ def build_codex_command(
 ) -> list[str]:
     """Build the argv for a Codex review call.
 
-    Defaults are read-only, never-ask-for-approval, JSONL output, and an
-    optional JSON-schema-validated output written to ``output_path``. Tests
-    can call this directly to verify the command shape without invoking Codex.
+    Defaults are read-only sandbox and an optional JSON-schema-validated
+    output written to ``output_path``. Tests can call this directly to verify
+    the command shape without invoking Codex.
+
+    Compatibility note: the local ``codex`` CLI (codex-cli 0.140.0 and newer)
+    enforces read-only behaviour via ``--sandbox read-only`` only; the older
+    ``--ask-for-approval never`` flag is rejected as an unexpected argument.
+    The read-only sandbox is the actual safety contract here, so we pass
+    that flag alone. Older codex builds that still accept
+    ``--ask-for-approval never`` are also handled by relying on the default
+    approval policy (``never``), so the behaviour is equivalent.
     """
-    command = [binary, "exec", "--sandbox", "read-only", "--ask-for-approval", "never"]
+    command = [binary, "exec", "--sandbox", "read-only"]
     if schema_path is not None:
         command.extend(["--output-schema", str(schema_path)])
     if output_path is not None:
