@@ -108,6 +108,76 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="Check local dependencies.")
 
+    # Operator Run Harness: durable, recoverable execution of long operator
+    # prompts (e.g. ``opencode run`` with a long prompt). See
+    # ``docs/operator-run-harness.md`` for the full procedure.
+    operator_run_cmd = sub.add_parser(
+        "operator-run",
+        help="Run a long operator prompt with durable logs and an optional AGENTOPS_RESULT_JSON extraction.",
+        description=(
+            "Launch a long-running operator prompt under .operator-runs/<run-id>/. "
+            "Each run is durable: prompt, argv, status, stdout/stderr/combined "
+            "logs and (when present) the extracted result are written to disk so "
+            "you can recover after a terminal disconnect or SSH drop. Use "
+            "--detach to keep the run alive after the controlling terminal closes."
+        ),
+    )
+    operator_run_cmd.add_argument("--name", default=None, help="Optional human-friendly run name (slugified into the run id).")
+    operator_run_cmd.add_argument("--prompt-file", required=True, help="Path to the prompt file (the executor's stdin/argument).")
+    operator_run_cmd.add_argument("--dir", default=".", help="Working directory for the executor (passed as --dir). Default: current directory.")
+    operator_run_cmd.add_argument("--model", default="minimax/MiniMax-M3", help="Model id passed to the executor. Default: minimax/MiniMax-M3.")
+    operator_run_cmd.add_argument("--runner", default="opencode", choices=("opencode",), help="Runner binary. Default: opencode.")
+    operator_run_cmd.add_argument("--yolo", action="store_true", help="Add --dangerously-skip-permissions to the executor argv. Off by default.")
+    operator_run_cmd.add_argument("--detach", action="store_true", help="Start the executor in a new session and return immediately.")
+    operator_run_cmd.add_argument(
+        "--no-detach",
+        dest="detach",
+        action="store_false",
+        help="Run the executor in the foreground and wait for it to exit (default).",
+    )
+    operator_run_cmd.set_defaults(detach=False)
+
+    operator_status_cmd = sub.add_parser(
+        "operator-status",
+        help="Show the status of one or all operator runs.",
+        description=(
+            "Read the durable status of every .operator-runs/<run-id>/ directory "
+            "(or the single one named by --run-id) and report whether the pid is "
+            "still alive, the recorded exit_code, and the timestamps. When a "
+            "status.json says ``running`` but the pid is gone, the runtime is "
+            "reported as ``exited`` so stale 'running' entries do not mislead the operator."
+        ),
+    )
+    operator_status_cmd.add_argument("--dir", default=".", help="Working directory that owns .operator-runs/. Default: current directory.")
+    operator_status_cmd.add_argument("--run-id", default=None, help="Inspect a single run id. Default: list all runs.")
+
+    operator_tail_cmd = sub.add_parser(
+        "operator-tail",
+        help="Print the last N lines of the combined log for an operator run.",
+        description=(
+            "Read .operator-runs/<run-id>/combined.log and print the last --lines "
+            "lines to stdout. Does not call the external ``tail`` binary; this "
+            "works after the controlling terminal has closed."
+        ),
+    )
+    operator_tail_cmd.add_argument("run_id", help="Run id to tail (the directory name under .operator-runs/).")
+    operator_tail_cmd.add_argument("--dir", default=".", help="Working directory that owns .operator-runs/. Default: current directory.")
+    operator_tail_cmd.add_argument("--lines", type=int, default=100, help="How many trailing lines to print. Default: 100.")
+
+    operator_result_cmd = sub.add_parser(
+        "operator-result",
+        help="Extract the last AGENTOPS_RESULT_JSON block from an operator run's combined log.",
+        description=(
+            "Parse .operator-runs/<run-id>/combined.log for the last "
+            "AGENTOPS_RESULT_JSON marker, decode the JSON that follows it (tolerating "
+            "pretty-printed multi-line output and trailing text) and write the parsed "
+            "object to result.json. Prints the JSON to stdout. Exits non-zero when no "
+            "parseable block is found."
+        ),
+    )
+    operator_result_cmd.add_argument("run_id", help="Run id to extract (the directory name under .operator-runs/).")
+    operator_result_cmd.add_argument("--dir", default=".", help="Working directory that owns .operator-runs/. Default: current directory.")
+
     serve = sub.add_parser("serve", help="Start the local AgentOps web UI (local-only, default 127.0.0.1:8765).")
     serve.add_argument("--host", default="127.0.0.1", help="Host to bind the local UI on. Default: 127.0.0.1 (local-only).")
     serve.add_argument("--port", type=int, default=8765, help="TCP port for the local UI. Default: 8765.")
@@ -233,6 +303,18 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "decide":
             return _cmd_decide(state, args)
+
+        if args.command == "operator-run":
+            return _cmd_operator_run(args)
+
+        if args.command == "operator-status":
+            return _cmd_operator_status(args)
+
+        if args.command == "operator-tail":
+            return _cmd_operator_tail(args)
+
+        if args.command == "operator-result":
+            return _cmd_operator_result(args)
 
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
@@ -832,6 +914,162 @@ def _cmd_decide(state: StateStore, args: argparse.Namespace) -> int:
         {"verdict": "BLOCK", "summary": args.summary, "reviewer": "human"},
     )
     state.event(roadmap.roadmap_id, task.id, attempt["id"], "task.blocked_by_review", {"reviewer": "human"})
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Operator Run Harness
+# ---------------------------------------------------------------------------
+
+
+def _operator_run_root(args: argparse.Namespace) -> Path:
+    """The directory under which ``.operator-runs/`` is created.
+
+    We use ``--dir`` as the workdir passed to the executor AND as the root
+    that owns the ``.operator-runs/`` directory. This mirrors the operator's
+    mental model: they say "run in this repo" and the harness creates
+    ``<repo>/.operator-runs/``.
+    """
+    return Path(args.dir).expanduser().resolve()
+
+
+def _cmd_operator_run(args: argparse.Namespace) -> int:
+    from .operator_run import (
+        run_detached,
+        run_foreground,
+        start_run,
+    )
+
+    root = _operator_run_root(args)
+    if not root.exists() or not root.is_dir():
+        print(f"Workdir does not exist or is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    prompt_path = Path(args.prompt_file).expanduser().resolve()
+    if not prompt_path.is_file():
+        print(f"Prompt file not found: {prompt_path}", file=sys.stderr)
+        return 2
+
+    # Build the run directory and the immutable metadata before launching the
+    # subprocess. This means a Ctrl-C between ``start_run`` and ``launch_run``
+    # still leaves a ``created`` run directory the operator can inspect.
+    spec, target, argv = start_run(
+        root=root,
+        name=args.name,
+        prompt_path=prompt_path,
+        workdir=root,
+        model=args.model,
+        runner=args.runner,
+        yolo=bool(args.yolo),
+        detach=bool(args.detach),
+    )
+
+    print(f"operator-run: run_id={spec.run_id}")
+    print(f"operator-run: run_dir={target}")
+    print(f"operator-run: argv={argv}")
+
+    if spec.detach:
+        run_detached(spec, target, argv)
+        print(f"operator-run: detached pid written; use 'agentops operator-status --run-id {spec.run_id}' to monitor.")
+        return 0
+
+    payload = run_foreground(spec, target, argv)
+    # Always print the final result (or a clear "not found" note) so the
+    # operator can copy/paste it into a status report without rerunning
+    # ``operator-result``.
+    result_path = target / "result.json"
+    if result_path.exists():
+        print(f"operator-run: exit_code={payload.get('exit_code')} result={result_path}")
+        print(result_path.read_text(encoding="utf-8"))
+    else:
+        print(
+            f"operator-run: exit_code={payload.get('exit_code')} no AGENTOPS_RESULT_JSON found in combined.log. "
+            f"Run 'agentops operator-result {spec.run_id}' to retry extraction."
+        )
+    return 0 if payload.get("exit_code") == 0 else 1
+
+
+def _cmd_operator_status(args: argparse.Namespace) -> int:
+    from .operator_run import format_status_line, list_status
+
+    root = _operator_run_root(args)
+    if not root.exists():
+        print(f"Workdir does not exist: {root}", file=sys.stderr)
+        return 2
+
+    try:
+        entries = list_status(root, run_id=args.run_id)
+    except FileNotFoundError as exc:
+        print(f"operator-status: {exc}", file=sys.stderr)
+        return 2
+
+    if not entries:
+        if args.run_id:
+            print(f"operator-status: no run with id {args.run_id!r} under {root}", file=sys.stderr)
+            return 2
+        print(f"No operator runs under {root / '.operator-runs'}. Start one with 'agentops operator-run --prompt-file <path>'.")
+        return 0
+
+    for run_dir_path, payload in entries:
+        print(format_status_line(payload))
+        result_path = run_dir_path / "result.json"
+        print(f"  prompt={payload.get('prompt_path', '-')}")
+        print(f"  combined_log={run_dir_path / 'combined.log'}")
+        print(f"  result_json={'present' if result_path.exists() else 'absent'}")
+    return 0
+
+
+def _cmd_operator_tail(args: argparse.Namespace) -> int:
+    from .operator_run import resolve_run, tail_combined
+
+    root = _operator_run_root(args)
+    if not root.exists():
+        print(f"Workdir does not exist: {root}", file=sys.stderr)
+        return 2
+
+    try:
+        target = resolve_run(root, args.run_id)
+    except FileNotFoundError as exc:
+        print(f"operator-tail: {exc}", file=sys.stderr)
+        return 2
+
+    lines = tail_combined(target, lines=int(args.lines))
+    if not lines:
+        print(f"(empty) {target / 'combined.log'}")
+        return 0
+    for line in lines:
+        print(line)
+    return 0
+
+
+def _cmd_operator_result(args: argparse.Namespace) -> int:
+    from .operator_run import ResultNotFound, extract_result, resolve_run, write_result
+
+    root = _operator_run_root(args)
+    if not root.exists():
+        print(f"Workdir does not exist: {root}", file=sys.stderr)
+        return 2
+
+    try:
+        target = resolve_run(root, args.run_id)
+    except FileNotFoundError as exc:
+        print(f"operator-result: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        payload = extract_result(target)
+    except ResultNotFound as exc:
+        print(f"operator-result: {exc}", file=sys.stderr)
+        print(
+            "Hint: the executor must print 'AGENTOPS_RESULT_JSON' on its own line (or as part of a banner), "
+            "followed by a single JSON object or array. Re-run the prompt with a closing marker if needed.",
+            file=sys.stderr,
+        )
+        return 1
+
+    result_path = write_result(target, payload)
+    print(f"operator-result: wrote {result_path}")
+    print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
 

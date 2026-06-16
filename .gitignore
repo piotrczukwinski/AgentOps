@@ -27,3 +27,6 @@ dist/
 
 # Operator session logs (gated-roadmap operator runs, not source)
 /.operator-logs/
+
+# Operator Run Harness durable run directories
+/.operator-runs/

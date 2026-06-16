@@ -138,6 +138,44 @@ agentops review-queue
 
 See `docs/usability-mvp.md` for the full CLI reference, `docs/operator-runbook.md` for triage procedures, and `docs/gated-roadmap-runner.md` for the gated runner reference.
 
+## Operator Run Harness
+
+Long `opencode run` prompts used to be launched with
+`opencode run ... 2>&1 | tee .operator-logs/...`. That pattern is
+fragile: a terminal disconnect, an SSH drop, or a computer reboot
+could lose the final `AGENTOPS_RESULT_JSON` block and force the
+operator to `grep` raw logs by hand.
+
+The Operator Run Harness is the durable replacement:
+
+```bash
+python -m agentops operator-run \
+  --name schema-path-hardening \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --model minimax/MiniMax-M3 \
+  --yolo \
+  --detach
+```
+
+Each run is written to `.operator-runs/<run-id>/` with the prompt,
+the exact argv, the status, and the stdout/stderr/combined logs.
+Inspect or recover the run from a different terminal with:
+
+```bash
+python -m agentops operator-status --dir /home/czuki/AgentOps
+python -m agentops operator-tail <run-id> --dir /home/czuki/AgentOps --lines 200
+python -m agentops operator-result <run-id> --dir /home/czuki/AgentOps
+```
+
+A detached run survives a terminal close; a foreground run leaves
+`combined.log` on disk for after-the-fact triage; a full reboot does
+not lose the logs, only the in-flight process. The harness uses
+`shell=False`, sanitized env, and `GIT_TERMINAL_PROMPT=0` so the
+safety contract from the gated-roadmap runner is preserved.
+
+See `docs/operator-run-harness.md` for the full procedure.
+
 ## Local browser UI
 
 A small local-only dashboard is included as a thin layer over the CLI and
