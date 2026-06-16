@@ -92,7 +92,6 @@ def copy_allowed_files_back(mirror: Path, target_worktree: Path, allowed_files: 
             else:
                 shutil.copy2(src, dst)
         elif dst.exists():
-            # Do not delete target files from gitless mode unless deletion capability is added later.
             continue
 
 
@@ -100,29 +99,63 @@ def collect_diff(repo: Path, base_ref: str = "HEAD") -> DiffSnapshot:
     changed = run_git(repo, ["status", "--porcelain=v1"], check=True).stdout
     changed_files: list[str] = []
     name_status_lines: list[str] = []
+
     for line in changed.splitlines():
         if not line:
             continue
-        status = line[:2].strip() or "M"
+
+        status_raw = line[:2]
         path = line[3:]
+
+        # Git reports a new directory as "?? docs/". Policy checks need
+        # concrete files, so untracked paths are expanded with ls-files below.
+        if status_raw == "??":
+            continue
+
+        status = status_raw.strip() or "M"
         if " -> " in path:
             path = path.split(" -> ", 1)[1]
-        changed_files.append(path)
-        name_status_lines.append(f"{status}\t{path}")
+
+        if path:
+            changed_files.append(path)
+            name_status_lines.append(f"{status}\t{path}")
 
     stat = run_git(repo, ["diff", "--stat", "--"], check=False).stdout
     patch_tracked = run_git(repo, ["diff", "--binary", "--"], check=False).stdout
+
     untracked_patches: list[str] = []
     untracked = run_git(repo, ["ls-files", "--others", "--exclude-standard"], check=False).stdout.splitlines()
+
     for path in untracked:
         file_path = repo / path
-        content = file_path.read_text(encoding="utf-8", errors="replace") if file_path.is_file() else ""
+        if not file_path.is_file():
+            continue
+
+        changed_files.append(path)
+        name_status_lines.append(f"A\t{path}")
+
+        content = file_path.read_text(encoding="utf-8", errors="replace")
         untracked_patches.append(
-            f"diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n" + _simple_added_patch(content)
+            "diff --git a/{0} b/{0}\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/{0}\n".format(path)
+            + _simple_added_patch(content)
         )
-    patch = patch_tracked + ("\n".join(untracked_patches) if untracked_patches else "")
+
+    patch = patch_tracked
+    if untracked_patches:
+        patch += "\n".join(untracked_patches)
+
     head = rev_parse(repo, "HEAD") if is_git_repo(repo) else ""
-    return DiffSnapshot(tuple(dict.fromkeys(changed_files)), "\n".join(name_status_lines), stat, patch, base_ref, head)
+    return DiffSnapshot(
+        tuple(dict.fromkeys(changed_files)),
+        "\n".join(name_status_lines),
+        stat,
+        patch,
+        base_ref,
+        head,
+    )
 
 
 def _simple_added_patch(content: str) -> str:

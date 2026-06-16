@@ -67,7 +67,23 @@ class ShellRunner(BaseRunner):
 
 class OpenCodeRunner(BaseRunner):
     def run(self, task: TaskConfig, prompt: str, cwd: Path, artifact_dir: Path) -> RunnerResult:
-        command = ["opencode", "run", "--model", task.model, prompt]
+        # OpenCode must be rooted in the executor workspace. Relying only on
+        # subprocess cwd is not enough in practice because OpenCode can keep or
+        # infer a different project/session root. Passing --dir makes the target
+        # repo explicit and avoids external_directory permission failures.
+        prompt_file = artifact_dir / "executor.input.md"
+        prompt_file.write_text(prompt, encoding="utf-8")
+
+        command = [
+            "opencode",
+            "run",
+            "--dir",
+            str(cwd),
+            "--model",
+            task.model,
+            prompt,
+        ]
+
         return run_argv(
             command,
             cwd=cwd,
