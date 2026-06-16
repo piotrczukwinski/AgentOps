@@ -34,12 +34,12 @@ Implemented in this repository:
 - Branch safety checks.
 - Validation command runner.
 - Review routing based on task risk and review policy.
-- CLI commands: `init`, `run`, `status`, `logs`, `artifacts`, `attempts`, `review-queue`, `export-summary`, `plan`, `doctor`.
+- CLI commands: `init`, `run`, `status`, `logs`, `artifacts`, `attempts`, `review-queue`, `export-summary`, `plan`, `doctor`, `serve`.
 - Offline `plan` command for preflight linting of roadmaps.
+- Local browser UI over the same CLI/state (`agentops serve`, default `127.0.0.1:8765`).
 
 Not implemented yet:
 
-- Web UI.
 - GitHub PR creation and connector-based review.
 - Full budget pricing ledger.
 - Parallel scheduling.
@@ -76,6 +76,24 @@ For a real MiniMax/OpenCode task, set `executor` to `opencode` and `model` to `m
 
 See `docs/usability-mvp.md` for the full CLI reference and `docs/operator-runbook.md` for triage procedures.
 
+## Local browser UI
+
+A small local-only dashboard is included as a thin layer over the CLI and
+the SQLite state. It runs on the Python standard library, binds to
+`127.0.0.1:8765` by default, and never executes arbitrary shell.
+
+```bash
+python -m agentops serve
+# AgentOps UI: http://127.0.0.1:8765
+```
+
+The UI shows task status, latest events, active run subprocesses, and
+per-task logs/artifacts. The "Run" button always passes `--no-codex`; to
+run with Codex, use the CLI directly.
+
+See `docs/local-web-ui.md` for the full description, safety notes, and
+recommended workflow.
+
 ## Safety defaults
 
 - The executor subprocess does not receive common GitHub token environment variables.
@@ -101,12 +119,14 @@ agentops/
   runners.py         shell, OpenCode, and Codex subprocess runners
   state.py           SQLite schema and event log
   validation.py      validation command runner
+  web.py             local HTTP server and dashboard
 
 docs/
   architecture.md
   two-agent-strategy.md
   security.md
   roadmap-format.md
+  local-web-ui.md
 
 examples/
   roadmaps/
