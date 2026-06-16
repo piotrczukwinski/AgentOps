@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "confidence",
+    "summary",
+    "blocking_issues",
+    "repair_prompt",
+    "safe_to_push",
+    "safe_to_merge"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["ACCEPT", "REQUEST_CHANGES", "BLOCK"]
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "summary": {"type": "string"},
+    "blocking_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "severity", "issue", "suggested_fix"],
+        "properties": {
+          "file": {"type": "string"},
+          "severity": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"]
+          },
+          "issue": {"type": "string"},
+          "suggested_fix": {"type": "string"}
+        }
+      }
+    },
+    "repair_prompt": {"type": "string"},
+    "safe_to_push": {"type": "boolean"},
+    "safe_to_merge": {"type": "boolean"}
+  }
+}

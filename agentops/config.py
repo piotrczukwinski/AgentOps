@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .models import RepoConfig, ReviewConfig, RoadmapConfig, TaskConfig
+from .models import MergePolicy, RepoConfig, ReviewConfig, RoadmapConfig, TaskConfig
 
 
 class ConfigError(ValueError):
@@ -43,6 +43,28 @@ def _as_tuple(value: Any, *, name: str) -> tuple[str, ...]:
 def _merge(defaults: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     merged = dict(defaults)
     merged.update(task)
+    return merged
+
+
+def _merge_executor_options(
+    defaults: Any,
+    task: Any,
+) -> dict[str, Any]:
+    """Deep-merge executor_options with per-task overrides taking precedence.
+
+    Only known boolean / scalar flags are propagated so that the runner
+    can read them deterministically. Unknown keys are preserved for
+    forward compatibility but are not consulted by the yolo gate.
+    """
+    merged: dict[str, Any] = {}
+    if isinstance(defaults, dict):
+        merged.update(defaults)
+    if isinstance(task, dict):
+        for key, value in task.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = {**merged[key], **value}
+            else:
+                merged[key] = value
     return merged
 
 
@@ -134,6 +156,10 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 auto_push=bool(item.get("auto_push", defaults.get("auto_push", False))),
                 review=review,
                 executor_command=item.get("executor_command"),
+                executor_options=_merge_executor_options(
+                    defaults.get("executor_options"),
+                    item.get("executor_options"),
+                ),
                 metadata={k: v for k, v in item.items() if k.startswith("x_")},
             )
         )
@@ -147,4 +173,64 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
         policies=data.get("policies", {}) or {},
         runtime_budget=data.get("runtime_budget", {}) or {},
         path=roadmap_path,
+        integration_branch=str(
+            data.get("integration_branch")
+            or repo.integration_branch
+            or ""
+        )
+        or None,
+        merge_policy=_build_merge_policy(data.get("merge_policy", {}) or {}, defaults),
+        continue_on_blocked=bool(data.get("continue_on_blocked", defaults.get("continue_on_blocked", False))),
+        max_tasks=_optional_int(data.get("max_tasks", defaults.get("max_tasks"))),
+        max_attempts_per_task=_optional_int(
+            data.get("max_attempts_per_task", defaults.get("max_attempts_per_task"))
+        ),
+        review=_build_roadmap_review(data.get("review", {}) or {}, defaults),
+        reviewer=str(data.get("reviewer", defaults.get("reviewer", "codex"))),
+    )
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"expected integer, got {value!r}") from exc
+
+
+def _build_merge_policy(value: Any, defaults: dict[str, Any]) -> MergePolicy:
+    if not isinstance(value, dict):
+        raise ConfigError("merge_policy must be an object")
+    protected_raw = value.get(
+        "protected_branches",
+        defaults.get("merge_protected_branches", ("main", "master", "audit/**", "release/**")),
+    )
+    if not isinstance(protected_raw, (list, tuple)):
+        raise ConfigError("merge_policy.protected_branches must be a list")
+    return MergePolicy(
+        auto_merge=bool(value.get("auto_merge", defaults.get("auto_merge", False))),
+        strategy=str(value.get("strategy", defaults.get("merge_strategy", "cherry_pick"))),
+        require_clean_validations=bool(
+            value.get("require_clean_validations", defaults.get("require_clean_validations", True))
+        ),
+        require_safe_to_merge=bool(
+            value.get("require_safe_to_merge", defaults.get("require_safe_to_merge", True))
+        ),
+        protected_branches=tuple(str(item) for item in protected_raw),
+    )
+
+
+def _build_roadmap_review(value: Any, defaults: dict[str, Any]) -> ReviewConfig:
+    if not isinstance(value, dict):
+        raise ConfigError("review must be an object at roadmap level")
+    codex_raw = value.get("codex", value.get("default_mode", defaults.get("review_default_mode", "auto")))
+    codex = str(codex_raw).lower()
+    if codex not in {"auto", "required", "never", "milestone_only"}:
+        raise ConfigError(f"review.codex must be one of auto/required/never/milestone_only, got {codex_raw!r}")
+    return ReviewConfig(
+        codex=codex,
+        risk_threshold=int(value.get("risk_threshold", defaults.get("codex_risk_threshold", 4))),
+        schema_path=None,
+        fallback_heuristic=bool(value.get("fallback_heuristic", defaults.get("review_fallback_heuristic", False))),
     )

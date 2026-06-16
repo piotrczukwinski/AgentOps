@@ -24,3 +24,6 @@ dist/
 # Local operator configs (root-level only; examples/ is versioned)
 /prompts/
 /roadmaps/
+
+# Operator session logs (gated-roadmap operator runs, not source)
+/.operator-logs/

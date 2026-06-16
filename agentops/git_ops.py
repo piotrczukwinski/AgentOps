@@ -178,3 +178,148 @@ def commit(repo: Path, message: str) -> str | None:
 
 def push(repo: Path, remote: str, branch: str) -> None:
     run_git(repo, ["push", remote, f"HEAD:{branch}"])
+
+
+# ---------------------------------------------------------------------------
+# Merge gate (integration branch finalization)
+# ---------------------------------------------------------------------------
+
+# Branches that AgentOps must never auto-merge into. The orchestrator
+# re-checks this list against the operator-supplied integration_branch
+# before any merge is performed; a match aborts the merge with
+# ``IntegrationBranchBlocked`` so dependent tasks do not silently run.
+DEFAULT_PROTECTED_BRANCHES = ("main", "master", "audit/**", "release/**")
+
+
+class IntegrationBranchBlocked(RuntimeError):
+    """Raised when an integration branch is in the protected set."""
+
+
+def is_protected_branch(name: str, protected: tuple[str, ...] = DEFAULT_PROTECTED_BRANCHES) -> bool:
+    import fnmatch
+
+    for pattern in protected:
+        if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(name.strip("/"), pattern.strip("/")):
+            return True
+    return False
+
+
+def branch_exists(repo: Path, name: str) -> bool:
+    result = run_git(repo, ["rev-parse", "--verify", f"refs/heads/{name}"], check=False)
+    return result.returncode == 0
+
+
+def ensure_integration_branch(repo: Path, integration_branch: str, base_branch: str) -> None:
+    """Create the integration branch off ``base_branch`` if it does not exist."""
+    if not integration_branch or integration_branch == base_branch:
+        raise IntegrationBranchBlocked(
+            f"integration_branch must be a non-empty branch distinct from base {base_branch!r}"
+        )
+    if is_protected_branch(integration_branch):
+        raise IntegrationBranchBlocked(
+            f"integration_branch {integration_branch!r} matches a protected branch pattern"
+        )
+    if not branch_exists(repo, integration_branch):
+        run_git(repo, ["branch", integration_branch, base_branch])
+
+
+def fast_forward_merge(repo: Path, integration_branch: str, task_branch: str) -> None:
+    """Fast-forward ``integration_branch`` to ``task_branch``.
+
+    Fails if integration_branch is not an ancestor of task_branch (i.e. the
+    branches have diverged). Use :func:`cherry_pick_into` for a non-FF merge
+    that preserves task isolation.
+    """
+    if is_protected_branch(integration_branch):
+        raise IntegrationBranchBlocked(
+            f"integration_branch {integration_branch!r} is in the protected set"
+        )
+    if not branch_exists(repo, task_branch):
+        raise RuntimeError(f"task branch {task_branch!r} does not exist in {repo}")
+    run_git(repo, ["checkout", "--quiet", integration_branch])
+    try:
+        result = run_git(repo, ["merge", "--ff-only", task_branch], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"fast-forward merge of {task_branch!r} into {integration_branch!r} failed: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+    finally:
+        # Always return the repo to the original branch to keep subsequent
+        # operations predictable.
+        previous = run_git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False).stdout.strip()
+        if previous and previous != f"refs/heads/{integration_branch}":
+            run_git(repo, ["checkout", "--quiet", previous.removeprefix("refs/heads/")])
+
+
+def cherry_pick_into(repo: Path, integration_branch: str, sha: str) -> str:
+    """Cherry-pick ``sha`` into ``integration_branch``.
+
+    Returns the new commit SHA on the integration branch. Raises on
+    conflict so the orchestrator can mark the task ``merge_failed``.
+    """
+    if is_protected_branch(integration_branch):
+        raise IntegrationBranchBlocked(
+            f"integration_branch {integration_branch!r} is in the protected set"
+        )
+    if not sha:
+        raise RuntimeError("cherry_pick_into requires a non-empty commit SHA")
+    previous = current_branch(repo) or run_git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False).stdout.strip().removeprefix("refs/heads/")
+    run_git(repo, ["checkout", "--quiet", integration_branch])
+    try:
+        result = run_git(repo, ["cherry-pick", "--no-edit", sha], check=False)
+        if result.returncode != 0:
+            run_git(repo, ["cherry-pick", "--abort"], check=False)
+            raise RuntimeError(
+                f"cherry-pick of {sha!r} into {integration_branch!r} failed (likely conflict)"
+            )
+        new_sha = rev_parse(repo, "HEAD")
+        return new_sha
+    finally:
+        if previous and previous != integration_branch:
+            run_git(repo, ["checkout", "--quiet", previous])
+
+
+def merge_integration(
+    repo: Path,
+    integration_branch: str,
+    task_branch: str,
+    *,
+    strategy: str = "cherry_pick",
+) -> str | None:
+    """Run the configured merge strategy into ``integration_branch``.
+
+    ``strategy`` is one of ``cherry_pick`` (default), ``ff``, ``no_ff``.
+    Returns the resulting integration-branch HEAD SHA, or None if the task
+    branch was already merged (no-op).
+    """
+    if is_protected_branch(integration_branch):
+        raise IntegrationBranchBlocked(
+            f"integration_branch {integration_branch!r} is in the protected set"
+        )
+    if not branch_exists(repo, integration_branch):
+        raise RuntimeError(f"integration branch {integration_branch!r} does not exist in {repo}")
+    if not branch_exists(repo, task_branch):
+        raise RuntimeError(f"task branch {task_branch!r} does not exist in {repo}")
+
+    if strategy == "ff":
+        fast_forward_merge(repo, integration_branch, task_branch)
+        return rev_parse(repo, integration_branch)
+    if strategy == "no_ff":
+        previous = current_branch(repo) or ""
+        run_git(repo, ["checkout", "--quiet", integration_branch])
+        try:
+            result = run_git(repo, ["merge", "--no-ff", "--no-edit", task_branch], check=False)
+            if result.returncode != 0:
+                run_git(repo, ["merge", "--abort"], check=False)
+                raise RuntimeError(
+                    f"no-ff merge of {task_branch!r} into {integration_branch!r} failed"
+                )
+            return rev_parse(repo, integration_branch)
+        finally:
+            if previous and previous != integration_branch:
+                run_git(repo, ["checkout", "--quiet", previous])
+
+    # Default: cherry-pick. Use the tip commit of the task branch.
+    tip = rev_parse(repo, task_branch)
+    return cherry_pick_into(repo, integration_branch, tip)
