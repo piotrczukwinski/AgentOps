@@ -65,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     sub.add_parser("doctor", help="Check local dependencies.")
+
+    serve = sub.add_parser("serve", help="Start the local AgentOps web UI (local-only, default 127.0.0.1:8765).")
+    serve.add_argument("--host", default="127.0.0.1", help="Host to bind the local UI on. Default: 127.0.0.1 (local-only).")
+    serve.add_argument("--port", type=int, default=8765, help="TCP port for the local UI. Default: 8765.")
     return parser
 
 
@@ -119,6 +123,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "doctor":
             return _cmd_doctor()
+
+        if args.command == "serve":
+            from . import web as _web  # local import; CLI stays light when not serving
+
+            return _web.serve(host=args.host, port=args.port)
 
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
