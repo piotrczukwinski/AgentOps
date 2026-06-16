@@ -253,14 +253,23 @@ def _verdict_from_dict(data: dict[str, Any]) -> ReviewVerdict:
                 "suggested_fix": str(item.get("suggested_fix", "")),
             }
         )
+    # Backward-compat shim for the legacy ``codex_review.schema.json``:
+    # that schema does not declare ``safe_to_push`` / ``safe_to_merge``.
+    # The conservative default for the new ``review_verdict.schema.json`` is
+    # False, but legacy verdicts must keep behaving as if the reviewer
+    # approved push/merge (i.e. True). We detect the legacy shape by the
+    # absence of either key in the raw payload.
+    legacy = "safe_to_push" not in data and "safe_to_merge" not in data
+    safe_to_push_default = bool(legacy)
+    safe_to_merge_default = bool(legacy)
     return ReviewVerdict(
         verdict=verdict,
         confidence=str(data.get("confidence", "low")),
         summary=str(data.get("summary", "")),
         blocking_issues=tuple(normalized_issues),
         repair_prompt=str(data.get("repair_prompt", "")),
-        safe_to_push=bool(data.get("safe_to_push", False)),
-        safe_to_merge=bool(data.get("safe_to_merge", False)),
+        safe_to_push=bool(data.get("safe_to_push", safe_to_push_default)),
+        safe_to_merge=bool(data.get("safe_to_merge", safe_to_merge_default)),
         raw=data,
     )
 

@@ -17,7 +17,8 @@
   "review": {
     "codex": "auto",
     "risk_threshold": 4,
-    "fallback_heuristic": false
+    "fallback_heuristic": false,
+    "schema": "../../schemas/review_verdict.schema.json"
   },
   "reviewer": "codex",
   "defaults": {

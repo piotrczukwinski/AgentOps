@@ -61,6 +61,13 @@ ACCEPTED_OUTCOMES = {
     TaskState.MERGED.value,
 }
 
+# Default review verdict schema. The orchestrator falls back to this when
+# neither the task nor the roadmap-level review config specifies a schema
+# path. The path is resolved relative to the AgentOps source tree (which
+# is the install location in production) so it works both for editable
+# installs and for repository checkouts.
+DEFAULT_REVIEW_SCHEMA_PATH = "schemas/review_verdict.schema.json"
+
 
 @dataclass(frozen=True)
 class RunOptions:
@@ -626,7 +633,7 @@ class Orchestrator:
         self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.CODEX_REVIEWING)
         self.state.event(roadmap.roadmap_id, task.id, attempt_id, "task.review_requested", {"reviewer": "codex"})
         budget.record_codex_prompt(review_prompt)
-        schema_path = Path(task.review.schema_path).expanduser().resolve() if task.review.schema_path else None
+        schema_path = self._resolve_review_schema(roadmap, task)
         verdict, result_path = codex_service.review(
             review_prompt_path, target_worktree, attempt_dir, schema_path=schema_path, timeout_seconds=task.timeout_seconds
         )
@@ -832,6 +839,54 @@ class Orchestrator:
     # ------------------------------------------------------------------
     def _policy_for(self, roadmap: RoadmapConfig) -> PolicyEngine:
         return PolicyEngine(roadmap)
+
+    def _resolve_review_schema(
+        self,
+        roadmap: RoadmapConfig,
+        task: TaskConfig,
+        *,
+        repo_path: Path | None = None,
+    ) -> Path | None:
+        """Resolve the JSON-Schema path the codex command should advertise.
+
+        Resolution order:
+
+        1. ``task.review.schema_path`` (per-task override, wins).
+        2. ``roadmap.review.schema_path`` (roadmap-level default).
+        3. The bundled default at ``schemas/review_verdict.schema.json``
+           resolved relative to the AgentOps source tree.
+
+        The returned path is always absolute and ``expanduser``-ed. Returns
+        ``None`` only when the bundled default cannot be located, which
+        indicates a broken install; callers can then fall back to running
+        codex without an ``--output-schema`` flag.
+        """
+        candidates: list[str | None] = [
+            task.review.schema_path,
+            roadmap.review.schema_path,
+        ]
+        for raw in candidates:
+            if not raw:
+                continue
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                # Configs may resolve relative to the roadmap file or repo.
+                if roadmap.path is not None:
+                    path = (roadmap.path.parent / path).resolve()
+                elif repo_path is not None:
+                    path = (repo_path / path).resolve()
+                else:
+                    path = path.resolve()
+            return path
+        # Bundled default: schemas/review_verdict.schema.json next to the
+        # installed agentops package. agentops lives at <repo>/agentops and
+        # the schemas are at <repo>/schemas, so two levels up.
+        here = Path(__file__).resolve().parent
+        for base in (here.parent, here):
+            candidate = base / DEFAULT_REVIEW_SCHEMA_PATH
+            if candidate.exists():
+                return candidate
+        return None
 
     def _runner_for(self, task: TaskConfig) -> BaseRunner:
         """Return a runner for ``task`` honoring any test-injected override.

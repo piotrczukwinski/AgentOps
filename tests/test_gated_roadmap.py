@@ -1019,5 +1019,551 @@ class BuildCodexCommandTests(unittest.TestCase):
         self.assertNotIn("--json", cmd)
 
 
+# ---------------------------------------------------------------------------
+# Schema path end-to-end wiring (review.schema / review.schema_path,
+# roadmap vs task overrides, default fallback)
+# ---------------------------------------------------------------------------
+
+
+class ReviewSchemaPathTests(unittest.TestCase):
+    def _init_repo(self, parent: Path) -> Path:
+        repo = parent / "repo"
+        repo.mkdir()
+        git(repo, "init")
+        git(repo, "config", "user.email", "agentops@example.invalid")
+        git(repo, "config", "user.name", "AgentOps Test")
+        (repo / "README.md").write_text("seed\n", encoding="utf-8")
+        git(repo, "add", "README.md")
+        git(repo, "commit", "-m", "initial")
+        return repo
+
+    def _write_roadmap(
+        self,
+        root: Path,
+        repo: Path,
+        *,
+        roadmap_review: dict[str, object] | None = None,
+        task_review: dict[str, object] | None = None,
+        task_id: str = "T1",
+    ) -> Path:
+        prompt = root / "prompt.md"
+        prompt.write_text("x", encoding="utf-8")
+        roadmap_path = root / "r.json"
+        review_obj: dict[str, object] = {"codex": "required"}
+        if task_review is not None:
+            review_obj.update(task_review)
+        payload: dict[str, object] = {
+            "version": 1,
+            "roadmap_id": "schema-path",
+            "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+            "tasks": [
+                {
+                    "id": task_id,
+                    "kind": "implementation",
+                    "executor": "shell",
+                    "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('x\\n', encoding='utf-8')\"",
+                    "prompt": str(prompt),
+                    "allowed_files": ["out.txt"],
+                    "validations": ["true"],
+                    "review": review_obj,
+                }
+            ],
+        }
+        if roadmap_review is not None:
+            payload["review"] = roadmap_review
+        roadmap_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return roadmap_path
+
+    def test_default_review_schema_path_is_review_verdict(self) -> None:
+        """When neither task nor roadmap sets a schema, the bundled
+        review_verdict.schema.json must be resolved."""
+        from agentops.orchestrator import Orchestrator
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._init_repo(root)
+            roadmap_path = self._write_roadmap(root, repo)
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+
+            captured_schemas: list[Path | None] = []
+
+            class _CapturingCodex(FakeCodexService):
+                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds):
+                    captured_schemas.append(schema_path)
+                    return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
+
+            cap = _CapturingCodex(
+                [ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True)]
+            )
+            Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=cap,
+            ).run_roadmap(roadmap)
+
+            self.assertEqual(len(captured_schemas), 1)
+            resolved = captured_schemas[0]
+            self.assertIsNotNone(resolved)
+            self.assertTrue(resolved.exists(), f"default schema should exist on disk: {resolved}")
+            self.assertEqual(resolved.name, "review_verdict.schema.json")
+            # The schema must be the real, content-valid file shipped with AgentOps.
+            data = json.loads(resolved.read_text(encoding="utf-8"))
+            self.assertIn("properties", data)
+            self.assertEqual(data["required"][0], "verdict")
+
+    def test_task_schema_path_overrides_roadmap_schema_path(self) -> None:
+        """A task with review.schema must take precedence over the
+        roadmap-level review.schema and the bundled default."""
+        from agentops.orchestrator import Orchestrator
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._init_repo(root)
+            # Two schemas side by side. The task asks for ``task.schema.json``
+            # and the roadmap asks for ``roadmap.schema.json``.
+            schemas_dir = root / "schemas"
+            schemas_dir.mkdir()
+            task_schema = schemas_dir / "task.schema.json"
+            task_schema.write_text(json.dumps({"type": "object"}), encoding="utf-8")
+            roadmap_schema = schemas_dir / "roadmap.schema.json"
+            roadmap_schema.write_text(json.dumps({"type": "object"}), encoding="utf-8")
+
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "schema-precedence",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "review": {"codex": "required", "schema": "schemas/roadmap.schema.json"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('x\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required", "schema_path": "schemas/task.schema.json"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+
+            captured: list[Path | None] = []
+
+            class _Cap(FakeCodexService):
+                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds):
+                    captured.append(schema_path)
+                    return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
+
+            cap = _Cap([ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True)])
+            Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=cap,
+            ).run_roadmap(roadmap)
+
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0].resolve(), task_schema.resolve())
+            # Also verify the resolved argv is what the runner would use.
+            self.assertIn(str(task_schema.resolve()), cap.calls[0]["argv"])
+
+    def test_roadmap_schema_path_used_when_task_omits_schema(self) -> None:
+        """If only the roadmap sets a schema, it must propagate to the
+        codex command via the orchestrator's resolution helper."""
+        from agentops.orchestrator import Orchestrator
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._init_repo(root)
+            schemas_dir = root / "schemas"
+            schemas_dir.mkdir()
+            roadmap_schema = schemas_dir / "roadmap.schema.json"
+            roadmap_schema.write_text(json.dumps({"type": "object"}), encoding="utf-8")
+
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "schema-roadmap",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "review": {"codex": "required", "schema": "schemas/roadmap.schema.json"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('x\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+
+            captured: list[Path | None] = []
+
+            class _Cap(FakeCodexService):
+                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds):
+                    captured.append(schema_path)
+                    return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
+
+            cap = _Cap([ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True)])
+            Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=cap,
+            ).run_roadmap(roadmap)
+
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0].resolve(), roadmap_schema.resolve())
+            # The argv passed to the runner includes the resolved --output-schema
+            # pointing at the roadmap-level schema.
+            argv_strs = cap.calls[0]["argv"]
+            self.assertIn("--output-schema", argv_strs)
+            schema_idx = argv_strs.index("--output-schema")
+            self.assertEqual(Path(argv_strs[schema_idx + 1]).resolve(), roadmap_schema.resolve())
+
+    def test_config_resolves_relative_schema_against_roadmap_dir(self) -> None:
+        """``review.schema`` paths are resolved relative to the directory
+        that contains the roadmap JSON file (not the cwd)."""
+        from agentops.config import load_roadmap
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "nested"
+            nested.mkdir()
+            schemas_dir = nested / "schemas"
+            schemas_dir.mkdir()
+            schema = schemas_dir / "task.schema.json"
+            schema.write_text(json.dumps({"type": "object"}), encoding="utf-8")
+
+            repo = self._init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = nested / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "schema-relative",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required", "schema": "schemas/task.schema.json"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            roadmap = load_roadmap(roadmap_path)
+            self.assertEqual(Path(roadmap.tasks[0].review.schema_path).resolve(), schema.resolve())
+
+    def test_legacy_codex_review_schema_defaults_safe_flags_true(self) -> None:
+        """Backwards compat: the legacy ``codex_review.schema.json`` does
+        not declare ``safe_to_push`` / ``safe_to_merge``. The parser must
+        default both to True so that legacy ACCEPT verdicts still flow
+        through the merge gate."""
+        from agentops.review import _verdict_from_dict
+
+        legacy = {
+            "verdict": "ACCEPT",
+            "confidence": "high",
+            "summary": "ok",
+            "blocking_issues": [],
+            "repair_prompt": "",
+        }
+        verdict = _verdict_from_dict(legacy)
+        self.assertTrue(verdict.safe_to_push, "legacy ACCEPT must default safe_to_push=True")
+        self.assertTrue(verdict.safe_to_merge, "legacy ACCEPT must default safe_to_merge=True")
+
+    def test_new_review_verdict_schema_explicit_false_wins(self) -> None:
+        """The new ``review_verdict.schema.json`` requires the reviewer to
+        be explicit. ``safe_to_push=false`` must round-trip as False."""
+        from agentops.review import _verdict_from_dict
+
+        new = {
+            "verdict": "ACCEPT",
+            "confidence": "high",
+            "summary": "ok",
+            "blocking_issues": [],
+            "repair_prompt": "",
+            "safe_to_push": False,
+            "safe_to_merge": True,
+        }
+        verdict = _verdict_from_dict(new)
+        self.assertFalse(verdict.safe_to_push)
+        self.assertTrue(verdict.safe_to_merge)
+
+
+# ---------------------------------------------------------------------------
+# Offline stub codex binary: end-to-end command-construction + parsing
+# ---------------------------------------------------------------------------
+
+
+class StubCodexBinaryTests(unittest.TestCase):
+    """Prepend a fake ``codex`` binary to PATH and verify the
+    orchestrator wires it through the same parsing path as the real one.
+
+    The fake binary:
+      * records its argv + cwd to a file (so we can assert on the contract),
+      * writes a valid review_verdict JSON to the -o / --output path,
+      * exits 0.
+    No network, no real codex required.
+    """
+
+    def _write_fake_codex(self, parent: Path, verdict: dict[str, object]) -> tuple[Path, Path]:
+        bin_dir = parent / "bin"
+        bin_dir.mkdir()
+        log = parent / "codex.calls.log"
+        script = bin_dir / "codex"
+        log_path = str(log)
+        # Write the verdict to a side file so the script reads it as JSON
+        # (avoids embedding Python/JSON dialect mixups in the script body).
+        verdict_file = parent / "fake_verdict.json"
+        verdict_file.write_text(json.dumps(verdict), encoding="utf-8")
+        verdict_path = str(verdict_file)
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            f"with open({log_path!r}, 'a', encoding='utf-8') as f:\n"
+            f"    f.write(json.dumps({{'argv': args, 'cwd': os.getcwd()}}) + '\\n')\n"
+            "out_path = None\n"
+            "for i, a in enumerate(args):\n"
+            "    if a == '-o' and i + 1 < len(args):\n"
+            "        out_path = args[i + 1]\n"
+            "        break\n"
+            "if out_path is None:\n"
+            "    sys.stderr.write('no -o path\\n')\n"
+            "    sys.exit(2)\n"
+            f"with open({verdict_path!r}, 'r', encoding='utf-8') as src, "
+            "open(out_path, 'w', encoding='utf-8') as out:\n"
+            "    out.write(src.read())\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return bin_dir, log
+
+    def test_fake_codex_binary_is_invoked_with_safety_flags_and_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            verdict = {
+                "verdict": "ACCEPT",
+                "confidence": "high",
+                "summary": "stub codex",
+                "blocking_issues": [],
+                "repair_prompt": "",
+                "safe_to_push": True,
+                "safe_to_merge": True,
+            }
+            bin_dir, call_log = self._write_fake_codex(tmpdir, verdict)
+
+            from agentops.orchestrator import Orchestrator
+            from agentops.review import CodexReviewService
+
+            repo = tmpdir / "repo"
+            repo.mkdir()
+            git(repo, "init")
+            git(repo, "config", "user.email", "agentops@example.invalid")
+            git(repo, "config", "user.name", "AgentOps Test")
+            (repo / "README.md").write_text("seed\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "initial")
+            prompt = tmpdir / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = tmpdir / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "stub-codex",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('x\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = StateStore(tmpdir / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            # Force the orchestrator to use the stub binary.
+            service = CodexReviewService(binary=str(bin_dir / "codex"))
+            Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=tmpdir / "artifacts",
+                    workspaces_root=tmpdir / "workspaces",
+                ),
+                review_service=service,
+            ).run_roadmap(roadmap)
+
+            # The fake binary was actually invoked.
+            self.assertTrue(call_log.exists(), "stub codex was not invoked")
+            calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines() if line]
+            self.assertEqual(len(calls), 1, "stub codex should be called once")
+            argv = calls[0]["argv"]
+            cwd = calls[0]["cwd"]
+            # Safety flags present.
+            self.assertIn("--sandbox", argv)
+            self.assertIn("read-only", argv)
+            self.assertIn("--ask-for-approval", argv)
+            self.assertIn("never", argv)
+            # --output-schema present and points at the bundled default.
+            self.assertIn("--output-schema", argv)
+            schema_idx = argv.index("--output-schema")
+            schema_path = Path(argv[schema_idx + 1])
+            self.assertTrue(schema_path.exists())
+            self.assertEqual(schema_path.name, "review_verdict.schema.json")
+            # -o path is an absolute file path the runner will read.
+            self.assertIn("-o", argv)
+            out_idx = argv.index("-o")
+            out_path = Path(argv[out_idx + 1])
+            self.assertTrue(out_path.is_absolute())
+            # cwd is the executor workspace (a worktree under workspaces-root).
+            self.assertIn(str(tmpdir / "workspaces"), cwd)
+
+            # The state machine accepted the task.
+            row = state.task_rows("stub-codex")[0]
+            self.assertEqual(row["state"], TaskState.ACCEPTED.value)
+
+    def test_build_codex_command_includes_schema_path(self) -> None:
+        """The single source of truth for the codex argv must include
+        ``--output-schema <resolved>`` when a schema is given."""
+        from agentops.review import build_codex_command
+        from agentops.runners import build_codex_command as run_build
+
+        # Both helpers must agree on the safety contract.
+        cmd = build_codex_command(Path("/tmp/p.md"), schema_path=Path("/tmp/s.json"))
+        run_cmd = run_build(Path("/tmp/p.md"), schema_path=Path("/tmp/s.json"))
+        self.assertEqual(cmd, run_cmd)
+        self.assertIn("--output-schema", cmd)
+        self.assertIn("/tmp/s.json", cmd)
+        self.assertIn("--sandbox", cmd)
+        self.assertIn("read-only", cmd)
+        self.assertIn("--ask-for-approval", cmd)
+        self.assertIn("never", cmd)
+        # No shell=True is possible because we are passing argv.
+        self.assertNotIn("--shell", cmd)
+
+    def test_fake_codex_binary_unavailable_moves_to_awaiting_review(self) -> None:
+        """When the binary path is bogus, codex.is_available() is False and
+        the task must land in awaiting_review (no auto-accept, no push)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            from agentops.orchestrator import Orchestrator
+            from agentops.review import CodexReviewService
+
+            repo = tmpdir / "repo"
+            repo.mkdir()
+            git(repo, "init")
+            git(repo, "config", "user.email", "agentops@example.invalid")
+            git(repo, "config", "user.name", "AgentOps Test")
+            (repo / "README.md").write_text("seed\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "initial")
+            prompt = tmpdir / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = tmpdir / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "stub-missing",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('x\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = StateStore(tmpdir / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            service = CodexReviewService(binary="/nonexistent/codex-binary-xyz")
+            self.assertFalse(service.is_available())
+            Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=tmpdir / "artifacts",
+                    workspaces_root=tmpdir / "workspaces",
+                ),
+                review_service=service,
+            ).run_roadmap(roadmap)
+
+            row = state.task_rows("stub-missing")[0]
+            self.assertEqual(row["state"], TaskState.AWAITING_REVIEW.value)
+            # No silent accept, no push, no merge.
+            events = [e["type"] for e in state.latest_events(50) if e["task_id"] == "T1"]
+            self.assertNotIn("task.accepted_by_review", events)
+            self.assertNotIn("task.merged_to_integration", events)
+            self.assertIn("task.awaiting_review", events)
+
+
 if __name__ == "__main__":
     unittest.main()

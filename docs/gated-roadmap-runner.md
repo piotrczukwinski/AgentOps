@@ -117,6 +117,34 @@ Codex writes a single JSON object that matches
 `merge_policy.require_safe_to_merge=true`. The verifier is in
 `agentops/review.py::parse_review_verdict_file`.
 
+### Schema path resolution
+
+The schema path advertised to Codex via `--output-schema` is resolved in
+this order:
+
+1. `tasks[].review.schema` or `tasks[].review.schema_path` — per-task
+   override, wins.
+2. `review.schema` or `review.schema_path` at the roadmap level —
+   roadmap-wide default.
+3. The bundled default at `schemas/review_verdict.schema.json` next to
+   the AgentOps source tree.
+
+Relative paths are resolved against the directory that contains the
+roadmap JSON file. Absolute paths are used as-is. The resolver lives in
+`agentops/orchestrator.py::Orchestrator._resolve_review_schema` and is
+covered by `tests/test_gated_roadmap.py::ReviewSchemaPathTests`.
+
+### Backward compatibility with the legacy `codex_review.schema.json`
+
+The earlier `schemas/codex_review.schema.json` did not declare
+`safe_to_push` or `safe_to_merge`. The parser detects that legacy shape
+(no `safe_to_push` key in the raw verdict) and defaults both flags to
+`True` so legacy ACCEPT verdicts keep flowing through the merge gate.
+For new roadmaps prefer the bundled `review_verdict.schema.json` and
+require the reviewer to be explicit about push/merge safety. The
+fallback is opt-out: any new-schema verdict that omits the flags is
+treated conservatively (both `False`).
+
 ## Integration branch merge
 
 The runner honors the `merge_policy` block:
@@ -188,8 +216,11 @@ When the flag is enabled, the runner still:
 
 **Yolo is dangerous.** It bypasses every interactive approval inside
 OpenCode. Only use it in isolated, throwaway executor workspaces where you
-trust the task prompt. For anything touching `app/`, `config/`,
-`migrations/`, `data/`, or `evidence/`, leave it off.
+trust the task prompt. The safest pairing is
+`execution_mode: gitless_mirror` (the executor cannot mutate the real
+worktree, and changes are copied back through `allowed_files` after the
+run). For anything touching `app/`, `config/`, `migrations/`, `data/`,
+or `evidence/`, leave it off.
 
 ## CLI surface
 
@@ -229,3 +260,17 @@ All per-task state is in `<repo>/.agentops/state.sqlite`. Tables:
 
 `agentops status` and `agentops logs` are the read APIs; `decide` and
 `review` are the write APIs for human-in-the-loop steering.
+
+## Known merge risks
+
+* `agentops/cli.py` and `README.md` are also touched by the local web UI
+  PR (`minimax/agentops-local-web-ui-001`). The two PRs share a common
+  base on `main` and both add subparser commands, so they will conflict
+  on `agentops/cli.py` and on the README CLI surface. Resolve in this
+  order: keep the gated runner's `review`, `decide`, and `review-queue`
+  commands; add the `serve` command from the web UI PR; reconcile
+  README CLI sections by listing the union of commands and the union of
+  flags.
+* The legacy `codex_review.schema.json` is still shipped for
+  backward compatibility with older review packets. New roadmaps should
+  use `review_verdict.schema.json` (the default).

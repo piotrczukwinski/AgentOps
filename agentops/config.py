@@ -119,13 +119,10 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
         if isinstance(review_data, str):
             review = ReviewConfig(codex=review_data)
         elif isinstance(review_data, dict):
-            schema_raw = review_data.get("schema")
-            schema_path = None
-            if schema_raw:
-                schema_candidate = Path(str(schema_raw))
-                if not schema_candidate.is_absolute():
-                    schema_candidate = (roadmap_path.parent / schema_candidate).resolve()
-                schema_path = str(schema_candidate)
+            schema_path = _resolve_schema_path(
+                review_data.get("schema_path") or review_data.get("schema"),
+                base=roadmap_path.parent,
+            )
             review = ReviewConfig(
                 codex=str(review_data.get("codex", item.get("review_policy", "auto"))),
                 risk_threshold=int(review_data.get("risk_threshold", defaults.get("codex_risk_threshold", 4))),
@@ -185,7 +182,7 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
         max_attempts_per_task=_optional_int(
             data.get("max_attempts_per_task", defaults.get("max_attempts_per_task"))
         ),
-        review=_build_roadmap_review(data.get("review", {}) or {}, defaults),
+        review=_build_roadmap_review(data.get("review", {}) or {}, defaults, base=roadmap_path.parent),
         reviewer=str(data.get("reviewer", defaults.get("reviewer", "codex"))),
     )
 
@@ -221,7 +218,16 @@ def _build_merge_policy(value: Any, defaults: dict[str, Any]) -> MergePolicy:
     )
 
 
-def _build_roadmap_review(value: Any, defaults: dict[str, Any]) -> ReviewConfig:
+def _resolve_schema_path(schema_raw: Any, *, base: Path) -> str | None:
+    if not schema_raw:
+        return None
+    schema_candidate = Path(str(schema_raw))
+    if not schema_candidate.is_absolute():
+        schema_candidate = (base / schema_candidate).resolve()
+    return str(schema_candidate)
+
+
+def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -> ReviewConfig:
     if not isinstance(value, dict):
         raise ConfigError("review must be an object at roadmap level")
     codex_raw = value.get("codex", value.get("default_mode", defaults.get("review_default_mode", "auto")))
@@ -231,6 +237,9 @@ def _build_roadmap_review(value: Any, defaults: dict[str, Any]) -> ReviewConfig:
     return ReviewConfig(
         codex=codex,
         risk_threshold=int(value.get("risk_threshold", defaults.get("codex_risk_threshold", 4))),
-        schema_path=None,
+        schema_path=_resolve_schema_path(
+            value.get("schema_path") or value.get("schema"),
+            base=base,
+        ),
         fallback_heuristic=bool(value.get("fallback_heuristic", defaults.get("review_fallback_heuristic", False))),
     )
