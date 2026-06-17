@@ -324,6 +324,9 @@ def write_status(
     idle_log_size_bytes: int | None = None,
     failure_category: str | None = None,
     result_status: str | None = None,
+    startup_for_seconds: float | None = None,
+    startup_timeout: float | None = None,
+    startup_log_size_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Update ``status.json`` for a run.
 
@@ -398,6 +401,12 @@ def write_status(
         payload["failure_category"] = str(failure_category)
     if result_status is not None:
         payload["result_status"] = str(result_status)
+    if startup_for_seconds is not None:
+        payload["startup_for_seconds"] = float(startup_for_seconds)
+    if startup_timeout is not None:
+        payload["startup_timeout"] = float(startup_timeout)
+    if startup_log_size_bytes is not None:
+        payload["startup_log_size_bytes"] = int(startup_log_size_bytes)
 
     status_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return payload
@@ -951,6 +960,7 @@ def _close_proc_handles(proc: subprocess.Popen[bytes]) -> None:
 # (or its process group when one is available).
 
 IDLE_TIMEOUT_REASON = "idle_timeout"
+NO_OUTPUT_STARTUP_REASON = "no_output_startup"
 STOP_REASON = "operator_stop"
 
 
@@ -1169,6 +1179,92 @@ class _IdleWatchdog:
             self._thread.join(timeout=self.poll_interval * 2)
 
 
+class _StartupWatchdog:
+    """Background watchdog that kills a run that never produced any output.
+
+    A real ``opencode run`` typically writes a banner or a few
+    progress bytes within a few seconds. When the harness sees
+    ``log_size_bytes == 0`` for longer than ``startup_timeout``
+    seconds while the process is still alive, it terminates the
+    process group and flags the run as ``needs_operator`` with
+    reason ``no_output_startup``. The operator can then re-run the
+    same prompt in the foreground (or via ``operator-retry``) to
+    see the actual error directly.
+
+    The watchdog only fires when the log is *zero bytes*; as soon as
+    the executor writes anything the watchdog exits cleanly and the
+    general ``--idle-timeout`` watchdog takes over.
+    """
+
+    def __init__(
+        self,
+        *,
+        log_path: Path,
+        pid: int,
+        startup_timeout: float,
+        poll_interval: float = 0.2,
+        sleep_fn: Callable[[float], None] | None = None,
+    ) -> None:
+        if startup_timeout <= 0:
+            raise ValueError("startup_timeout must be > 0")
+        self.log_path = Path(log_path)
+        self.pid = int(pid)
+        self.startup_timeout = float(startup_timeout)
+        self.poll_interval = max(0.05, float(poll_interval))
+        self._sleep = sleep_fn if sleep_fn is not None else time.sleep
+        self.triggered: bool = False
+        self.triggered_at: float | None = None
+        self.last_log_size: int = 0
+        self.elapsed: float = 0.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample(self) -> int:
+        stat = _safe_stat(self.log_path)
+        size = int(stat[0]) if stat is not None else 0
+        self.last_log_size = size
+        return size
+
+    def _loop(self) -> None:
+        try:
+            start = time.time()
+            while not self._stop.is_set():
+                size = self._sample()
+                if size > 0:
+                    # Log is no longer empty; the executor is alive and
+                    # producing output. Let the idle watchdog handle
+                    # any subsequent stalls.
+                    return
+                if not pid_alive(self.pid):
+                    return
+                self.elapsed = time.time() - start
+                if self.elapsed >= self.startup_timeout:
+                    terminate_process_group(self.pid, timeout=0.0)
+                    self.triggered = True
+                    self.triggered_at = time.time()
+                    return
+                if self._stop.wait(self.poll_interval):
+                    return
+        except Exception:  # noqa: BLE001 - background watchdog, never raise
+            return
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._sample()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="agentops-startup-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.poll_interval * 2)
+
+
 def _read_idle_timeout_from_args(args: argparse.Namespace | None) -> float | None:
     """Return the ``--idle-timeout`` value from ``args`` or ``None``.
 
@@ -1206,6 +1302,7 @@ def run_foreground(
     *,
     env: dict[str, str] | None = None,
     idle_timeout: float | None = None,
+    startup_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Run the executor in the foreground, writing status/logs/result.
 
@@ -1215,6 +1312,14 @@ def run_foreground(
     the active combined.log; if the log does not grow for that many
     seconds the watchdog terminates the process group and the run is
     finalised with status ``needs_operator`` and reason ``idle_timeout``.
+
+    When ``startup_timeout`` is not ``None`` a second, faster
+    watchdog fires only when ``log_size_bytes`` is still 0 after
+    that many seconds. The terminal status is then
+    ``needs_operator`` with reason ``no_output_startup`` so the
+    operator (and the morning checklist) can tell the difference
+    between "ran for a while then stalled" and "never produced
+    any output at all".
     """
     proc = launch_run(spec, run_dir_path, argv, env=env)
     started_at: str = proc._agentops_started_at  # type: ignore[attr-defined]
@@ -1230,6 +1335,11 @@ def run_foreground(
         pid=proc.pid,
         idle_timeout=idle_timeout,
     )
+    startup_watchdog = _start_startup_watchdog(
+        log_path=run_dir_path / "combined.log",
+        pid=proc.pid,
+        startup_timeout=startup_timeout,
+    )
 
     try:
         try:
@@ -1243,6 +1353,8 @@ def run_foreground(
     finally:
         if watchdog is not None:
             watchdog.stop()
+        if startup_watchdog is not None:
+            startup_watchdog.stop()
         # Always drain tee threads and close file handles so we do not
         # leak descriptors on errors. The tee threads exit when the
         # pipes see EOF after ``proc.wait()`` returns.
@@ -1251,9 +1363,16 @@ def run_foreground(
 
     ended_at = utc_now()
     idle_was_triggered = watchdog is not None and watchdog.triggered
+    startup_was_triggered = startup_watchdog is not None and startup_watchdog.triggered
     # Append a small banner to the combined log so operator-tail shows
     # the run finished marker even if the executor did not flush.
-    if idle_was_triggered:
+    if startup_was_triggered:
+        extra = (
+            f"\n[agentops] run terminated by startup watchdog after "
+            f"{startup_watchdog.startup_timeout:.0f}s without any log output "
+            f"(last size {startup_watchdog.last_log_size} bytes) at {ended_at}\n"
+        )
+    elif idle_was_triggered:
         extra = (
             f"\n[agentops] run terminated by idle watchdog after "
             f"{watchdog.idle_timeout:.0f}s without log growth "
@@ -1264,7 +1383,9 @@ def run_foreground(
     _append_combined(run_dir_path, stdout_text="", stderr_text=extra)
 
     terminal_status, terminal_reason = _idle_terminal_status(
-        exit_code=exit_code, watchdog=watchdog
+        exit_code=exit_code,
+        watchdog=watchdog,
+        startup_watchdog=startup_watchdog,
     )
     payload = write_status(
         run_dir_path,
@@ -1273,7 +1394,7 @@ def run_foreground(
         exit_code=exit_code,
         ended_at=ended_at,
         error=terminal_reason,
-        **(_idle_status_kwargs(watchdog) or {}),
+        **(_idle_status_kwargs(watchdog, startup_watchdog) or {}),
     )
 
     # Try to extract the structured result so the operator does not have to
@@ -1298,7 +1419,7 @@ def run_foreground(
             error=str(exc),
             failure_category=failure_category,
             result_status="template",
-            **(_idle_status_kwargs(watchdog) or {}),
+            **(_idle_status_kwargs(watchdog, startup_watchdog) or {}),
         )
         return payload
     except ResultNotFound as exc:
@@ -1316,7 +1437,7 @@ def run_foreground(
                 error=str(exc),
                 failure_category=failure_category,
                 result_status="missing",
-                **(_idle_status_kwargs(watchdog) or {}),
+                **(_idle_status_kwargs(watchdog, startup_watchdog) or {}),
             )
             return payload
         # Non-zero exit + no result: keep the existing behavior
@@ -1334,7 +1455,7 @@ def run_foreground(
         ended_at=ended_at,
         error=terminal_reason,
         result_path=str(run_dir_path / "result.json"),
-        **(_idle_status_kwargs(watchdog) or {}),
+        **(_idle_status_kwargs(watchdog, startup_watchdog) or {}),
     )
     return payload
 
@@ -1357,12 +1478,43 @@ def _start_idle_watchdog(
     return watchdog
 
 
+def _start_startup_watchdog(
+    *,
+    log_path: Path,
+    pid: int,
+    startup_timeout: float | None,
+) -> _StartupWatchdog | None:
+    """Start the startup watchdog if ``startup_timeout`` is set, else return ``None``.
+
+    The watchdog fires only while ``log_size_bytes == 0``; as soon
+    as the executor writes anything it exits cleanly and the
+    general idle watchdog takes over.
+    """
+    if startup_timeout is None or startup_timeout <= 0:
+        return None
+    watchdog = _StartupWatchdog(
+        log_path=log_path,
+        pid=pid,
+        startup_timeout=float(startup_timeout),
+    )
+    watchdog.start()
+    return watchdog
+
+
 def _idle_terminal_status(
     *,
     exit_code: int,
     watchdog: _IdleWatchdog | None,
+    startup_watchdog: _StartupWatchdog | None = None,
 ) -> tuple[str, str | None]:
-    """Return the (terminal_status, error) pair to write after the attempt."""
+    """Return the (terminal_status, error) pair to write after the attempt.
+
+    A startup watchdog firing takes precedence: it always means the
+    executor never produced any output, so the operator wants the
+    ``no_output_startup`` reason on the status record.
+    """
+    if startup_watchdog is not None and startup_watchdog.triggered:
+        return (NEEDS_OPERATOR_STATUS, NO_OUTPUT_STARTUP_REASON)
     if watchdog is not None and watchdog.triggered:
         return (NEEDS_OPERATOR_STATUS, IDLE_TIMEOUT_REASON)
     if exit_code == 0:
@@ -1370,19 +1522,26 @@ def _idle_terminal_status(
     return (EXITED_STATUS, None)
 
 
-def _idle_status_kwargs(watchdog: _IdleWatchdog | None) -> dict[str, Any] | None:
+def _idle_status_kwargs(
+    watchdog: _IdleWatchdog | None,
+    startup_watchdog: _StartupWatchdog | None = None,
+) -> dict[str, Any] | None:
     """Return extra ``write_status`` kwargs to record the watchdog state."""
-    if watchdog is None:
-        return None
     out: dict[str, Any] = {}
-    if watchdog.last_log_at is not None:
-        out["last_log_at"] = datetime.fromtimestamp(
-            watchdog.last_log_at, tz=UTC
-        ).isoformat(timespec="seconds")
-    if watchdog.triggered:
-        out["idle_for_seconds"] = float(watchdog.idle_timeout)
-        out["idle_timeout"] = float(watchdog.idle_timeout)
-        out["idle_log_size_bytes"] = int(watchdog.last_log_size)
+    if watchdog is not None:
+        if watchdog.last_log_at is not None:
+            out["last_log_at"] = datetime.fromtimestamp(
+                watchdog.last_log_at, tz=UTC
+            ).isoformat(timespec="seconds")
+        if watchdog.triggered:
+            out["idle_for_seconds"] = float(watchdog.idle_timeout)
+            out["idle_timeout"] = float(watchdog.idle_timeout)
+            out["idle_log_size_bytes"] = int(watchdog.last_log_size)
+    if startup_watchdog is not None and startup_watchdog.triggered:
+        out["startup_for_seconds"] = float(startup_watchdog.elapsed)
+        out["startup_timeout"] = float(startup_watchdog.startup_timeout)
+        out["startup_log_size_bytes"] = int(startup_watchdog.last_log_size)
+        out["failure_category"] = NO_OUTPUT_STARTUP_REASON
     return out or None
 
 
@@ -1456,6 +1615,7 @@ def run_attempt_foreground(
     env: dict[str, str] | None = None,
     attempt_status: str = RUNNING_STATUS,
     idle_timeout: float | None = None,
+    startup_timeout: float | None = None,
 ) -> AttemptResult:
     """Run a single attempt and return its outcome.
 
@@ -1472,6 +1632,11 @@ def run_attempt_foreground(
     ``classification.reason`` (``"idle_timeout"``) and on
     ``exit_code=137`` so the retry loop can treat the attempt as
     non-transient.
+
+    ``startup_timeout`` adds a separate, faster watchdog that fires
+    only while ``log_size_bytes`` is still 0; it is recorded with
+    classification ``no_output_startup`` and exit code 137 so the
+    retry loop can tell the two failure modes apart.
     """
     target_log_dir = log_dir if log_dir is not None else run_dir_path
     target_log_dir.mkdir(parents=True, exist_ok=True)
@@ -1490,6 +1655,11 @@ def run_attempt_foreground(
         pid=proc.pid,
         idle_timeout=idle_timeout,
     )
+    startup_watchdog = _start_startup_watchdog(
+        log_path=target_log_dir / "combined.log",
+        pid=proc.pid,
+        startup_timeout=startup_timeout,
+    )
 
     try:
         try:
@@ -1501,12 +1671,38 @@ def run_attempt_foreground(
     finally:
         if watchdog is not None:
             watchdog.stop()
+        if startup_watchdog is not None:
+            startup_watchdog.stop()
         _join_tee_threads(proc)
         _close_proc_handles(proc)
 
     ended_at = utc_now()
     idle_triggered = watchdog is not None and watchdog.triggered
-    if idle_triggered:
+    startup_triggered = startup_watchdog is not None and startup_watchdog.triggered
+    if startup_triggered:
+        _append_combined(
+            target_log_dir,
+            stdout_text="",
+            stderr_text=(
+                f"\n[agentops] attempt {attempt_no} terminated by startup watchdog after "
+                f"{startup_watchdog.startup_timeout:.0f}s without any log output "
+                f"(last size {startup_watchdog.last_log_size} bytes) at {ended_at}\n"
+            ),
+        )
+        _idle_status_kwargs_dict = _idle_status_kwargs(watchdog, startup_watchdog)
+        if _idle_status_kwargs_dict is not None:
+            write_status(
+                run_dir_path,
+                status=attempt_status,
+                spec=spec,
+                pid=proc.pid,
+                started_at=started_at,
+                attempt=attempt_no,
+                error=NO_OUTPUT_STARTUP_REASON,
+                **_idle_status_kwargs_dict,
+            )
+        reported_exit_code = 137
+    elif idle_triggered:
         _append_combined(
             target_log_dir,
             stdout_text="",
@@ -1544,7 +1740,9 @@ def run_attempt_foreground(
         reported_exit_code = int(exit_code)
     stdout_text, stderr_text = _read_attempt_log(target_log_dir)
     classification: TransientClassification
-    if idle_triggered:
+    if startup_triggered:
+        classification = TransientClassification(transient=False, reason=NO_OUTPUT_STARTUP_REASON)
+    elif idle_triggered:
         # Idle terminations are never transient: a stalled run will not
         # recover on its own, so we want the retry loop (if any) to stop
         # and the operator to be told to inspect the run.
@@ -1590,6 +1788,7 @@ def run_foreground_with_retries(
     start_log_dir: Path | None = None,
     start_attempt_no: int = 1,
     idle_timeout: float | None = None,
+    startup_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Run the executor in the foreground with optional transient retry.
 
@@ -1669,6 +1868,7 @@ def run_foreground_with_retries(
             env=env,
             attempt_status=attempt_status,
             idle_timeout=idle_timeout,
+            startup_timeout=startup_timeout,
         )
         if on_attempt is not None:
             on_attempt(result)
@@ -1737,6 +1937,7 @@ def _finalize_attempts(
         and last.exit_code != 0
     )
     is_idle_termination = classification.reason == IDLE_TIMEOUT_REASON
+    is_startup_termination = classification.reason == NO_OUTPUT_STARTUP_REASON
     terminal_status = EXITED_STATUS
     error: str | None = None
     if is_transient_exhaustion:
@@ -1745,6 +1946,9 @@ def _finalize_attempts(
         # sets the runtime overlay to ``needs_operator`` when the operator
         # explicitly asks for that state via ``operator-retry``.
         terminal_status = TRANSIENT_FAILED_STATUS
+    elif is_startup_termination:
+        terminal_status = NEEDS_OPERATOR_STATUS
+        error = NO_OUTPUT_STARTUP_REASON
     elif is_idle_termination:
         terminal_status = NEEDS_OPERATOR_STATUS
         error = IDLE_TIMEOUT_REASON
@@ -1844,8 +2048,11 @@ def prepare_retry_run(
 
     # Always write a per-attempt prompt.md so the operator can inspect
     # the exact prompt the executor saw, even when no resume hint was
-    # added. The argv's last element is updated to point at this file
-    # so the executor reads from a stable per-attempt path.
+    # added. The argv's last element is updated to the new prompt
+    # CONTENT (not a file path) so the executor does not silently
+    # receive a path that may not be readable. The per-attempt
+    # ``prompt.md`` is preserved for the operator's audit trail; the
+    # executor still receives the prompt string verbatim.
     original_prompt_path = target / "prompt.md"
     original_prompt = (
         original_prompt_path.read_text(encoding="utf-8")
@@ -1859,7 +2066,7 @@ def prepare_retry_run(
         new_prompt = original_prompt
     new_prompt_path.write_text(new_prompt, encoding="utf-8")
     argv = list(argv)
-    argv[-1] = str(new_prompt_path)
+    argv[-1] = new_prompt
 
     # Persist the per-attempt command.json so the operator can inspect
     # the exact argv the harness used for this attempt.
@@ -2310,6 +2517,8 @@ def _suggested_action(
         return "operator-tail then operator-stop"
     if canonical == TRANSIENT_FAILED_STATUS and transient_reason:
         return "operator-retry"
+    if canonical == NEEDS_OPERATOR_STATUS and transient_reason == NO_OUTPUT_STARTUP_REASON:
+        return "raw_fallback_or_foreground"
     if canonical == NEEDS_OPERATOR_STATUS:
         return "inspect log then operator-retry"
     return None
@@ -2657,12 +2866,16 @@ JSON_STATUS_FIELDS = (
     "last_log_at",
     "idle_for_seconds",
     "idle_timeout",
+    "startup_for_seconds",
+    "startup_timeout",
+    "startup_log_size_bytes",
     "stopped_at",
     "stop_reason",
     "result_path",
     "suggested_action",
     "runtime_status_note",
     "runtime_status_alias",
+    "failure_category",
 )
 
 

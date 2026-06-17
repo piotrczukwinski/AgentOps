@@ -15,7 +15,6 @@ import unittest
 from pathlib import Path
 
 from agentops.config import load_roadmap
-from agentops.orchestrator import Orchestrator, RunOptions
 from agentops.operator_run import (
     MISSING_RESULT_CATEGORY,
     RESULT_MARKER,
@@ -24,6 +23,7 @@ from agentops.operator_run import (
     failure_category_for_result_marker,
     is_template_placeholder_result,
 )
+from agentops.orchestrator import Orchestrator, RunOptions
 from agentops.state import StateStore
 
 

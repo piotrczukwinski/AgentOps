@@ -56,7 +56,32 @@ class MaxTasksBudgetTests(unittest.TestCase):
 
 
 class MaxTaskAttemptsBudgetTests(unittest.TestCase):
-    def test_max_task_attempts_blocks_third_in_two_attempt_budget(self) -> None:
+    def test_max_task_attempts_per_task_blocks_third_attempt_of_same_task(self) -> None:
+        # Per-task semantics: each task gets up to ``max_task_attempts``
+        # attempts independently. A second task's first attempt must
+        # not be blocked by the first task's attempt count.
+        manager = BudgetManager(run_budget={"max_task_attempts": 2})
+        # Task A: 2 attempts are allowed, the 3rd is blocked.
+        self.assertTrue(manager.can_start_attempt(task_id="A").allowed)
+        manager.record_attempt_started(task_id="A")
+        self.assertTrue(manager.can_start_attempt(task_id="A").allowed)
+        manager.record_attempt_started(task_id="A")
+        decision = manager.can_start_attempt(task_id="A")
+        self.assertFalse(decision.allowed)
+        self.assertIn("max_task_attempts", decision.reason)
+        # Task B is independent and may run its full attempt budget
+        # even though Task A is exhausted.
+        self.assertTrue(manager.can_start_attempt(task_id="B").allowed)
+        manager.record_attempt_started(task_id="B")
+        self.assertTrue(manager.can_start_attempt(task_id="B").allowed)
+        manager.record_attempt_started(task_id="B")
+        decision_b = manager.can_start_attempt(task_id="B")
+        self.assertFalse(decision_b.allowed)
+        self.assertIn("max_task_attempts", decision_b.reason)
+
+    def test_max_task_attempts_legacy_global_counter_still_works(self) -> None:
+        # Callers that predate the per-task semantics and do not
+        # pass a ``task_id`` must keep working.
         manager = BudgetManager(run_budget={"max_task_attempts": 2})
         self.assertTrue(manager.can_start_attempt().allowed)
         manager.record_attempt_started()
@@ -65,6 +90,23 @@ class MaxTaskAttemptsBudgetTests(unittest.TestCase):
         decision = manager.can_start_attempt()
         self.assertFalse(decision.allowed)
         self.assertIn("max_task_attempts", decision.reason)
+
+    def test_max_total_task_attempts_is_run_level(self) -> None:
+        # ``max_total_task_attempts`` is an *additional* run-level cap
+        # on the cumulative number of attempts. It blocks further
+        # attempts even when the per-task budget is not yet exhausted.
+        manager = BudgetManager(
+            run_budget={"max_task_attempts": 5, "max_total_task_attempts": 3}
+        )
+        manager.record_attempt_started(task_id="A")
+        manager.record_attempt_started(task_id="A")
+        manager.record_attempt_started(task_id="A")
+        # Per-task budget for "A" is 5; cumulative is 3 -> blocked.
+        decision = manager.can_start_attempt(task_id="A")
+        self.assertFalse(decision.allowed)
+        self.assertIn("max_total_task_attempts", decision.reason)
+        # Other tasks are also blocked because the run cap is shared.
+        self.assertFalse(manager.can_start_attempt(task_id="B").allowed)
 
 
 class MaxReviewCallsBudgetTests(unittest.TestCase):

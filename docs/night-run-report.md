@@ -85,8 +85,16 @@ on `status.json` / `event` payloads).
 
 ### no-output startup stall
 
-* **Detected by:** the operator. A 0-byte `combined.log` for
-  several minutes after `--detach` is the canonical symptom.
+* **Category:** `no_output_startup`
+* **Detected by:** the operator-run `--startup-timeout` watchdog
+  (`agentops/operator_run.py::_StartupWatchdog`).
+* **Behavior:** if the active `combined.log` is still 0 bytes
+  after `startup_timeout` seconds while the executor is still
+  alive, the watchdog terminates the process group, marks the
+  run as `needs_operator` with `reason: no_output_startup` and
+  `failure_category: no_output_startup`, and records
+  `startup_for_seconds`, `startup_timeout`, and
+  `startup_log_size_bytes` in `status.json`.
 * **Operator action:** foreground fallback (see below).
 
 ### missing final result
@@ -110,8 +118,17 @@ on `status.json` / `event` payloads).
 
 * **Category:** `budget_exceeded`
 * **Detected by:** the AO-CONTRACT-002 budget guards
-  (`max_tasks`, `max_task_attempts`, `max_review_calls`,
-  `max_run_seconds`).
+  (`max_tasks`, `max_task_attempts`, `max_total_task_attempts`,
+  `max_review_calls`, `max_run_seconds`).
+* **Behavior:** the affected task transitions to `BLOCKED` with
+  `failure_category: budget_exceeded` and a `budget_block_kind`
+  set to one of:
+  * `task_blocked_by_budget` — the per-task attempt cap was
+    reached.
+  * `run_blocked_by_budget` — the run-level attempt, task, or
+    wall-clock cap was reached.
+  * `review_blocked_by_budget` — the codex review cap was
+    reached.
 * **Operator action:** raise the cap in the roadmap and re-run
   the affected task, or split the roadmap into smaller pieces.
 
@@ -132,14 +149,45 @@ on `status.json` / `event` payloads).
 
 ### Codex unavailable / awaiting_review
 
-* **Detected by:** the orchestrator when `codex` is missing or
-  the budget is exhausted.
+* **Categories:** `codex_unavailable` / `review_unavailable`
+* **Detected by:** the orchestrator when `codex` is missing,
+  the codex process fails, or the codex JSONL output is not
+  parseable.
+* **Behavior:** tasks with `review.codex: required` move to
+  `AWAITING_REVIEW` (NEVER `ACCEPTED` via the heuristic
+  fallback). The `agentops export-summary` output must not
+  report the run as `passed` while any task is in
+  `awaiting_review` or `merge_failed` — the morning checklist
+  applies a verdict to each task before declaring the run
+  complete.
 * **Operator action:** in non-autonomous mode, the task
   transitions to `awaiting_review`. Apply a verdict with
   `agentops decide <task-id> --roadmap <path> --verdict
-  ACCEPT`. In autonomous mode, the heuristic reviewer is used
-  as a fallback; the verdict is recorded as `reviewer:
-  heuristic` in the state database.
+  ACCEPT`. In autonomous mode the heuristic reviewer is only
+  used when the task does NOT pin `codex=required`; required
+  tasks still go to `awaiting_review` so the morning checklist
+  is the single source of truth.
+
+### merge failed
+
+* **Category:** `merge_failed`
+* **Detected by:** the orchestrator's integration-branch
+  merge step (cherry-pick / ff / no_ff). The reviewer
+  accepted the change, but the merge refused it (the
+  integration branch is protected, the reviewer's
+  `safe_to_merge` was `False`, or the cherry-pick hit a
+  conflict).
+* **Behavior:** the task transitions to `merge_failed`. The
+  `agentops export-summary` output must not report the run as
+  `passed` while any task is in `merge_failed`; the summary
+  surfaces a `merge_failed=...` count and a "Merge-failed
+  tasks" section with the failed task ids so the morning
+  checklist can plan a manual salvage.
+* **Operator action:** the canonical salvage is to
+  squash-rebuild the integration branch with the accepted
+  task commits and re-run the affected tasks. The agent
+  MUST NOT silently fall back to a "clean pass" because the
+  review queue is empty.
 
 ## Failure modes NOT covered (remaining risks)
 

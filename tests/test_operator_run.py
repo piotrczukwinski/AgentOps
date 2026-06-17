@@ -1330,16 +1330,16 @@ class PrepareRetryRunTests(unittest.TestCase):
             )
             self.assertEqual(attempt_no, 2)
             self.assertEqual(spec.run_id, run_id)
-            # The original argv is preserved; only the prompt path is
-            # updated to point at the per-attempt prompt file.
+            # The original argv is preserved; only the prompt CONTENT
+            # is updated to the per-attempt prompt so the executor
+            # receives the prompt as a string, not a filesystem path.
             self.assertEqual(argv[0], "opencode")
             self.assertIn("run", argv)
             self.assertIn("--dir", argv)
             self.assertIn("--model", argv)
-            # argv's last element now points at the per-attempt
-            # prompt.md so the executor reads from a stable location.
-            self.assertEqual(argv[-1], str(attempt_dir(target, 2) / "prompt.md"))
-            # The per-attempt prompt is a verbatim copy of the original.
+            # argv's last element is the prompt content (not a path).
+            self.assertEqual(argv[-1], "do the original work")
+            # The per-attempt prompt.md is still on disk for audit.
             self.assertEqual(
                 (attempt_dir(target, 2) / "prompt.md").read_text(encoding="utf-8"),
                 "do the original work",
@@ -1360,16 +1360,20 @@ class PrepareRetryRunTests(unittest.TestCase):
             spec, _, argv, _ = prepare_retry_run(
                 root, run_id, resume_hint=hint, max_retries=3, backoff=[0.0], retry_on_transient=True
             )
-            # The argv's last element should now point at the new prompt
-            # file under attempts/2/ and that file should contain the
-            # original prompt + the resume hint.
-            new_prompt_path = Path(argv[-1])
-            self.assertEqual(new_prompt_path.parent, attempt_dir(target, 2))
-            content = new_prompt_path.read_text(encoding="utf-8")
+            # argv's last element is the merged prompt content; the
+            # original prompt + the resume hint are concatenated and
+            # passed as a string, not a path.
+            content = argv[-1]
+            self.assertIsInstance(content, str)
             self.assertIn("do the original work", content)
             self.assertIn("Continue from the current working tree", content)
             self.assertIn("rate_limit", content)
-            # Original prompt is still intact.
+            # The per-attempt prompt.md is on disk with the same merged
+            # content; the original prompt.md is intact.
+            self.assertEqual(
+                (attempt_dir(target, 2) / "prompt.md").read_text(encoding="utf-8"),
+                content,
+            )
             self.assertEqual((target / "prompt.md").read_text(encoding="utf-8"), "do the original work")
 
     def test_prepare_retry_rejects_missing_command_json(self) -> None:
@@ -2386,6 +2390,196 @@ class OperatorTailLatestAttemptTests(unittest.TestCase):
             self.assertIn("from-attempt-2", out2)
             result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
             self.assertEqual(result["status"], "from-attempt-2")
+
+
+# ---------------------------------------------------------------------------
+# No-output startup watchdog + prompt content vs path
+# ---------------------------------------------------------------------------
+
+
+def _write_silent_fake_opencode(bindir: Path, *, sleep_seconds: float) -> Path:
+    """Create a fake opencode that writes nothing to combined.log and then sleeps.
+
+    Used to simulate the AO-CONTRACT night-batch symptom: the executor
+    process is alive but its log stays at 0 bytes for several seconds.
+    The startup watchdog must fire and mark the run as
+    ``needs_operator`` with reason ``no_output_startup``.
+    """
+    bindir.mkdir(parents=True, exist_ok=True)
+    script = bindir / "opencode"
+    body_lines = [
+        "#!/bin/sh",
+        "set -eu",
+        "printf '%s\\n' \"$@\" >> \"$AGENTOPS_FAKE_CMD_LOG\"",
+        f"sleep {sleep_seconds}",
+        "exit 0",
+    ]
+    script.write_text("\n".join(body_lines) + "\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+class OperatorRunPromptContentTests(unittest.TestCase):
+    """``operator_run_passes_prompt_content_to_fake_opencode`` and friends."""
+
+    def _setup(self, tmp: str) -> tuple[Path, Path, Path, Path]:
+        bindir = Path(tmp) / "bin"
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        prompt = root / "prompt.md"
+        prompt.write_text("hello world", encoding="utf-8")
+        log = Path(tmp) / "cmd.log"
+        log.write_text("", encoding="utf-8")
+        return bindir, root, prompt, log
+
+    def test_operator_run_passes_prompt_content_to_fake_opencode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup(tmp)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(bindir, stdout="ok", exit_code=0)
+                spec, target, argv = start_run(
+                    root=root,
+                    name="content-check",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                # argv's last element is the prompt CONTENT, not a path.
+                self.assertEqual(argv[-1], "hello world")
+                self.assertNotIn("prompt.md", str(argv[-1]))
+                run_foreground(spec, target, argv)
+                # The fake recorded the argv: the last arg is the
+                # prompt content, not a path.
+                recorded = log.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(recorded)
+                self.assertEqual(recorded[-1], "hello world")
+                self.assertNotIn("prompt.md", recorded[-1])
+
+    def test_operator_retry_passes_prompt_content_to_fake_opencode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup(tmp)
+            prompt.write_text("the original prompt", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(bindir, stdout="", stderr="ETIMEDOUT", exit_code=1)
+                spec, target, argv = start_run(
+                    root=root,
+                    name="retry-content",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                run_foreground(spec, target, argv)
+            # The retry uses prepare_retry_run; reset the fake so we
+            # can observe the retry's argv cleanly.
+            log.write_text("", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(bindir, stdout="ok", exit_code=0)
+                spec2, target2, argv2, attempt_no = prepare_retry_run(
+                    root, spec.run_id, resume_hint=None, max_retries=1, backoff=[0.0], retry_on_transient=True
+                )
+                self.assertEqual(attempt_no, 2)
+                # argv2's last element is the prompt content, not a path.
+                self.assertEqual(argv2[-1], "the original prompt")
+                self.assertNotIn("prompt.md", str(argv2[-1]))
+                # The per-attempt prompt.md is on disk for audit.
+                self.assertEqual(
+                    (attempt_dir(target2, 2) / "prompt.md").read_text(encoding="utf-8"),
+                    "the original prompt",
+                )
+                run_foreground(spec2, target2, argv2)
+                recorded = log.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(recorded)
+                self.assertEqual(recorded[-1], "the original prompt")
+                self.assertNotIn("prompt.md", recorded[-1])
+
+
+class NoOutputStartupWatchdogTests(unittest.TestCase):
+    """``no_output_startup_timeout_marks_needs_operator``."""
+
+    def _setup(self, tmp: str) -> tuple[Path, Path, Path, Path]:
+        bindir = Path(tmp) / "bin"
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        prompt = root / "prompt.md"
+        prompt.write_text("hi", encoding="utf-8")
+        log = Path(tmp) / "cmd.log"
+        log.write_text("", encoding="utf-8")
+        return bindir, root, prompt, log
+
+    def test_no_output_startup_timeout_marks_needs_operator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup(tmp)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                # Fake that writes nothing to stdout/stderr and
+                # sleeps for a long time. The startup watchdog must
+                # fire before the idle watchdog.
+                _write_silent_fake_opencode(bindir, sleep_seconds=30)
+                spec, target, argv = start_run(
+                    root=root,
+                    name="startup",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                payload = run_foreground(
+                    spec,
+                    target,
+                    argv,
+                    startup_timeout=0.5,
+                    idle_timeout=600,
+                )
+            self.assertEqual(payload.get("status"), "needs_operator")
+            self.assertEqual(payload.get("error"), "no_output_startup")
+            status_payload = json.loads((target / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status_payload.get("status"), "needs_operator")
+            self.assertEqual(status_payload.get("error"), "no_output_startup")
+            self.assertEqual(status_payload.get("failure_category"), "no_output_startup")
+            self.assertIn("startup_timeout", status_payload)
+            self.assertIn("startup_for_seconds", status_payload)
+            # The idle watchdog must NOT have fired (its reason is
+            # 'idle_timeout', which is a different value).
+            self.assertNotEqual(status_payload.get("error"), "idle_timeout")
+
+    def test_stale_pid_with_zero_log_suggests_raw_fallback_or_retry(self) -> None:
+        # A 0-byte log + a dead pid is the "stale_pid + no output"
+        # combination. ``operator-status`` overlays this as
+        # ``runtime_status=stale_pid`` with ``suggested_action`` set
+        # so the operator (and the web panel) see the right hint.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir(exist_ok=True)
+            run = runs_root(root) / "stale-no-output"
+            run.mkdir(parents=True)
+            (run / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "stale-no-output",
+                        "name": "stale",
+                        "status": "running",
+                        "pid": 99999999,
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Empty combined.log; combined.log exists but is 0 bytes.
+            (run / "combined.log").write_text("", encoding="utf-8")
+            entries = list_status(root)
+            _, payload = entries[0]
+            self.assertEqual(payload.get("runtime_status"), "stale_pid")
+            # The JSON overlay surfaces the active log size and idle
+            # time, and the operator-action hint points at retry.
+            self.assertEqual(payload.get("log_size_bytes"), 0)
+            self.assertEqual(payload.get("suggested_action"), "operator-retry")
 
 
 if __name__ == "__main__":

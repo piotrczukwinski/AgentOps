@@ -103,6 +103,7 @@ Launches a long operator prompt under `.operator-runs/<run-id>/`.
 | `--detach` | off | Starts the process in a new session and returns immediately |
 | `--no-detach` | on | Runs in the foreground, waits for the process to exit |
 | `--idle-timeout` | unset | If set, terminate the process group when the active combined.log has not grown for N seconds. See [Idle watchdog](#idle-watchdog) below. |
+| `--startup-timeout` | unset | If set, terminate the process group when the active combined.log is still 0 bytes after N seconds. See [Startup watchdog](#startup-watchdog) below. |
 | `--retry-on-transient` | off | Classify failures; on transient ones, sleep and try again. See [Transient failure recovery](#transient-failure-recovery) below. |
 | `--backoff` | `5,15,45` | Comma-separated seconds to sleep between retry attempts. |
 | `--max-retries` | `3` | Additional attempts after the first one when `--retry-on-transient` is set. |
@@ -116,7 +117,11 @@ launched with `shell=False`.
 The harness never re-orders or re-words the executor argv; it only
 adds `--dir <dir> --model <model> [--dangerously-skip-permissions]`
 before the prompt. The prompt is read from `--prompt-file` and passed
-verbatim as the last argument.
+verbatim as the last argument; the harness never passes a prompt
+*file path* to the executor. `operator-retry` keeps the same
+contract: each attempt's `argv` last element is the merged prompt
+*content*, and a per-attempt `prompt.md` is written under
+`attempts/<n>/` for the operator's audit trail.
 
 ## `operator-status`
 
@@ -333,6 +338,44 @@ is in a different process group from the harness; a foreground run
 that shares the harness's process group is signalled on the bare pid
 so the watchdog can never kill the test runner or the operator's
 shell.
+
+## Startup watchdog
+
+A separate, faster watchdog covers the canonical "opencode never
+produced any output" symptom: the executor process is alive but its
+`combined.log` is still 0 bytes after several seconds. This is
+distinct from `--idle-timeout` because the operator wants to know
+whether the run *never started* (`no_output_startup`) or *started
+and then stalled* (`idle_timeout`).
+
+`--startup-timeout SECONDS` adds the startup watchdog. The watchdog
+polls the active `combined.log` every 200 ms; if the log is still
+0 bytes after `SECONDS` while the process is still alive, the
+watchdog terminates the process group and marks the run as
+`needs_operator` with:
+
+* `error: no_output_startup`,
+* `failure_category: no_output_startup`,
+* `startup_for_seconds` — the actual elapsed time,
+* `startup_timeout` — the configured threshold,
+* `startup_log_size_bytes` — the log size when the watchdog fired.
+
+`operator-status --format json` exposes all of the above so the
+local UI can render the row with the right color. The watchdog
+auto-disables itself the moment the log grows past 0 bytes; the
+general `--idle-timeout` watchdog takes over for the rest of the
+run.
+
+```bash
+# Kill the subprocess if its combined.log is still 0 bytes after 30
+# seconds. Pair with --idle-timeout for a full watchdog stack.
+python -m agentops operator-run \
+  --name business-agent-batch-001 \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --startup-timeout 30 \
+  --idle-timeout 600
+```
 
 ## Lifecycle for foreground mode
 

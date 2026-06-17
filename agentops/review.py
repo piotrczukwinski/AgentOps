@@ -227,10 +227,30 @@ class CodexReviewService:
                             "suggested_fix": "Inspect review.stderr and rerun or use manual review.",
                         },
                     ),
+                    raw={"codex_failure": True, "exit_code": int(result.exit_code), "timed_out": bool(result.timed_out)},
                 ),
                 result.stderr_path,
             )
         verdict = parse_review_verdict_file(result.stdout_path, fallback_path=output_path)
+        # ``parse_review_verdict_file`` synthesizes a BLOCK verdict when
+        # the JSONL stream had no parseable agent_message. Stamp a
+        # ``codex_failure`` marker on the raw payload so the orchestrator
+        # can tell a codex-process failure apart from a real reviewer
+        # BLOCK verdict (the summary is also a stable marker).
+        if (verdict.verdict or "").upper() == "BLOCK" and "parseable" in (verdict.summary or "").lower():
+            raw = dict(verdict.raw or {})
+            raw.setdefault("codex_failure", True)
+            raw.setdefault("parse_failure", True)
+            verdict = ReviewVerdict(
+                verdict=verdict.verdict,
+                confidence=verdict.confidence,
+                summary=verdict.summary,
+                blocking_issues=verdict.blocking_issues,
+                repair_prompt=verdict.repair_prompt,
+                safe_to_push=verdict.safe_to_push,
+                safe_to_merge=verdict.safe_to_merge,
+                raw=raw,
+            )
         return verdict, output_path if output_path.exists() else result.stdout_path
 
 

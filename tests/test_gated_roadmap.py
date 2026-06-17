@@ -619,7 +619,13 @@ class ScenarioDCodexMissingTests(unittest.TestCase):
             events = [e for e in state.latest_events(50) if e["task_id"] == "T1" and e["type"] == "task.accepted_by_review"]
             self.assertEqual(events, [])
 
-    def test_autonomous_falls_back_to_heuristic_when_codex_missing(self) -> None:
+    def test_autonomous_does_not_fallback_to_heuristic_when_codex_required(self) -> None:
+        # Regression for the AO-CONTRACT night-batch hardening: a
+        # ``codex=required`` task must NEVER be silently accepted via
+        # the heuristic fallback, even in autonomous mode. The
+        # runbook treats that as a hard policy violation and the
+        # task is moved to ``awaiting_review`` with a clear
+        # ``codex_unavailable`` failure category.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = _init_repo(root)
@@ -658,6 +664,55 @@ class ScenarioDCodexMissingTests(unittest.TestCase):
             )
             orch.run_roadmap(roadmap)
             row = state.task_rows("gated-autonomous")[0]
+            self.assertEqual(row["state"], TaskState.AWAITING_REVIEW.value)
+            # No silent ACCEPT event was recorded.
+            events = [e for e in state.latest_events(50) if e["task_id"] == "T1" and e["type"] == "task.accepted_by_review"]
+            self.assertEqual(events, [])
+
+    def test_autonomous_falls_back_to_heuristic_when_codex_optional(self) -> None:
+        # When ``review.codex`` is auto and the runbook allows the
+        # heuristic fallback, autonomous mode MAY use the heuristic
+        # reviewer so the run can finish without an operator.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "gated-autonomous-optional",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "review": {"codex": "auto", "fallback_heuristic": True},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('x\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "auto"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            orch = Orchestrator(
+                state,
+                RunOptions(autonomous=True, artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
+                review_service=UnavailableCodexService(),
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("gated-autonomous-optional")[0]
+            # Auto + fallback_heuristic -> heuristic may take over.
             self.assertEqual(row["state"], TaskState.ACCEPTED.value)
 
 

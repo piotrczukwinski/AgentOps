@@ -69,6 +69,54 @@ ACCEPTED_OUTCOMES = {
 DEFAULT_REVIEW_SCHEMA_PATH = "schemas/review_verdict.schema.json"
 
 
+def _is_codex_failure_verdict(verdict: ReviewVerdict) -> bool:
+    """Return True when ``verdict`` reflects a codex *process* failure
+    rather than a real reviewer BLOCK.
+
+    The :class:`agentops.review.CodexReviewService` synthesizes a
+    ``BLOCK`` verdict when the codex binary fails to start, when it
+    exits non-zero, or when its JSONL output is unparseable. Those
+    cases must NOT be treated as a reviewer's intentional BLOCK for
+    tasks that explicitly required Codex; the task has to be moved to
+    ``awaiting_review`` with a clear ``codex_unavailable`` /
+    ``review_unavailable`` failure category so the run summary does
+    not pretend the change was approved.
+
+    The detection is intentionally narrow so that a real reviewer's
+    BLOCK verdict (with a meaningful summary) is never misclassified.
+    """
+    if verdict is None:
+        return False
+    if (verdict.verdict or "").upper() != "BLOCK":
+        return False
+    summary = (verdict.summary or "").lower()
+    failure_markers = (
+        "codex review command failed",
+        "codex review failed",
+        "reviewer did not return a parseable final message",
+        "reviewer final message was not valid json",
+    )
+    if any(marker in summary for marker in failure_markers):
+        return True
+    # Also catch the marker the CodexReviewService sets in the raw
+    # payload when it cannot find a valid verdict.
+    raw = verdict.raw or {}
+    return isinstance(raw, dict) and raw.get("codex_failure") is True
+
+
+def _failure_category_for_verdict(verdict: ReviewVerdict) -> str:
+    """Map a codex-failure verdict to the canonical failure category.
+
+    Used together with :func:`_is_codex_failure_verdict` so a
+    required-codex task that the codex process could not complete
+    lands in ``awaiting_review`` with the right greppable category.
+    """
+    summary = (verdict.summary or "").lower()
+    if "codex review command failed" in summary or "codex review failed" in summary:
+        return "codex_unavailable"
+    return "review_unavailable"
+
+
 @dataclass(frozen=True)
 class RunOptions:
     no_codex: bool = False
@@ -167,11 +215,15 @@ class Orchestrator:
                     {
                         "reason": task_budget.reason,
                         "failure_category": "budget_exceeded",
+                        "budget_block_kind": "run_blocked_by_budget",
                     },
                 )
                 self._record_roadmap_event(
                     roadmap, "task.blocked_by_budget", task.id,
-                    extra={"reason": task_budget.reason},
+                    extra={
+                        "reason": task_budget.reason,
+                        "budget_block_kind": "run_blocked_by_budget",
+                    },
                 )
                 completed += 1
                 continue
@@ -218,6 +270,7 @@ class Orchestrator:
                             {
                                 "reason": run_budget.reason,
                                 "failure_category": "budget_exceeded",
+                                "budget_block_kind": "run_blocked_by_budget",
                             },
                         )
                 completed += 1
@@ -307,8 +360,16 @@ class Orchestrator:
         max_attempts = self._effective_max_attempts(task, roadmap)
         accepted_outcome = False
         for attempt_no in range(1, max_attempts + 1):
-            attempt_budget = budget.can_start_attempt()
+            attempt_budget = budget.can_start_attempt(task_id=task.id)
             if not attempt_budget.allowed:
+                # ``max_total_task_attempts`` blocks the run as a whole;
+                # ``max_task_attempts`` blocks just this task. The two
+                # cases are surfaced separately so the run summary can
+                # distinguish "task ran out of attempts" from
+                # "the run is over its hard attempt ceiling".
+                block_kind = "task_blocked_by_budget"
+                if "max_total_task_attempts" in (attempt_budget.reason or ""):
+                    block_kind = "run_blocked_by_budget"
                 self.state.transition_task(
                     roadmap.roadmap_id,
                     task.id,
@@ -316,14 +377,15 @@ class Orchestrator:
                     {
                         "reason": attempt_budget.reason,
                         "failure_category": "budget_exceeded",
+                        "budget_block_kind": block_kind,
                     },
                 )
                 self._record_roadmap_event(
                     roadmap, "task.blocked_by_budget", task.id,
-                    extra={"reason": attempt_budget.reason},
+                    extra={"reason": attempt_budget.reason, "budget_block_kind": block_kind},
                 )
                 return
-            budget.record_attempt_started()
+            budget.record_attempt_started(task_id=task.id)
             runtime.attempt = attempt_no
             attempt_dir = artifact_store.attempt_dir(roadmap.roadmap_id, task.id, attempt_no)
             attempt_id = self.state.create_attempt(
@@ -683,9 +745,22 @@ class Orchestrator:
                 {"reason": budget_decision.reason, "estimated_input_tokens": budget_decision.estimated_input_tokens},
             )
             self.state.transition_task(
-                roadmap.roadmap_id, task.id, TaskState.BLOCKED, {"reason": budget_decision.reason}
+                roadmap.roadmap_id,
+                task.id,
+                TaskState.BLOCKED,
+                {
+                    "reason": budget_decision.reason,
+                    "failure_category": "budget_exceeded",
+                    "budget_block_kind": "review_blocked_by_budget",
+                },
             )
-            self._record_roadmap_event(roadmap, "task.blocked_by_budget", task.id)
+            self._record_roadmap_event(
+                roadmap, "task.blocked_by_budget", task.id,
+                extra={
+                    "reason": budget_decision.reason,
+                    "budget_block_kind": "review_blocked_by_budget",
+                },
+            )
             return None
         review_prompt_path = artifact_store.write_text(attempt_dir, "review.prompt.md", review_prompt)
         self.state.record_artifact(
@@ -697,8 +772,15 @@ class Orchestrator:
             artifact_store.sha256(review_prompt_path),
         )
 
-        # If Codex is unavailable: fall back to heuristic in autonomous mode
-        # or when explicitly allowed; otherwise move to awaiting_review.
+        # If Codex is unavailable: fall back to heuristic only when the
+        # review policy explicitly allows it (``review.codex=auto`` /
+        # ``milestone_only`` and ``review.fallback_heuristic=true``) or
+        # when the operator opted in via ``--no-codex``. A task with
+        # ``review.codex=required`` must NEVER be silently accepted via
+        # the heuristic fallback, even in autonomous mode; the runbook
+        # treats that as a hard policy violation and the task is moved
+        # to ``awaiting_review`` with a clear ``codex_unavailable``
+        # failure category.
         if not codex_service.is_available():
             self.state.event(
                 roadmap.roadmap_id,
@@ -707,7 +789,12 @@ class Orchestrator:
                 "codex.unavailable",
                 {"binary": getattr(codex_service, "binary", "codex")},
             )
-            if self.options.autonomous or roadmap.review.fallback_heuristic:
+            task_codex = (task.review.codex or "").lower()
+            allow_heuristic_fallback = (
+                task_codex != "required"
+                and (roadmap.review.fallback_heuristic or self.options.no_codex)
+            )
+            if allow_heuristic_fallback:
                 self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.CODEX_REVIEWING)
                 self.state.event(roadmap.roadmap_id, task.id, attempt_id, "task.review_requested", {"reviewer": "heuristic"})
                 verdict, result_path = heuristic.review(
@@ -733,8 +820,32 @@ class Orchestrator:
                     {"verdict": verdict.verdict, "reviewer": "heuristic", "fallback": "codex_missing"},
                 )
                 return verdict
-            self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.AWAITING_REVIEW)
-            self._record_roadmap_event(roadmap, "task.awaiting_review", task.id)
+            # Required-Codex path: refuse to silently accept via heuristic.
+            self.state.event(
+                roadmap.roadmap_id,
+                task.id,
+                attempt_id,
+                "codex.required_unavailable",
+                {
+                    "binary": getattr(codex_service, "binary", "codex"),
+                    "autonomous": bool(self.options.autonomous),
+                    "review_codex": task_codex,
+                },
+            )
+            self.state.transition_task(
+                roadmap.roadmap_id,
+                task.id,
+                TaskState.AWAITING_REVIEW,
+                {
+                    "reason": "codex_unavailable",
+                    "failure_category": "codex_unavailable",
+                    "review_codex": task_codex,
+                },
+            )
+            self._record_roadmap_event(
+                roadmap, "task.awaiting_review", task.id,
+                extra={"reason": "codex_unavailable", "review_codex": task_codex},
+            )
             return None
 
         self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.CODEX_REVIEWING)
@@ -757,6 +868,43 @@ class Orchestrator:
             verdict.verdict,
             verdict.raw,
         )
+        # For tasks that require Codex, a codex process failure or
+        # unparseable verdict is NOT a real reviewer BLOCK. Reclassify
+        # such cases as ``awaiting_review`` with failure_category
+        # ``codex_unavailable`` (or ``review_unavailable`` for generic
+        # parse problems) so the run summary does not pretend the
+        # reviewer approved the change.
+        task_codex = (task.review.codex or "").lower()
+        if task_codex == "required" and _is_codex_failure_verdict(verdict):
+            failure_cat = _failure_category_for_verdict(verdict)
+            self.state.event(
+                roadmap.roadmap_id,
+                task.id,
+                attempt_id,
+                "codex.required_unavailable",
+                {
+                    "binary": getattr(codex_service, "binary", "codex"),
+                    "review_codex": task_codex,
+                    "failure_category": failure_cat,
+                    "summary": verdict.summary,
+                },
+            )
+            self.state.transition_task(
+                roadmap.roadmap_id,
+                task.id,
+                TaskState.AWAITING_REVIEW,
+                {
+                    "reason": failure_cat,
+                    "failure_category": failure_cat,
+                    "review_codex": task_codex,
+                    "summary": verdict.summary,
+                },
+            )
+            self._record_roadmap_event(
+                roadmap, "task.awaiting_review", task.id,
+                extra={"reason": failure_cat, "review_codex": task_codex},
+            )
+            return None
         self.state.transition_task(
             roadmap.roadmap_id,
             task.id,
@@ -1023,6 +1171,60 @@ class Orchestrator:
     def _record_roadmap_finished(self, roadmap: RoadmapConfig) -> None:
         rows = self.state.task_rows(roadmap.roadmap_id)
         counts: dict[str, int] = {}
+        merge_failed_count = 0
+        blocked_count = 0
+        awaiting_review_count = 0
         for row in rows:
             counts[row["state"]] = counts.get(row["state"], 0) + 1
-        self.state.event(roadmap.roadmap_id, None, None, "roadmap.finished", {"counts": counts})
+            if row["state"] == TaskState.MERGE_FAILED.value:
+                merge_failed_count += 1
+            elif row["state"] == TaskState.BLOCKED.value:
+                blocked_count += 1
+            elif row["state"] == TaskState.AWAITING_REVIEW.value:
+                awaiting_review_count += 1
+        # Run-level verdict: a run is "passed" only when every task
+        # reached an accepted outcome and no task is in
+        # ``merge_failed`` / ``blocked`` / ``awaiting_review``. This
+        # is the single source of truth for export-summary and the
+        # night-batch checklist; the morning review must never call a
+        # run "passed" while a merge_failed task is sitting on the
+        # integration branch.
+        passed_states = {
+            TaskState.ACCEPTED.value,
+            TaskState.PUSHED.value,
+            TaskState.MERGED.value,
+            TaskState.SKIPPED.value,
+        }
+        non_pass = (
+            merge_failed_count
+            + blocked_count
+            + awaiting_review_count
+            + counts.get(TaskState.FAILED.value, 0)
+        )
+        if counts and non_pass == 0 and all(
+            row["state"] in passed_states for row in rows
+        ):
+            run_verdict = "passed"
+        elif merge_failed_count or counts.get(TaskState.FAILED.value, 0):
+            run_verdict = "failed"
+        elif awaiting_review_count:
+            run_verdict = "awaiting_review"
+        elif blocked_count:
+            run_verdict = "blocked"
+        elif counts:
+            run_verdict = "in_progress"
+        else:
+            run_verdict = "empty"
+        self.state.event(
+            roadmap.roadmap_id,
+            None,
+            None,
+            "roadmap.finished",
+            {
+                "counts": counts,
+                "merge_failed_count": merge_failed_count,
+                "blocked_count": blocked_count,
+                "awaiting_review_count": awaiting_review_count,
+                "run_verdict": run_verdict,
+            },
+        )

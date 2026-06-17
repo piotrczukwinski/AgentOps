@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -34,9 +34,22 @@ class BudgetManager:
       ``max_codex_input_tokens``).
     * ``budget`` - per-run caps declared in the optional
       ``budget`` block (``max_tasks``, ``max_task_attempts``,
-      ``max_review_calls``, ``max_run_seconds``). The new fields
-      default to "no cap" so legacy roadmaps keep behaving as
-      before.
+      ``max_review_calls``, ``max_run_seconds``,
+      ``max_total_task_attempts``). The new fields default to
+      "no cap" so legacy roadmaps keep behaving as before.
+
+    Field semantics:
+
+    * ``max_tasks`` is run-level: the total number of tasks the run
+      may start.
+    * ``max_task_attempts`` is per-task: each task may run at most
+      this many executor attempts.
+    * ``max_total_task_attempts`` is run-level (optional): a hard
+      ceiling on the *cumulative* executor attempts across all
+      tasks. When unset, per-task attempts are only bounded by
+      ``max_task_attempts``.
+    * ``max_review_calls`` is run-level: total Codex calls allowed.
+    * ``max_run_seconds`` is run-level: wall-clock cap.
 
     The class is intentionally small and dependency-free. Durable
     budget ledgers can later reuse the existing ``model_calls``
@@ -57,6 +70,10 @@ class BudgetManager:
         self.attempts_started = 0
         self.codex_calls_used = 0
         self.run_started_at: datetime | None = None
+        # Per-task attempt counter; ``max_task_attempts`` is per-task
+        # so a 4-task run with max_task_attempts=2 may legitimately
+        # run up to 4 * 2 = 8 attempts.
+        self.attempts_by_task: dict[str, int] = field(default_factory=dict) if False else {}
 
     # ------------------------------------------------------------------
     # Run lifecycle
@@ -70,8 +87,10 @@ class BudgetManager:
     def record_task_started(self) -> None:
         self.tasks_started += 1
 
-    def record_attempt_started(self) -> None:
+    def record_attempt_started(self, task_id: str | None = None) -> None:
         self.attempts_started += 1
+        if task_id is not None:
+            self.attempts_by_task[task_id] = self.attempts_by_task.get(task_id, 0) + 1
 
     # ------------------------------------------------------------------
     # Per-run budget checks (the new ``budget`` block)
@@ -88,14 +107,40 @@ class BudgetManager:
             )
         return BudgetDecision(True, "ok")
 
-    def can_start_attempt(self) -> BudgetDecision:
+    def can_start_attempt(self, task_id: str | None = None) -> BudgetDecision:
+        """Return whether another attempt may be started.
+
+        ``max_task_attempts`` is per-task: when ``task_id`` is given
+        the check is scoped to that task only, so a 4-task run with
+        ``max_task_attempts=2`` may still start 4 tasks (each of
+        which may use up to 2 attempts). When ``task_id`` is not
+        given, the legacy global counter is consulted so callers
+        that predate the per-task semantics keep working.
+
+        ``max_total_task_attempts`` is a separate, optional run-level
+        cap on the *cumulative* number of executor attempts across
+        all tasks. It is checked alongside the per-task cap.
+        """
         max_attempts = self.run_budget.get("max_task_attempts")
-        if max_attempts is None:
-            return BudgetDecision(True, "ok")
-        if self.attempts_started >= int(max_attempts):
+        if max_attempts is not None:
+            if task_id is not None:
+                task_attempts = self.attempts_by_task.get(task_id, 0)
+                if task_attempts >= int(max_attempts):
+                    return BudgetDecision(
+                        False,
+                        f"max_task_attempts exceeded: {max_attempts}",
+                    )
+            else:
+                if self.attempts_started >= int(max_attempts):
+                    return BudgetDecision(
+                        False,
+                        f"max_task_attempts exceeded: {max_attempts}",
+                    )
+        max_total = self.run_budget.get("max_total_task_attempts")
+        if max_total is not None and self.attempts_started >= int(max_total):
             return BudgetDecision(
                 False,
-                f"max_task_attempts exceeded: {max_attempts}",
+                f"max_total_task_attempts exceeded: {max_total}",
             )
         return BudgetDecision(True, "ok")
 
