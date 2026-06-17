@@ -783,6 +783,25 @@ def export_summary(state: StateStore, roadmap_id: str | None = None) -> str:
         lines.append("")
 
     lines.append("## Latest events")
+    lines.append("## Latest events")
+    if rows:
+        first_roadmap = rows[0]["roadmap_id"]
+        with state.connect() as conn:
+            rm_row = conn.execute(
+                "SELECT config_json FROM roadmaps WHERE id=?", (first_roadmap,),
+            ).fetchone()
+        if rm_row is not None:
+            import json as _json
+            try:
+                cfg = _json.loads(rm_row["config_json"])
+            except _json.JSONDecodeError:
+                cfg = {}
+            budget_block = cfg.get("budget") or {}
+            if budget_block:
+                lines.append("## Budget snapshot")
+                for key, value in budget_block.items():
+                    lines.append(f"- `{key}`: {value}")
+                lines.append("")
     for row in state.latest_events(30):
         lines.append(f"- `{row['created_at']}` `{row['type']}` roadmap=`{row['roadmap_id']}` task=`{row['task_id']}`")
     return "\n".join(lines)

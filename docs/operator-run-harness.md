@@ -666,6 +666,15 @@ actually did.
   `_TEMPLATE_PLACEHOLDER_STRINGS` set) and cannot be triggered by
   the executor's output alone.
 
+
+## Overnight runbook
+
+See `docs/night-run-report.md` for the recommended overnight
+command, the failure modes covered by the harness, and the
+morning checklist that pairs with the local UI's
+`/api/operator-runs` and `/api/operator-runs/<run_id>/tail`
+endpoints.
+
 ## Web / admin panel integration
 
 A future admin web panel can consume the operator run state without

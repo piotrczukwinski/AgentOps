@@ -90,6 +90,71 @@ ALL_PERSISTED_STATUSES = LEGACY_PERSISTED_STATUSES | CANONICAL_PERSISTED_STATUSE
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF: tuple[float, ...] = (5.0, 15.0, 45.0)
 
+# Canonical failure categories for AGENTOPS_RESULT_JSON handling.
+# The Operator Run Harness and the gated orchestrator both consult
+# these names so the operator (and the runbook) can grep for one
+# stable string regardless of which path produced the failure.
+MISSING_RESULT_CATEGORY = "missing_result"
+TEMPLATE_RESULT_CATEGORY = "template_result"
+
+
+def failure_category_for_result_marker(text: str) -> str | None:
+    r"""Map a marker classification to the canonical category string.
+
+    Returns one of ``MISSING_RESULT_CATEGORY`` /
+    ``TEMPLATE_RESULT_CATEGORY`` for the unsafe classifications, or
+    ``None`` when the marker is absent or the result is real. The
+    helper is exposed at module level so the orchestrator and the
+    CLI can use the same string without duplicating the mapping.
+    """
+    cls = classify_result_marker(text)
+    if cls == "missing":
+        return MISSING_RESULT_CATEGORY
+    if cls == "template":
+        return TEMPLATE_RESULT_CATEGORY
+    return None
+
+
+def classify_result_marker(text: str) -> str:
+    r"""Classify a chunk of text by its ``AGENTOPS_RESULT_JSON`` block.
+
+    Returns one of:
+
+    * ``"real"`` - marker present, body is parseable JSON that is
+      *not* a known template placeholder.
+    * ``"template"`` - marker present, body parses to one of the
+      known template placeholders (``"..."``, ``"done|blocked"``,
+      ``"passed|awaiting_review|failed|blocked"``, etc.).
+    * ``"missing"`` - marker present, but no parseable JSON body
+      followed it (e.g. the executor printed the header and then
+      was killed before it could write the body).
+    * ``"absent"`` - the marker is not in the text at all.
+
+    The function is a pure function of its input. It is exposed at
+    module level so the orchestrator can use the same
+    classification as ``run_foreground`` without re-parsing the
+    log twice.
+    """
+    if not isinstance(text, str) or RESULT_MARKER not in text:
+        return "absent"
+    matches = list(_RESULT_HEADER.finditer(text))
+    if not matches:
+        return "absent"
+    for header in reversed(matches):
+        body = _slice_json_body(text, header.end(), header_match=header)
+        if body is None:
+            continue
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if is_template_placeholder_result(payload):
+            return "template"
+        return "real"
+    return "missing"
+
+
+
 # Token / secret env names are duplicated from agentops.runners on purpose so
 # this module can be used without importing the full runner stack. Keep in
 # sync with agentops.runners.TOKEN_ENV_NAMES.
@@ -257,6 +322,8 @@ def write_status(
     idle_for_seconds: float | None = None,
     idle_timeout: float | None = None,
     idle_log_size_bytes: int | None = None,
+    failure_category: str | None = None,
+    result_status: str | None = None,
 ) -> dict[str, Any]:
     """Update ``status.json`` for a run.
 
@@ -327,6 +394,10 @@ def write_status(
         payload["idle_timeout"] = float(idle_timeout)
     if idle_log_size_bytes is not None:
         payload["idle_log_size_bytes"] = int(idle_log_size_bytes)
+    if failure_category is not None:
+        payload["failure_category"] = str(failure_category)
+    if result_status is not None:
+        payload["result_status"] = str(result_status)
 
     status_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return payload
@@ -1212,7 +1283,44 @@ def run_foreground(
     # stub for a real final answer.
     try:
         result = extract_result(run_dir_path)
-    except (ResultNotFound, TemplateResultRejected):
+    except TemplateResultRejected as exc:
+        # Exit was 0 but the executor printed a template placeholder
+        # result. The run is not a real success; surface the
+        # canonical failure category so the morning checklist and
+        # the runbook can grep for it.
+        failure_category = TEMPLATE_RESULT_CATEGORY
+        payload = write_status(
+            run_dir_path,
+            status=FAILED_STATUS,
+            spec=spec,
+            exit_code=exit_code,
+            ended_at=ended_at,
+            error=str(exc),
+            failure_category=failure_category,
+            result_status="template",
+            **(_idle_status_kwargs(watchdog) or {}),
+        )
+        return payload
+    except ResultNotFound as exc:
+        if exit_code == 0:
+            # Exit was 0 but no marker was found. This is the
+            # canonical missing_result case: the executor did not
+            # print a real result. Mark the run as failed.
+            failure_category = MISSING_RESULT_CATEGORY
+            payload = write_status(
+                run_dir_path,
+                status=FAILED_STATUS,
+                spec=spec,
+                exit_code=exit_code,
+                ended_at=ended_at,
+                error=str(exc),
+                failure_category=failure_category,
+                result_status="missing",
+                **(_idle_status_kwargs(watchdog) or {}),
+            )
+            return payload
+        # Non-zero exit + no result: keep the existing behavior
+        # (the run is failed for an unrelated reason).
         return payload
 
     write_result(run_dir_path, result)

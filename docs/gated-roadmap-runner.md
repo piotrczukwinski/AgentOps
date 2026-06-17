@@ -274,3 +274,39 @@ All per-task state is in `<repo>/.agentops/state.sqlite`. Tables:
 * The legacy `codex_review.schema.json` is still shipped for
   backward compatibility with older review packets. New roadmaps should
   use `review_verdict.schema.json` (the default).
+
+
+## Roadmap budget
+
+Roadmaps can declare an optional ``budget`` block that bounds
+the run. The block is a small JSON object with up to four
+fields:
+
+```json
+{
+  "budget": {
+    "max_tasks": 4,
+    "max_task_attempts": 2,
+    "max_review_calls": 4,
+    "max_run_seconds": 14400
+  }
+}
+```
+
+| Field | Meaning | Default |
+|---|---|---|
+| `max_tasks` | Maximum number of tasks the run will start. Tasks past the cap transition to `BLOCKED` with `failure_category: budget_exceeded`. | unlimited |
+| `max_task_attempts` | Maximum number of executor attempts per task (including repair attempts). | unlimited |
+| `max_review_calls` | Maximum number of Codex review calls the run may make. When exhausted, the affected task transitions to `BLOCKED` with `failure_category: budget_exceeded`; the heuristic fallback is **not** used so the cap is real. | unlimited |
+| `max_run_seconds` | Wall-clock seconds since the run started. The remaining tasks are skipped with `failure_category: budget_exceeded`. | unlimited |
+
+The `budget` block is independent of the legacy
+`runtime_budget` block (which still controls the
+`max_codex_calls` and `max_codex_input_tokens` per-call caps).
+When both are set, `max_review_calls` is the dominant cap for
+codex calls.
+
+Budgets fail closed: when a cap is exceeded, the orchestrator
+refuses to start the next task, attempt, or review call. The
+`agentops export-summary` output includes a "Budget snapshot"
+section when the roadmap declares a budget.

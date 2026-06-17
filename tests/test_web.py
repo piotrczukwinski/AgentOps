@@ -510,3 +510,152 @@ class WebEnvSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+# ---------------------------------------------------------------------------
+# Operator-run monitor endpoints (AO-CONTRACT-003)
+# ---------------------------------------------------------------------------
+
+
+def _seed_operator_run(root, run_id, *, combined_log="line1\nline2\nline3\n"):
+    run = root / ".operator-runs" / run_id
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "combined.log").write_text(combined_log, encoding="utf-8")
+    (run / "status.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "name": "demo",
+                "status": "exited",
+                "exit_code": 0,
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "ended_at": "2026-01-01T00:00:05+00:00",
+                "pid": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run
+
+
+class OperatorRunsEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.repo = _init_repo(self.tmp)
+        self.roadmap = _write_minimal_roadmap(self.tmp, self.repo)
+        self.db = self.tmp / "state.sqlite"
+        self.store = StateStore(self.db)
+        self.store.init()
+        self.port = _free_port()
+        self.server = web.make_server("127.0.0.1", self.port, state=self.store)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._stop_server)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                conn = HTTPConnection("127.0.0.1", self.port, timeout=1)
+                conn.connect()
+                conn.close()
+                return
+            except OSError:
+                time.sleep(0.05)
+        self.fail("server did not start")
+
+    def _stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read()
+            return resp.status, json.loads(body.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def test_operator_runs_endpoint_empty_when_no_dir(self):
+        with mock.patch.dict(os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.tmp / "empty")}, clear=False):
+            status, data = self._get("/api/operator-runs")
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"runs": []})
+
+    def test_operator_runs_endpoint_lists_fake_run_dirs(self):
+        with mock.patch.dict(os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False):
+            _seed_operator_run(self.repo, "20260617T000000Z-fake-aaaaaaaa")
+            _seed_operator_run(self.repo, "20260617T000100Z-fake-bbbbbbbb")
+            status, data = self._get("/api/operator-runs")
+        self.assertEqual(status, 200)
+        run_ids = sorted(r["run_id"] for r in data["runs"])
+        self.assertEqual(run_ids, [
+            "20260617T000000Z-fake-aaaaaaaa",
+            "20260617T000100Z-fake-bbbbbbbb",
+        ])
+        sample = data["runs"][0]
+        for key in (
+            "run_id",
+            "name",
+            "canonical_status",
+            "runtime_status",
+            "pid",
+            "pid_alive",
+            "active_attempt",
+            "active_combined_log",
+            "log_size_bytes",
+            "idle_for_seconds",
+            "result_json_present",
+            "suggested_action",
+        ):
+            self.assertIn(key, sample)
+
+    def test_operator_runs_tail_returns_latest_log(self):
+        with mock.patch.dict(os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False):
+            _seed_operator_run(self.repo, "20260617T000000Z-fake-cccccccc", combined_log="a\nb\nc\nd\n")
+            status, data = self._get("/api/operator-runs/20260617T000000Z-fake-cccccccc/tail?lines=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["run_id"], "20260617T000000Z-fake-cccccccc")
+        self.assertEqual(data["lines"], 2)
+        self.assertIn("c", data["text"])
+        self.assertIn("d", data["text"])
+
+    def test_operator_runs_tail_rejects_traversal(self):
+        status, _ = self._get("/api/operator-runs/..%2F..%2Fetc%2Fpasswd/tail?lines=10")
+        self.assertIn(status, {400, 404})
+
+    def test_operator_runs_tail_unknown_run_returns_404(self):
+        with mock.patch.dict(os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False):
+            status, data = self._get("/api/operator-runs/20260617T000000Z-unknown/tail?lines=10")
+        self.assertEqual(status, 404)
+        # The harness's FileNotFoundError message contains the run id;
+        # we accept any of "not found" or "no operator run directory".
+        self.assertTrue(
+            "not found" in data["error"].lower()
+            or "no operator run directory" in data["error"].lower(),
+            data,
+        )
+
+    def test_index_html_loads_with_operator_runs_card(self):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", "/")
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8")
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Operator runs (monitor)", body)
+        self.assertIn("/api/operator-runs", body)
+        for forbidden in ("/api/exec", "/api/shell", "/api/command", "/api/run_command"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_shell_endpoint_exposed(self):
+        for forbidden in ("/api/exec", "/api/shell", "/api/command"):
+            status, data = self._get(forbidden)
+            self.assertEqual(status, 404)
+            self.assertIn("not found", data["error"].lower())

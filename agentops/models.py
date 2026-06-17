@@ -112,6 +112,7 @@ class TaskConfig:
     review: ReviewConfig = field(default_factory=ReviewConfig)
     executor_command: str | None = None
     executor_options: dict[str, Any] = field(default_factory=dict)
+    require_executor_result: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -124,6 +125,7 @@ class RoadmapConfig:
     defaults: dict[str, Any] = field(default_factory=dict)
     policies: dict[str, Any] = field(default_factory=dict)
     runtime_budget: dict[str, Any] = field(default_factory=dict)
+    budget: dict[str, Any] = field(default_factory=dict)
     path: Path | None = None
     # Gated-roadmap runner settings.
     integration_branch: str | None = None

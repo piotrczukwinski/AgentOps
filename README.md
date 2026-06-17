@@ -250,6 +250,11 @@ including the JSON schema and the playbook for terminal disconnects,
 transient failures, stale pids, idle timeouts, and the admin web
 panel integration.
 
+
+For overnight monitoring, see `docs/night-run-report.md` for
+the recommended `agentops operator-run` command and the
+morning checklist.
+
 ## Local browser UI
 
 A small local-only dashboard is included as a thin layer over the CLI and
@@ -267,6 +272,28 @@ run with Codex, use the CLI directly.
 
 See `docs/local-web-ui.md` for the full description, safety notes, and
 recommended workflow.
+
+
+## Roadmap budget
+
+Roadmaps can declare a `budget` block that caps the run:
+
+```json
+{
+  "budget": {
+    "max_tasks": 4,
+    "max_task_attempts": 2,
+    "max_review_calls": 4,
+    "max_run_seconds": 14400
+  }
+}
+```
+
+All four fields are optional and default to "no cap". When
+a cap is exceeded, the orchestrator fails closed (transitions
+the task to `BLOCKED` with `failure_category: budget_exceeded`)
+so an overnight run cannot burn unlimited resources. See
+`docs/gated-roadmap-runner.md` for the full table.
 
 ## Safety defaults
 

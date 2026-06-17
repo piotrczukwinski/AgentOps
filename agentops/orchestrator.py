@@ -152,11 +152,30 @@ class Orchestrator:
         )
         codex_service = self._injected_codex or CodexReviewService()
         heuristic = self._injected_heuristic or HeuristicReviewer()
-        budget = BudgetManager(roadmap.runtime_budget)
+        budget = BudgetManager(roadmap.runtime_budget, roadmap.budget)
+        budget.start_run()
 
         max_tasks = self.options.max_tasks if self.options.max_tasks is not None else roadmap.max_tasks
         completed = 0
         for task in sorted(roadmap.tasks, key=lambda item: (item.priority, item.id)):
+            task_budget = budget.can_start_task()
+            if not task_budget.allowed:
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.BLOCKED,
+                    {
+                        "reason": task_budget.reason,
+                        "failure_category": "budget_exceeded",
+                    },
+                )
+                self._record_roadmap_event(
+                    roadmap, "task.blocked_by_budget", task.id,
+                    extra={"reason": task_budget.reason},
+                )
+                completed += 1
+                continue
+            budget.record_task_started()
             if max_tasks is not None and completed >= max_tasks:
                 break
             if not self._dependencies_satisfied(roadmap, task):
@@ -178,6 +197,31 @@ class Orchestrator:
                     heuristic=heuristic,
                     budget=budget,
                 )
+            run_budget = budget.can_continue_run()
+            if not run_budget.allowed:
+                self.state.event(
+                    roadmap.roadmap_id,
+                    None,
+                    None,
+                    "budget.run_seconds_exceeded",
+                    {"reason": run_budget.reason},
+                )
+                # Remaining tasks are skipped with a clear reason.
+                for remaining in sorted(
+                    roadmap.tasks, key=lambda item: (item.priority, item.id)
+                ):
+                    if self._dependencies_satisfied(roadmap, remaining):
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            remaining.id,
+                            TaskState.SKIPPED,
+                            {
+                                "reason": run_budget.reason,
+                                "failure_category": "budget_exceeded",
+                            },
+                        )
+                completed += 1
+                continue
             # Count skipped and ran tasks toward the cap; only ``break`` above
             # should stop the loop, and the operator's ``max_tasks`` is
             # intended as a task-coverage cap, not a successful-completion cap.
@@ -263,6 +307,23 @@ class Orchestrator:
         max_attempts = self._effective_max_attempts(task, roadmap)
         accepted_outcome = False
         for attempt_no in range(1, max_attempts + 1):
+            attempt_budget = budget.can_start_attempt()
+            if not attempt_budget.allowed:
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.BLOCKED,
+                    {
+                        "reason": attempt_budget.reason,
+                        "failure_category": "budget_exceeded",
+                    },
+                )
+                self._record_roadmap_event(
+                    roadmap, "task.blocked_by_budget", task.id,
+                    extra={"reason": attempt_budget.reason},
+                )
+                return
+            budget.record_attempt_started()
             runtime.attempt = attempt_no
             attempt_dir = artifact_store.attempt_dir(roadmap.roadmap_id, task.id, attempt_no)
             attempt_id = self.state.create_attempt(
@@ -324,6 +385,52 @@ class Orchestrator:
                 self._record_roadmap_event(roadmap, "task.blocked_by_policy", task.id)
                 return
 
+
+            # Opt-in AGENTOPS_RESULT_JSON guard. When the task opts in
+            # via ``require_executor_result: true``, scan the executor's
+            # stdout for the marker and refuse to validate / accept if
+            # the result is missing, absent, or a template placeholder.
+            # The canonical category is recorded on the BLOCKED
+            # transition so the runbook (AO-CONTRACT-004) can grep
+            # for it.
+            if task.require_executor_result and result.ok and result.stdout_path is not None:
+                try:
+                    _stdout_text = result.stdout_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    _stdout_text = ""
+                _category = None
+                try:
+                    from .operator_run import (
+                        MISSING_RESULT_CATEGORY,
+                        TEMPLATE_RESULT_CATEGORY,
+                        classify_result_marker,
+                    )
+                    _cls = classify_result_marker(_stdout_text)
+                except Exception:  # noqa: BLE001 - never let the guard crash the run
+                    _cls = "absent"
+                if _cls in {"absent", "missing"}:
+                    _category = MISSING_RESULT_CATEGORY
+                elif _cls == "template":
+                    _category = TEMPLATE_RESULT_CATEGORY
+                if _category is not None:
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.result_guard_blocked",
+                        {"failure_category": _category, "exit_code": result.exit_code, "classification": _cls},
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.BLOCKED,
+                        {"reason": _category, "failure_category": _category},
+                    )
+                    self._record_roadmap_event(
+                        roadmap, "task.blocked_by_result_guard", task.id,
+                        extra={"failure_category": _category, "classification": _cls},
+                    )
+                    return
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.VALIDATING)
             validation = ValidationEngine(
                 timeout_seconds=min(task.timeout_seconds, 1800)

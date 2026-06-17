@@ -732,7 +732,12 @@ class CliOperatorRunTests(unittest.TestCase):
             log = Path(tmp) / "cmd.log"
             log.write_text("", encoding="utf-8")
             with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
-                _write_fake_opencode(bindir, stdout="ok", exit_code=0)
+                _write_fake_opencode(
+                    bindir,
+                    stdout="ok",
+                    print_result_json={"status": "done", "summary": "status-target"},
+                    exit_code=0,
+                )
                 rc, out, err = self._run_cli(
                     [
                         "operator-run",

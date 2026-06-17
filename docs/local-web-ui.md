@@ -88,6 +88,8 @@ python -m agentops serve --port 9000
 | GET    | `/api/status`              | Tasks, latest events, db path. |
 | GET    | `/api/roadmaps`            | Candidate roadmap files (examples/ + user-level). |
 | GET    | `/api/runs`                | Active run subprocesses started from this UI. |
+| GET    | `/api/operator-runs`        | List operator runs visible from this UI (read-only). |
+| GET    | `/api/operator-runs/<run_id>/tail?lines=100` | Return the latest attempt's combined.log tail for `<run_id>`. |
 | GET    | `/api/logs?task_id=...`    | Task row, artifacts, recent events. |
 | GET    | `/api/artifacts?task_id=...` | Artifact rows for a task. |
 | POST   | `/api/plan`                | `{"roadmap": "..."}` → runs `agentops plan` lint. |
@@ -95,6 +97,31 @@ python -m agentops serve --port 9000
 
 `/api/plan` never creates worktrees and never calls models.
 `/api/run` always passes `--no-codex`; `no_codex=false` is rejected.
+
+
+## Operator-run monitor (read-only)
+
+The UI exposes two read-only endpoints that make the local
+browser tab useful as an overnight run monitor:
+
+* `GET /api/operator-runs` returns one row per
+  `.operator-runs/<run-id>/` directory with the projected
+  `runtime_status`, `pid`, `idle_for_seconds`,
+  `log_size_bytes`, `result_json_present`, and
+  `suggested_action` fields.
+* `GET /api/operator-runs/<run_id>/tail?lines=200` returns
+  the latest attempt's `combined.log` for the selected run.
+  The default is 100 lines; the cap is 5000.
+
+Both endpoints are GETs, bind to the loopback address by
+default, and never mutate the on-disk state. There is no
+`/api/exec` or `/api/shell` endpoint, and no write
+endpoint. The dashboard's "Operator runs" card polls the
+list every 3 seconds; the "Tail" button on each row loads
+the matching tail endpoint.
+
+See `docs/night-run-report.md` for the morning checklist
+that pairs with these endpoints.
 
 ## Recommended workflow
 
