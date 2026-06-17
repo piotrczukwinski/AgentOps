@@ -872,8 +872,8 @@ python -m agentops operator-run \
 ## PR repair loop (`agentops pr-loop`)
 
 `operator-run` covers the *outer* operator prompt. `agentops pr-loop`
-covers the *cross-tool* PR repair loop: take a Codex-style review JSON,
-turn it into a deterministic repair prompt, and (for `request_changes`
+covers the *cross-tool* PR repair loop: take a schema-conformant review JSON,
+turn it into a deterministic repair prompt, and (for `REQUEST_CHANGES`
 verdicts) schedule the executor under the harness described above. The
 final merge is always operator-controlled; the loop never pushes to
 `main`, never force-pushes, never rebases, and never merges the PR.
@@ -889,37 +889,40 @@ python -m agentops pr-loop 13 \
 
 ### Verdict contract
 
-The loop accepts the Codex-style lowercase enum from the pr-loop MVP
-spec:
+The loop accepts only the JSON shape from
+`schemas/review_verdict.schema.json`:
 
 | field | type | notes |
 |---|---|---|
-| `verdict` | enum: `approve` \| `request_changes` \| `comment` | uppercase forms (`ACCEPT` / `REQUEST_CHANGES` / `BLOCK`) are also accepted for backward compatibility with the existing `schemas/review_verdict.schema.json` |
+| `verdict` | enum: `ACCEPT` \| `REQUEST_CHANGES` \| `BLOCK` | lowercase aliases are rejected |
+| `confidence` | enum: `low` \| `medium` \| `high` | required reviewer confidence |
 | `summary` | string | reviewer-supplied one-paragraph summary |
-| `blocking_issues` | list of strings or `{file, severity, issue, suggested_fix}` objects | each entry is rendered into the prompt verbatim; plain strings are the Codex MVP form, objects are the legacy form |
-| `non_blocking_issues` | list of strings | rendered into the prompt as guidance only; never block the cycle |
-| `recommended_merge` | bool | surfaced so the operator can decide whether to merge; the loop never merges itself |
+| `blocking_issues` | list of `{file, severity, issue, suggested_fix}` objects | `severity` must be `low`, `medium`, `high`, or `critical`; string entries are rejected |
+| `repair_prompt` | string | included in the generated repair prompt verbatim |
+| `safe_to_push` | bool | when false, a non-dry-run `REQUEST_CHANGES` cycle writes the prompt but refuses to invoke the executor |
+| `safe_to_merge` | bool | records whether an `ACCEPT` verdict is merge-ready; the loop never merges itself |
 
-Any other shape (missing field, wrong type, unknown verdict) fails
-closed with a `VerdictParseError` and a non-zero exit code. The loop
-never invents a verdict and never silently downgrades a
-`request_changes` to a `comment`.
+Missing fields, wrong types, unknown top-level fields, unknown verdicts,
+and malformed blocking issue objects fail closed with a `VerdictParseError`
+and a non-zero exit code. The loop never invents a verdict.
 
 ### Loop semantics
 
 The command is deliberately narrow:
 
-* **`approve` verdict** — short-circuits, executor not invoked, prints
-  `status=approved`. `recommended_merge` is surfaced on stderr so the
-  operator can decide whether to merge; the loop never auto-merges.
-* **`comment` verdict** — short-circuits, executor not invoked, prints
-  `status=comment`. The non-blocking issues are recorded in the
-  output but no cycle directory is created.
-* **`request_changes` verdict** — writes a deterministic repair prompt
+* **`ACCEPT` verdict** — short-circuits, executor not invoked, prints
+  `status=approved`. `safe_to_merge=true` means ready for operator merge;
+  `safe_to_merge=false` means approved but not merge-ready. The loop never
+  auto-merges.
+* **`BLOCK` verdict** — short-circuits, executor not invoked, prints
+  `status=blocked`. Blocking issues are reported and no cycle directory is
+  created.
+* **`REQUEST_CHANGES` verdict** — writes a deterministic repair prompt
   under `.agentops/pr-loop/<pr-number>/cycle-<n>/executor.prompt.md`
   and (without `--dry-run`) schedules the existing operator-run harness
-  on the PR branch. The prompt includes the blocking issues verbatim
-  plus the PR metadata, and the input verdict JSON is persisted as
+  on the PR branch only when `safe_to_push=true`. The prompt includes the
+  reviewer `repair_prompt` verbatim, the exact blocking issues, and the PR
+  metadata, and the input verdict JSON is persisted as
   `review.verdict.json` next to the prompt so the operator can audit
   which JSON drove each cycle.
 
@@ -957,7 +960,7 @@ forever; once it fires the operator decides the next move.
     cycle-1/
       executor.prompt.md      # the rendered prompt
       review.verdict.json     # a copy of the input verdict JSON
-    cycle-2/                  # next request_changes cycle
+    cycle-2/                  # next REQUEST_CHANGES cycle
       ...
     cycle-<N>/                # the loop stops here
 ```
@@ -975,9 +978,8 @@ verdict was wrong) delete the cycle directory before the next run.
   and never weakens existing tests or gates.
 * The loop never modifies `BusinessAgent` (the prompt forbids it
   unless the blocking issue is explicitly about BusinessAgent).
-* The final merge is always operator-controlled. The loop's `approve`
-  path prints `recommended_merge=false` to stderr and the operator
-  decides whether to merge the PR.
+* The final merge is always operator-controlled. `safe_to_merge` is
+  decision metadata only; the operator decides whether to merge the PR.
 
 ### Limits and follow-ups
 
@@ -990,7 +992,6 @@ verdict was wrong) delete the cycle directory before the next run.
 * A direct Codex integration is the next obvious follow-up. It
   should live in a separate PR so the current MVP stays narrow and
   testable.
-* An optional auto-merge after repeated `approve` verdicts is
+* An optional auto-merge after repeated `ACCEPT` verdicts is
   intentionally out of scope for this PR. The merge remains
   operator-controlled.
-

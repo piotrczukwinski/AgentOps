@@ -1,9 +1,10 @@
 """PR repair loop.
 
-Cross-tool AgentOps PR repair loop. Loads a Codex-style review JSON,
-short-circuits on ``approve`` / ``comment``, and on ``request_changes``
-writes a deterministic repair prompt and (without ``--dry-run``) hands
-it to the existing Operator Run Harness.
+Cross-tool AgentOps PR repair loop. Loads a review verdict JSON that
+matches ``schemas/review_verdict.schema.json``, short-circuits on
+``ACCEPT`` / ``BLOCK``, and on ``REQUEST_CHANGES`` writes a deterministic
+repair prompt and (without ``--dry-run``) hands it to the existing
+Operator Run Harness.
 
 The loop never pushes to ``main``, never force-pushes, never rebases,
 and never merges the PR; the final merge is operator-controlled.
@@ -18,14 +19,25 @@ import sys
 from pathlib import Path
 from typing import Any, Protocol
 
-ACCEPT_VERDICTS: tuple[str, ...] = ("approve", "ACCEPT")
-REQUEST_CHANGES_VERDICTS: tuple[str, ...] = ("request_changes", "REQUEST_CHANGES")
-COMMENT_VERDICTS: tuple[str, ...] = ("comment", "BLOCK")
+ACCEPT_VERDICT = "ACCEPT"
+REQUEST_CHANGES_VERDICT = "REQUEST_CHANGES"
+BLOCK_VERDICT = "BLOCK"
 ALL_KNOWN_VERDICTS: tuple[str, ...] = (
-    *ACCEPT_VERDICTS,
-    *REQUEST_CHANGES_VERDICTS,
-    *COMMENT_VERDICTS,
+    ACCEPT_VERDICT,
+    REQUEST_CHANGES_VERDICT,
+    BLOCK_VERDICT,
 )
+CONFIDENCE_VALUES: tuple[str, ...] = ("low", "medium", "high")
+REQUIRED_REVIEW_FIELDS: tuple[str, ...] = (
+    "verdict",
+    "confidence",
+    "summary",
+    "blocking_issues",
+    "repair_prompt",
+    "safe_to_push",
+    "safe_to_merge",
+)
+ALLOWED_REVIEW_FIELDS = frozenset(REQUIRED_REVIEW_FIELDS)
 
 DEFAULT_REPO_ROOT = Path(".")
 DEFAULT_PR_LOOP_ROOT = Path(".agentops/pr-loop")
@@ -60,20 +72,22 @@ class BlockingIssue:
 @dataclasses.dataclass(frozen=True)
 class ReviewPayload:
     verdict: str
+    confidence: str
     summary: str
     blocking_issues: tuple[BlockingIssue, ...]
-    non_blocking_issues: tuple[str, ...]
-    recommended_merge: bool
+    repair_prompt: str
+    safe_to_push: bool
+    safe_to_merge: bool
     raw: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def requires_executor(self) -> bool:
-        return self.verdict == "request_changes"
+        return self.verdict == REQUEST_CHANGES_VERDICT
 
     def is_approved(self) -> bool:
-        return self.verdict == "approve"
+        return self.verdict == ACCEPT_VERDICT
 
-    def is_comment(self) -> bool:
-        return self.verdict == "comment"
+    def is_blocked(self) -> bool:
+        return self.verdict == BLOCK_VERDICT
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,10 +104,11 @@ class LoopDecision:
             "status": self.status,
             "cycle": self.cycle,
             "verdict": self.verdict.verdict,
+            "confidence": self.verdict.confidence,
             "summary": self.verdict.summary,
-            "recommended_merge": self.verdict.recommended_merge,
+            "safe_to_push": self.verdict.safe_to_push,
+            "safe_to_merge": self.verdict.safe_to_merge,
             "blocking_issue_count": len(self.verdict.blocking_issues),
-            "non_blocking_issue_count": len(self.verdict.non_blocking_issues),
             "prompt_path": str(self.prompt_path) if self.prompt_path is not None else None,
             "run_id": self.run_id,
             "message": self.message,
@@ -101,58 +116,65 @@ class LoopDecision:
 
 
 def _coerce_blocking_issue(raw: Any) -> BlockingIssue:
-    if isinstance(raw, str):
-        stripped = raw.strip()
-        if not stripped:
-            raise VerdictParseError("blocking_issues string entry is empty")
-        return BlockingIssue(file="", severity="medium", issue=stripped, suggested_fix="")
     if not isinstance(raw, dict):
         raise VerdictParseError(
-            f"blocking_issues item must be a string or object, got {type(raw).__name__}"
+            f"blocking_issues item must be an object, got {type(raw).__name__}"
         )
-    try:
-        file_ = str(raw["file"])
-        issue = str(raw["issue"])
-    except KeyError as exc:
+    required = {"file", "severity", "issue", "suggested_fix"}
+    keys = set(raw)
+    missing = sorted(required - keys)
+    if missing:
         raise VerdictParseError(
-            f"blocking_issues object item is missing required field {exc.args[0]!r}"
-        ) from exc
-    severity_raw = raw.get("severity", "medium")
+            f"blocking_issues object item is missing required field {missing[0]!r}"
+        )
+    unknown = sorted(keys - required)
+    if unknown:
+        raise VerdictParseError(
+            f"blocking_issues object item has unknown field {unknown[0]!r}"
+        )
+    for field in ("file", "severity", "issue", "suggested_fix"):
+        if not isinstance(raw[field], str):
+            raise VerdictParseError(
+                f"blocking_issues field {field!r} must be a string, got {type(raw[field]).__name__}"
+            )
+    severity_raw = raw["severity"]
     if not isinstance(severity_raw, str) or severity_raw not in SEVERITY_VALUES:
         raise VerdictParseError(
             f"blocking_issues severity {severity_raw!r} is not one of {SEVERITY_VALUES}"
         )
-    suggested_fix = str(raw.get("suggested_fix", ""))
-    return BlockingIssue(file=file_, severity=severity_raw, issue=issue, suggested_fix=suggested_fix)
-
-
-def _coerce_string_list(value: Any, *, field: str) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if not isinstance(value, list):
-        raise VerdictParseError(f"review {field} must be a list, got {type(value).__name__}")
-    out: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            raise VerdictParseError(
-                f"review {field} entries must be strings, got {type(item).__name__}"
-            )
-        out.append(item)
-    return tuple(out)
+    return BlockingIssue(
+        file=raw["file"],
+        severity=severity_raw,
+        issue=raw["issue"],
+        suggested_fix=raw["suggested_fix"],
+    )
 
 
 def _normalize_verdict(raw: str) -> str:
-    if raw in ACCEPT_VERDICTS:
-        return "approve"
-    if raw in REQUEST_CHANGES_VERDICTS:
-        return "request_changes"
-    if raw in COMMENT_VERDICTS:
-        return "comment"
+    if raw in ALL_KNOWN_VERDICTS:
+        return raw
     raise VerdictParseError(
         f"review verdict {raw!r} is not in {ALL_KNOWN_VERDICTS}; "
-        "expected one of 'approve', 'request_changes', or 'comment' "
-        "(or the legacy uppercase forms ACCEPT/REQUEST_CHANGES/BLOCK)."
+        "expected one of ACCEPT, REQUEST_CHANGES, or BLOCK."
     )
+
+
+def _require_string(data: dict[str, Any], field: str) -> str:
+    value = data[field]
+    if not isinstance(value, str):
+        raise VerdictParseError(
+            f"review {field} must be a string, got {type(value).__name__}"
+        )
+    return value
+
+
+def _require_bool(data: dict[str, Any], field: str) -> bool:
+    value = data[field]
+    if not isinstance(value, bool):
+        raise VerdictParseError(
+            f"review {field} must be a boolean, got {type(value).__name__}"
+        )
+    return value
 
 
 def load_review_payload(path: Path) -> ReviewPayload:
@@ -174,41 +196,42 @@ def parse_review_payload(data: Any) -> ReviewPayload:
         raise VerdictParseError(
             f"review verdict must be a JSON object, got {type(data).__name__}"
         )
-    if "verdict" not in data:
-        raise VerdictParseError("review verdict is missing required field 'verdict'")
-    verdict_raw = data["verdict"]
-    if not isinstance(verdict_raw, str):
+    unknown_fields = sorted(set(data) - ALLOWED_REVIEW_FIELDS)
+    if unknown_fields:
         raise VerdictParseError(
-            f"review verdict field 'verdict' must be a string, got {type(verdict_raw).__name__}"
+            f"review verdict has unknown top-level field {unknown_fields[0]!r}"
         )
+    for field in REQUIRED_REVIEW_FIELDS:
+        if field not in data:
+            raise VerdictParseError(f"review verdict is missing required field {field!r}")
+    verdict_raw = _require_string(data, "verdict")
     verdict_normalized = _normalize_verdict(verdict_raw)
 
-    summary = data.get("summary", "")
-    if not isinstance(summary, str):
+    confidence = _require_string(data, "confidence")
+    if confidence not in CONFIDENCE_VALUES:
         raise VerdictParseError(
-            f"review summary must be a string, got {type(summary).__name__}"
+            f"review confidence {confidence!r} is not one of {CONFIDENCE_VALUES}"
         )
+    summary = _require_string(data, "summary")
+    repair_prompt = _require_string(data, "repair_prompt")
+    safe_to_push = _require_bool(data, "safe_to_push")
+    safe_to_merge = _require_bool(data, "safe_to_merge")
 
-    blocking_raw = data.get("blocking_issues", []) or []
+    blocking_raw = data["blocking_issues"]
     if not isinstance(blocking_raw, list):
         raise VerdictParseError(
             f"review blocking_issues must be a list, got {type(blocking_raw).__name__}"
         )
     blocking = tuple(_coerce_blocking_issue(item) for item in blocking_raw)
 
-    non_blocking = _coerce_string_list(data.get("non_blocking_issues"), field="non_blocking_issues")
-    recommended_merge = data.get("recommended_merge", False)
-    if not isinstance(recommended_merge, bool):
-        raise VerdictParseError(
-            f"review recommended_merge must be a boolean, got {type(recommended_merge).__name__}"
-        )
-
     return ReviewPayload(
         verdict=verdict_normalized,
+        confidence=confidence,
         summary=summary,
         blocking_issues=blocking,
-        non_blocking_issues=non_blocking,
-        recommended_merge=recommended_merge,
+        repair_prompt=repair_prompt,
+        safe_to_push=safe_to_push,
+        safe_to_merge=safe_to_merge,
         raw=data,
     )
 
@@ -252,7 +275,7 @@ def _format_blocking_issue(issue: BlockingIssue, index: int) -> str:
 REPAIR_PROMPT_HEADER = """# AgentOps PR repair prompt
 
 You are running as the executor (MiniMax-M3) under the AgentOps Operator
-Run Harness. The reviewer returned a `request_changes` verdict on this PR.
+Run Harness. The reviewer returned a `REQUEST_CHANGES` verdict on this PR.
 Your job is to apply the requested fix and push the result back to the
 PR branch. The PR merge is operator-controlled; you must not merge.
 
@@ -354,9 +377,9 @@ def build_repair_prompt(
     max_cycles: int,
     branch: str | None = None,
 ) -> str:
-    if payload.verdict != "request_changes":
+    if payload.verdict != REQUEST_CHANGES_VERDICT:
         raise PrLoopRefused(
-            f"build_repair_prompt only accepts request_changes verdicts, got {payload.verdict!r}"
+            f"build_repair_prompt only accepts REQUEST_CHANGES verdicts, got {payload.verdict!r}"
         )
     blocking_lines: list[str] = []
     if payload.blocking_issues:
@@ -371,22 +394,19 @@ def build_repair_prompt(
         )
     blocking_block = "\n".join(blocking_lines)
 
-    non_blocking_block = ""
-    if payload.non_blocking_issues:
-        joined = "\n".join(f"- {item}" for item in payload.non_blocking_issues)
-        non_blocking_block = "\n## Non-blocking issues (do not block the cycle)\n\n" + joined + "\n"
-
     parts: list[str] = [
         REPAIR_PROMPT_HEADER,
         blocking_block,
+        "",
+        "## Reviewer repair prompt (verbatim)",
+        "",
+        payload.repair_prompt,
         "",
         f"## PR metadata\n\n* PR: {pr_number}\n* repo: {repo}\n* cycle: {cycle} of {max_cycles}\n* executor_model: {executor_model}",
     ]
     if branch:
         parts.append(f"* branch: {branch}")
     parts.append("")
-    if non_blocking_block:
-        parts.append(non_blocking_block)
     parts.append(REPAIR_PROMPT_FOOTER)
     return "\n".join(parts).rstrip() + "\n"
 
@@ -416,24 +436,23 @@ class ExecutorBackend(Protocol):
 
 def _decision_for_payload(payload: ReviewPayload, *, cycle: int) -> LoopDecision:
     if payload.is_approved():
+        readiness = "merge-ready" if payload.safe_to_merge else "not merge-ready"
         return LoopDecision(
             status="approved",
             verdict=payload,
             cycle=cycle,
             message=(
-                "approve verdict received; executor not invoked. "
-                "recommended_merge is recorded as metadata only; the "
-                "merge is still operator-controlled."
+                f"ACCEPT verdict received ({readiness}); executor not invoked. "
+                "The merge is still operator-controlled."
             ),
         )
-    if payload.is_comment():
+    if payload.is_blocked():
         return LoopDecision(
-            status="comment",
+            status="blocked",
             verdict=payload,
             cycle=cycle,
             message=(
-                "comment verdict received; no action required. "
-                "executor not invoked."
+                "BLOCK verdict received; executor not invoked."
             ),
         )
     return LoopDecision(status="repair_scheduled", verdict=payload, cycle=cycle)
@@ -487,7 +506,7 @@ def evaluate_cycle(
         decision,
         prompt_path=prompt_path,
         message=(
-            f"request_changes verdict received; repair prompt written to {prompt_path}. "
+            f"REQUEST_CHANGES verdict received; repair prompt written to {prompt_path}. "
             f"{'Dry-run: executor not invoked.' if dry_run else 'Executor scheduled.'}"
         ),
     )
@@ -497,6 +516,15 @@ def evaluate_cycle(
         if dry_run:
             decision = dataclasses.replace(decision, status="dry_run")
         return decision
+    if not payload.safe_to_push:
+        return dataclasses.replace(
+            decision,
+            status="blocked",
+            message=(
+                f"REQUEST_CHANGES verdict received; repair prompt written to {prompt_path}. "
+                "safe_to_push=false; executor not invoked."
+            ),
+        )
     workdir = Path.cwd()
     run_id = executor.schedule_repair(
         prompt_path=prompt_path,
@@ -558,10 +586,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agentops pr-loop",
         description=(
             "Run a single cycle of the AgentOps PR repair loop. Loads a "
-            "Codex-style review JSON (approve|request_changes|comment) "
-            "and either short-circuits (approve/comment) or schedules "
+            "review JSON matching schemas/review_verdict.schema.json "
+            "(ACCEPT|REQUEST_CHANGES|BLOCK) and either short-circuits "
+            "(ACCEPT/BLOCK) or schedules "
             "the existing operator-run harness with a deterministic "
-            "repair prompt (request_changes). The PR merge is always "
+            "repair prompt (REQUEST_CHANGES). The PR merge is always "
             "operator-controlled."
         ),
     )
@@ -572,11 +601,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         dest="review_json",
         help=(
-            "Path to a Codex-style review JSON file. The MVP accepts the "
-            "lowercase verdict enum (approve|request_changes|comment) "
-            "from the pr-loop task spec; the legacy uppercase verdicts "
-            "(ACCEPT/REQUEST_CHANGES/BLOCK) are also accepted for "
-            "backward compatibility."
+            "Path to a review JSON file matching schemas/review_verdict.schema.json. "
+            "Only ACCEPT, REQUEST_CHANGES, and BLOCK verdicts are valid."
         ),
     )
     parser.add_argument("--executor-model", default=DEFAULT_EXECUTOR_MODEL, help=f"Executor model id (default: {DEFAULT_EXECUTOR_MODEL}).")
@@ -585,7 +611,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT, help=f"Per-cycle executor idle watchdog in seconds. Default: {DEFAULT_IDLE_TIMEOUT}.")
     parser.add_argument("--branch", default=None, help="PR branch name (optional metadata). The loop refuses to schedule a repair on 'main' or 'master' so the executor cannot push to a protected branch by accident.")
     parser.add_argument("--pr-loop-root", default=str(DEFAULT_PR_LOOP_ROOT), help=f"Directory under which cycle artifacts are written. Default: {DEFAULT_PR_LOOP_ROOT}.")
-    parser.add_argument("--dry-run", action="store_true", help="Write the repair prompt and print the decision, but do not invoke the operator-run harness. Use this to preview a request_changes cycle before the executor actually runs.")
+    parser.add_argument("--dry-run", action="store_true", help="Write the repair prompt and print the decision, but do not invoke the operator-run harness. Use this to preview a REQUEST_CHANGES cycle before the executor actually runs.")
     parser.add_argument("--format", choices=("text", "json"), default="text", help="Output format. 'text' (default) prints a one-line summary; 'json' prints a JSON object with the loop decision fields.")
     return parser
 
@@ -642,7 +668,7 @@ def main(argv: list[str] | None = None, *, executor: ExecutorBackend | None = No
         print(json.dumps(decision.to_dict(), indent=2, sort_keys=True))
     else:
         _print_decision_text(decision)
-    if decision.status in {"comment", "blocked"} and decision.verdict.blocking_issues:
+    if decision.status == "blocked" and decision.verdict.blocking_issues:
         for index, issue in enumerate(decision.verdict.blocking_issues, start=1):
             print(f"  blocking_issue[{index}] severity={issue.severity}")
             print(f"      issue: {issue.issue}")
@@ -650,20 +676,17 @@ def main(argv: list[str] | None = None, *, executor: ExecutorBackend | None = No
                 print(f"      file: {issue.file}")
             if issue.suggested_fix:
                 print(f"      suggested_fix: {issue.suggested_fix}")
-    if decision.status == "approved" and not decision.verdict.recommended_merge:
-        print(
-            "pr-loop: warning: approve verdict but recommended_merge=false; "
-            "merge is operator-controlled and the loop will not auto-merge.",
-            file=sys.stderr,
-        )
+    if decision.status == "blocked" and decision.verdict.requires_executor():
+        return 2
     return 0
 
 
 __all__ = [
-    "ACCEPT_VERDICTS",
+    "ACCEPT_VERDICT",
     "ALL_KNOWN_VERDICTS",
     "BlockingIssue",
-    "COMMENT_VERDICTS",
+    "BLOCK_VERDICT",
+    "CONFIDENCE_VALUES",
     "DEFAULT_EXECUTOR_MODEL",
     "DEFAULT_IDLE_TIMEOUT",
     "DEFAULT_MAX_CYCLES",
@@ -673,7 +696,7 @@ __all__ = [
     "LoopDecision",
     "PrLoopError",
     "PrLoopRefused",
-    "REQUEST_CHANGES_VERDICTS",
+    "REQUEST_CHANGES_VERDICT",
     "ReviewPayload",
     "VerdictParseError",
     "build_parser",

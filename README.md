@@ -274,8 +274,8 @@ panel integration.
 
 `agentops operator-run` covers the *outer* operator prompt. The
 `agentops pr-loop` subcommand covers the *cross-tool* PR repair
-loop: take a Codex-style review JSON, turn it into a deterministic
-repair prompt, and (for `request_changes` verdicts) schedule the
+loop: take a schema-conformant review JSON, turn it into a deterministic
+repair prompt, and (for `REQUEST_CHANGES` verdicts) schedule the
 existing operator-run harness on the PR branch. The final merge is
 always operator-controlled; the loop never pushes to `main`, never
 force-pushes, never rebases, and never merges the PR.
@@ -291,20 +291,21 @@ python -m agentops pr-loop 13 \
 
 The command is deliberately narrow:
 
-* **`approve` verdict** — short-circuits, executor not invoked,
-  prints `status=approved`. `recommended_merge` is surfaced on
-  stderr so the operator can decide whether to merge; the loop
-  never auto-merges.
-* **`comment` verdict** — short-circuits, executor not invoked,
-  prints `status=comment`. Non-blocking issues are recorded but no
+* **`ACCEPT` verdict** — short-circuits, executor not invoked,
+  prints `status=approved`. `safe_to_merge=true` means ready for
+  operator merge; `safe_to_merge=false` means approved but not
+  merge-ready. The loop never auto-merges.
+* **`BLOCK` verdict** — short-circuits, executor not invoked,
+  prints `status=blocked`. Blocking issues are reported but no
   cycle directory is created.
-* **`request_changes` verdict** — writes a deterministic repair
+* **`REQUEST_CHANGES` verdict** — writes a deterministic repair
   prompt under `.agentops/pr-loop/<pr-number>/cycle-<n>/executor.prompt.md`
   and (without `--dry-run`) schedules the operator-run harness on
-  the PR branch. The prompt includes the blocking issues verbatim
+  the PR branch only when `safe_to_push=true`. The prompt includes
+  the reviewer `repair_prompt` verbatim, the exact blocking issues,
   and the input verdict JSON is persisted as `review.verdict.json`
-  next to the prompt so the operator can audit which JSON drove
-  each cycle.
+  next to the prompt so the operator can audit which JSON drove each
+  cycle.
 
 The `--dry-run` flag writes the prompt and prints the decision
 (`status=dry_run`) without invoking the executor. Without
@@ -324,12 +325,12 @@ PR. The `--max-cycles` guard (default 3) stops the loop from
 spinning forever; once it fires the operator decides the next
 move. The final merge is always operator-controlled.
 
-The MVP accepts the Codex-style lowercase verdict enum
-(`approve` / `request_changes` / `comment`) and the legacy
-uppercase forms (`ACCEPT` / `REQUEST_CHANGES` / `BLOCK`) from
-`schemas/review_verdict.schema.json` for backward compatibility.
-Any other shape (missing field, wrong type, unknown verdict) fails
-closed with a `VerdictParseError` and a non-zero exit code.
+The MVP accepts only the contract in `schemas/review_verdict.schema.json`:
+`ACCEPT`, `REQUEST_CHANGES`, or `BLOCK`; required `confidence`,
+`summary`, `blocking_issues`, `repair_prompt`, `safe_to_push`, and
+`safe_to_merge`; no unknown top-level fields; and object-only blocking
+issues with `file`, `severity`, `issue`, and `suggested_fix`. Any other
+shape fails closed with a `VerdictParseError` and a non-zero exit code.
 
 See `docs/gated-roadmap-runner.md` for the verdict contract and the
 anti-hallucination checklist, and `docs/operator-run-harness.md`

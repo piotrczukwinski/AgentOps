@@ -542,10 +542,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         dest="review_json",
         help=(
-            "Path to a Codex-style review JSON file. The MVP accepts the lowercase "
-            "verdict enum (approve|request_changes|comment); the legacy uppercase "
-            "verdicts (ACCEPT/REQUEST_CHANGES/BLOCK) are also accepted for backward "
-            "compatibility."
+            "Path to a review JSON file matching schemas/review_verdict.schema.json. "
+            "Only ACCEPT, REQUEST_CHANGES, and BLOCK verdicts are valid."
         ),
     )
     pr_loop_cmd.add_argument(
