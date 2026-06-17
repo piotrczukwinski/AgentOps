@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,21 @@ from .models import MergePolicy, RepoConfig, ReviewConfig, RoadmapConfig, TaskCo
 # ``max_attempts`` and the task-level ``max_repair_attempts`` are still
 # honored when the roadmap does not set the field.
 DEFAULT_MAX_REPAIR_ATTEMPTS = 3
+
+
+# Allowed values for ``review.model_reasoning_effort`` (and its
+# ``review.reasoning_effort`` alias). The local codex CLI maps these
+# onto the OpenAI reasoning-effort parameter via
+# ``-c model_reasoning_effort=<value>``. The current CLI rejects
+# ``--reasoning-effort`` so we always emit the ``-c`` form.
+ALLOWED_MODEL_REASONING_EFFORTS = frozenset({"low", "medium", "high"})
+
+# Environment variable names for the codex reviewer override. The
+# roadmap/task config wins when both are set; the env var is a fallback
+# so operators do not have to edit roadmaps just to point at a
+# different reviewer model.
+ENV_CODEX_MODEL = "AGENTOPS_CODEX_MODEL"
+ENV_CODEX_MODEL_REASONING_EFFORT = "AGENTOPS_CODEX_MODEL_REASONING_EFFORT"
 
 
 def default_max_repair_attempts() -> int:
@@ -149,6 +165,8 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 risk_threshold=roadmap_review.risk_threshold,
                 schema_path=roadmap_review.schema_path,
                 fallback_heuristic=roadmap_review.fallback_heuristic,
+                codex_model=roadmap_review.codex_model,
+                model_reasoning_effort=roadmap_review.model_reasoning_effort,
             )
         elif isinstance(review_data, str):
             review = ReviewConfig(codex=review_data)
@@ -162,6 +180,12 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 risk_threshold=int(review_data.get("risk_threshold", defaults.get("codex_risk_threshold", 4))),
                 schema_path=schema_path,
                 fallback_heuristic=bool(review_data.get("fallback_heuristic", defaults.get("review_fallback_heuristic", False))),
+                codex_model=_resolve_codex_model(
+                    review_data, defaults, roadmap_review=roadmap_review
+                ),
+                model_reasoning_effort=_resolve_model_reasoning_effort(
+                    review_data, defaults, roadmap_review=roadmap_review
+                ),
             )
         else:
             raise ConfigError(f"task {task_id}: review must be string or object")
@@ -305,6 +329,8 @@ def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -
             base=base,
         ),
         fallback_heuristic=bool(value.get("fallback_heuristic", defaults.get("review_fallback_heuristic", False))),
+        codex_model=_resolve_codex_model(value, defaults),
+        model_reasoning_effort=_resolve_model_reasoning_effort(value, defaults),
     )
 
 
@@ -355,3 +381,90 @@ def _resolve_review_codex(
             f"auto/required/never/milestone_only, got {raw!r}"
         )
     return codex
+
+
+def _resolve_codex_model(
+    review_data: dict[str, Any],
+    defaults: dict[str, Any],
+    *,
+    roadmap_review: ReviewConfig | None = None,
+) -> str | None:
+    """Resolve the codex reviewer model override.
+
+    Resolution order:
+
+    1. ``review.model`` in the roadmap/task JSON.
+    2. ``roadmap_review.codex_model`` (task-level fallback to the
+       roadmap-level review object).
+    3. ``defaults["codex_model"]`` (legacy roadmap default).
+    4. The ``AGENTOPS_CODEX_MODEL`` environment variable.
+    5. ``None`` (the codex CLI default is used; the runner emits no
+       ``-m`` flag).
+
+    Empty strings are treated as "not set" so a stray empty
+    ``"model": ""`` in a roadmap cannot accidentally clear the env
+    override.
+    """
+    raw = review_data.get("model")
+    if raw is None and roadmap_review is not None:
+        raw = roadmap_review.codex_model
+    if raw is None and isinstance(defaults, dict):
+        raw = defaults.get("codex_model")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = os.environ.get(ENV_CODEX_MODEL)
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    return value
+
+
+def _resolve_model_reasoning_effort(
+    review_data: dict[str, Any],
+    defaults: dict[str, Any],
+    *,
+    roadmap_review: ReviewConfig | None = None,
+) -> str | None:
+    """Resolve the codex ``model_reasoning_effort`` override.
+
+    Resolution order:
+
+    1. ``review.model_reasoning_effort`` in the roadmap/task JSON.
+    2. ``review.reasoning_effort`` alias for the same field.
+    3. ``roadmap_review.model_reasoning_effort`` (task-level fallback
+       to the roadmap-level review object).
+    4. ``defaults["codex_model_reasoning_effort"]`` /
+       ``defaults["reasoning_effort"]`` (legacy roadmap defaults).
+    5. The ``AGENTOPS_CODEX_MODEL_REASONING_EFFORT`` env var.
+    6. ``None`` (the runner emits no ``-c model_reasoning_effort=...``
+       flag).
+
+    The resolved value is normalized to lowercase and validated
+    against :data:`ALLOWED_MODEL_REASONING_EFFORTS`
+    (``low``/``medium``/``high``). An unknown value raises
+    :class:`ConfigError` so the operator finds out at plan time, not
+    on the first codex call.
+    """
+    raw = review_data.get("model_reasoning_effort")
+    if raw is None:
+        raw = review_data.get("reasoning_effort")
+    if raw is None and roadmap_review is not None and roadmap_review.model_reasoning_effort is not None:
+        raw = roadmap_review.model_reasoning_effort
+    if raw is None and isinstance(defaults, dict):
+        raw = defaults.get("codex_model_reasoning_effort")
+        if raw is None:
+            raw = defaults.get("reasoning_effort")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = os.environ.get(ENV_CODEX_MODEL_REASONING_EFFORT)
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if not value:
+        return None
+    if value not in ALLOWED_MODEL_REASONING_EFFORTS:
+        raise ConfigError(
+            f"review.model_reasoning_effort must be one of "
+            f"{sorted(ALLOWED_MODEL_REASONING_EFFORTS)}, got {raw!r}"
+        )
+    return value

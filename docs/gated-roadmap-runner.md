@@ -279,6 +279,72 @@ key, it inherits the roadmap-level `codex` (or `mode`) value. This lets
 operators write a single roadmap-level review policy and have every
 task honor it.
 
+### Reviewer model override (`model` / `model_reasoning_effort`)
+
+The default codex model can be 0%-rate-limited, but the local
+`codex` CLI works with an explicit model + reasoning-effort pair:
+
+```bash
+codex -m gpt-5.3-codex-spark -c model_reasoning_effort=high
+```
+
+AgentOps exposes this through the roadmap / task `review` config (and
+as an env-var fallback) instead of requiring a PATH wrapper:
+
+```json
+{
+  "review": {
+    "mode": "required",
+    "reviewer": "codex",
+    "model": "gpt-5.3-codex-spark",
+    "model_reasoning_effort": "high"
+  }
+}
+```
+
+The runner translates the config above to:
+
+```bash
+codex -m gpt-5.3-codex-spark -c model_reasoning_effort=high
+```
+
+The same fields can be set per task inside `tasks[].review`. The
+task-level values override the roadmap-level values; fields not set
+at the task level fall back to the roadmap-level review, then to
+the env var, then to the codex default (no flag).
+
+Env-var fallback:
+
+| Config key                  | Env var                              |
+|-----------------------------|--------------------------------------|
+| `review.model`              | `AGENTOPS_CODEX_MODEL`               |
+| `review.model_reasoning_effort` | `AGENTOPS_CODEX_MODEL_REASONING_EFFORT` |
+
+`review.reasoning_effort` is accepted as an alias for
+`review.model_reasoning_effort`. Allowed values are `low`, `medium`,
+`high`; an unknown value fails closed at `agentops plan` time
+(`ConfigError`). The runner intentionally emits
+`-c model_reasoning_effort=<value>` and never the legacy
+`--reasoning-effort` flag, because the local `codex` CLI rejects the
+latter as an unexpected argument on codex-cli 0.140.0+.
+
+Resolution order (per task, applied uniformly to `codex_model` and
+`model_reasoning_effort`):
+
+1. `tasks[].review.model` / `tasks[].review.model_reasoning_effort`
+   (per-task override).
+2. `review.model` / `review.model_reasoning_effort` (roadmap-level).
+3. `defaults.codex_model` / `defaults.codex_model_reasoning_effort`
+   (roadmap-level legacy default).
+4. `AGENTOPS_CODEX_MODEL` / `AGENTOPS_CODEX_MODEL_REASONING_EFFORT`
+   environment variable.
+5. The codex default (no flag emitted).
+
+The verifier is
+`agentops/config.py::_resolve_codex_model` /
+`agentops/config.py::_resolve_model_reasoning_effort` and the
+test surface is `tests/test_codex_reviewer_model.py`.
+
 ### Per-task repair cap (`max_repair_attempts`)
 
 The per-task total executor attempts (initial + repair attempts driven

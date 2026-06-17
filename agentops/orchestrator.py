@@ -1046,8 +1046,20 @@ class Orchestrator:
         self.state.event(roadmap.roadmap_id, task.id, attempt_id, "task.review_requested", {"reviewer": "codex"})
         budget.record_codex_prompt(review_prompt)
         schema_path = self._resolve_review_schema(roadmap, task)
+        # Forward the resolved codex-model overrides (config -> env ->
+        # None) to the runner. The model default can be 0%-rate-limited
+        # on the local codex CLI, so a roadmap that pins a working
+        # model keeps the review gate productive. Config-level values
+        # always win over the env fallback (see
+        # ``agentops.config._resolve_codex_model`` / ``..._effort``).
         verdict, result_path = codex_service.review(
-            review_prompt_path, target_worktree, attempt_dir, schema_path=schema_path, timeout_seconds=task.timeout_seconds
+            review_prompt_path,
+            target_worktree,
+            attempt_dir,
+            schema_path=schema_path,
+            timeout_seconds=task.timeout_seconds,
+            model=task.review.codex_model,
+            model_reasoning_effort=task.review.model_reasoning_effort,
         )
         self.state.record_artifact(
             roadmap.roadmap_id, task.id, attempt_id, "review_result", result_path

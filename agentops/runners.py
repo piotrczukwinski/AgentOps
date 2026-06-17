@@ -174,12 +174,26 @@ def yolo_enabled(task: TaskConfig) -> bool:
 
 
 class CodexRunner:
-    def run_review(self, prompt_path: Path, cwd: Path, artifact_dir: Path, schema_path: Path | None = None, timeout_seconds: int = 3600, *, output_path: Path | None = None, binary: str | None = None) -> RunnerResult:
+    def run_review(
+        self,
+        prompt_path: Path,
+        cwd: Path,
+        artifact_dir: Path,
+        schema_path: Path | None = None,
+        timeout_seconds: int = 3600,
+        *,
+        output_path: Path | None = None,
+        binary: str | None = None,
+        model: str | None = None,
+        model_reasoning_effort: str | None = None,
+    ) -> RunnerResult:
         command = build_codex_command(
             prompt_path,
             schema_path=schema_path,
             output_path=output_path or (artifact_dir / "review.result.json"),
             binary=binary or "codex",
+            model=model,
+            model_reasoning_effort=model_reasoning_effort,
         )
         stdout_path = artifact_dir / "review.stdout.jsonl"
         stderr_path = artifact_dir / "review.stderr.log"
@@ -211,6 +225,8 @@ def build_codex_command(
     schema_path: Path | None = None,
     output_path: Path | None = None,
     binary: str = "codex",
+    model: str | None = None,
+    model_reasoning_effort: str | None = None,
 ) -> list[str]:
     """Build the argv for a Codex review call.
 
@@ -225,12 +241,32 @@ def build_codex_command(
     that flag alone. Older codex builds that still accept
     ``--ask-for-approval never`` are also handled by relying on the default
     approval policy (``never``), so the behaviour is equivalent.
+
+    Reviewer model override
+    -----------------------
+
+    The codex CLI default model can be 0%-rate-limited. To keep the
+    review path productive the runner accepts two optional flags:
+
+    * ``model`` -> ``-m <model>`` (e.g. ``gpt-5.3-codex-spark``).
+    * ``model_reasoning_effort`` -> ``-c model_reasoning_effort=<value>``
+      (e.g. ``high``). The CLI rejects ``--reasoning-effort``, so the
+      ``-c`` form is the only way to set the effort knob on the
+      supported codex builds.
+
+    Both flags are emitted only when the corresponding argument is
+    truthy, so a legacy roadmap that does not set them still produces
+    the canonical ``codex exec --sandbox read-only ...`` argv.
     """
     command = [binary, "exec", "--sandbox", "read-only"]
     if schema_path is not None:
         command.extend(["--output-schema", str(schema_path)])
     if output_path is not None:
         command.extend(["-o", str(output_path)])
+    if model:
+        command.extend(["-m", str(model)])
+    if model_reasoning_effort:
+        command.extend(["-c", f"model_reasoning_effort={model_reasoning_effort}"])
     # The prompt is read from a file (not stdin) so Codex can re-read it
     # during structured output generation.
     command.append(str(prompt_path))
