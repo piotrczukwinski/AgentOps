@@ -470,7 +470,8 @@ def evaluate_cycle(
     dry_run: bool,
     executor: ExecutorBackend | None,
 ) -> LoopDecision:
-    cycle = next_cycle_number(pr_root)
+    pr_dir = pr_root / str(pr_number)
+    cycle = next_cycle_number(pr_dir)
     if cycle > max_cycles:
         return LoopDecision(
             status="blocked",
@@ -488,8 +489,8 @@ def evaluate_cycle(
 
     if branch is not None:
         _validate_branch_name(branch)
-    pr_root.mkdir(parents=True, exist_ok=True)
-    cycle_path = cycle_dir(pr_root, cycle)
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    cycle_path = cycle_dir(pr_dir, cycle)
     cycle_path.mkdir(parents=True, exist_ok=True)
     prompt_path = cycle_path / "executor.prompt.md"
     prompt_text = build_repair_prompt(

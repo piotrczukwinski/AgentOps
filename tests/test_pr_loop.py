@@ -254,7 +254,8 @@ class AcceptVerdictTests(unittest.TestCase):
             self.assertIn("status=approved", result.stdout)
             self.assertIn("merge-ready", result.stdout)
             self.assertEqual(executor.call_count(), 0)
-            self.assertFalse((pr_root / "cycle-1").exists())
+            self.assertFalse((pr_root / "13" / "cycle-1").exists())
+            self.assertFalse((pr_root / "13").exists())
 
     def test_accept_does_not_invoke_executor_when_not_merge_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,7 +270,8 @@ class AcceptVerdictTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertIn("not merge-ready", result.stdout)
             self.assertEqual(executor.call_count(), 0)
-            self.assertFalse((pr_root / "cycle-1").exists())
+            self.assertFalse((pr_root / "13" / "cycle-1").exists())
+            self.assertFalse((pr_root / "13").exists())
 
 
 class BlockVerdictTests(unittest.TestCase):
@@ -298,7 +300,8 @@ class BlockVerdictTests(unittest.TestCase):
             self.assertIn("status=blocked", result.stdout)
             self.assertIn("Executor must not run.", result.stdout)
             self.assertEqual(executor.call_count(), 0)
-            self.assertFalse((pr_root / "cycle-1").exists())
+            self.assertFalse((pr_root / "13" / "cycle-1").exists())
+            self.assertFalse((pr_root / "13").exists())
 
 
 class RequestChangesTests(unittest.TestCase):
@@ -331,13 +334,14 @@ class RequestChangesTests(unittest.TestCase):
                 _common_args(reviewer.path, pr_root), executor=executor
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            prompt_text = (pr_root / "cycle-1" / "executor.prompt.md").read_text(
+            prompt_text = (pr_root / "13" / "cycle-1" / "executor.prompt.md").read_text(
                 encoding="utf-8"
             )
             self.assertIn(reviewer_prompt, prompt_text)
             self.assertIn("agentops/pr_loop.py", prompt_text)
             self.assertIn("Wrong verdict contract.", prompt_text)
             self.assertIn("Use the schema enum only.", prompt_text)
+            self.assertTrue((pr_root / "13" / "cycle-1" / "executor.prompt.md").is_file())
             self.assertEqual(executor.call_count(), 1)
 
     def test_request_changes_safe_to_push_false_does_not_invoke_executor(self) -> None:
@@ -358,7 +362,7 @@ class RequestChangesTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, msg=result.stdout)
             self.assertIn("safe_to_push=false", result.stdout)
             self.assertEqual(executor.call_count(), 0)
-            self.assertTrue((pr_root / "cycle-1" / "executor.prompt.md").is_file())
+            self.assertTrue((pr_root / "13" / "cycle-1" / "executor.prompt.md").is_file())
 
     def test_dry_run_creates_prompt_and_does_not_invoke_executor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -379,7 +383,7 @@ class RequestChangesTests(unittest.TestCase):
             self.assertIn("status=dry_run", result.stdout)
             self.assertIn("prompt_path=", result.stdout)
             self.assertEqual(executor.call_count(), 0)
-            self.assertTrue((pr_root / "cycle-1" / "executor.prompt.md").is_file())
+            self.assertTrue((pr_root / "13" / "cycle-1" / "executor.prompt.md").is_file())
 
     def test_request_changes_cycle_number_increments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -393,12 +397,12 @@ class RequestChangesTests(unittest.TestCase):
             )
             executor = RecordingExecutor()
             pr_root = tmp_path / "pr-loop"
-            (pr_root / "cycle-1").mkdir(parents=True)
+            (pr_root / "13" / "cycle-1").mkdir(parents=True)
             result = _CliRunner().run(
                 _common_args(reviewer.path, pr_root), executor=executor
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertTrue((pr_root / "cycle-2" / "executor.prompt.md").is_file())
+            self.assertTrue((pr_root / "13" / "cycle-2" / "executor.prompt.md").is_file())
             self.assertEqual(executor.call_count(), 1)
 
 
@@ -494,7 +498,8 @@ class BranchSafetyTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0, msg=result.stdout)
             self.assertEqual(executor.call_count(), 0)
-            self.assertFalse((pr_root / "cycle-1").exists())
+            self.assertFalse((pr_root / "13" / "cycle-1").exists())
+            self.assertFalse((pr_root / "13").exists())
 
     def test_master_branch_is_rejected_for_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -514,6 +519,8 @@ class BranchSafetyTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0, msg=result.stdout)
             self.assertEqual(executor.call_count(), 0)
+            self.assertFalse((pr_root / "13" / "cycle-1").exists())
+            self.assertFalse((pr_root / "13").exists())
 
     def test_branch_validator_rejects_head(self) -> None:
         with self.assertRaises(pr_loop.PrLoopRefused):
@@ -545,6 +552,8 @@ class JsonOutputTests(unittest.TestCase):
             self.assertFalse(payload["safe_to_merge"])
             self.assertEqual(payload["blocking_issue_count"], 1)
             self.assertTrue(payload["prompt_path"].endswith("executor.prompt.md"))
+            self.assertIn("/13/", payload["prompt_path"])
+            self.assertIn("/cycle-1/", payload["prompt_path"])
             self.assertEqual(payload["run_id"], "fake-run-001")
 
     def test_json_output_for_accept(self) -> None:
@@ -574,6 +583,94 @@ class CycleNumberTests(unittest.TestCase):
             (root / "cycle-1").mkdir()
             (root / "cycle-2").mkdir()
             self.assertEqual(pr_loop.next_cycle_number(root), 3)
+
+
+class PrNumberScopeTests(unittest.TestCase):
+    """Cycle artifacts must be scoped by PR number, not shared across PRs."""
+
+    PR_NUMBER = "13"
+
+    def _expected_cycle_dir(self, pr_root: Path, cycle: int) -> Path:
+        return pr_root / self.PR_NUMBER / f"cycle-{cycle}"
+
+    def _request_changes_review(self, reviewer: FakeReviewer) -> None:
+        reviewer.write(
+            verdict="REQUEST_CHANGES",
+            blocking_issues=[_blocking_issue()],
+            safe_to_push=True,
+            safe_to_merge=False,
+        )
+
+    def test_dry_run_prompt_path_contains_pr_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            reviewer = FakeReviewer(tmp_path / "review")
+            self._request_changes_review(reviewer)
+            executor = RecordingExecutor()
+            pr_root = tmp_path / "pr-loop"
+            result = _CliRunner().run(
+                _common_args(reviewer.path, pr_root, dry_run=True),
+                executor=executor,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            expected = self._expected_cycle_dir(pr_root, 1) / "executor.prompt.md"
+            self.assertTrue(expected.is_file(), msg=f"missing prompt at {expected}")
+            self.assertIn(f"/{self.PR_NUMBER}/cycle-1/executor.prompt.md", str(expected))
+
+    def test_repair_scheduled_prompt_path_contains_pr_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            reviewer = FakeReviewer(tmp_path / "review")
+            self._request_changes_review(reviewer)
+            executor = RecordingExecutor()
+            pr_root = tmp_path / "pr-loop"
+            result = _CliRunner().run(
+                _common_args(reviewer.path, pr_root), executor=executor
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertEqual(executor.call_count(), 1)
+            called_prompt_path = executor.calls[0]["prompt_path"]
+            self.assertEqual(
+                called_prompt_path,
+                self._expected_cycle_dir(pr_root, 1) / "executor.prompt.md",
+            )
+            self.assertIn(f"/{self.PR_NUMBER}/", str(called_prompt_path))
+
+    def test_json_output_prompt_path_contains_pr_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            reviewer = FakeReviewer(tmp_path / "review")
+            self._request_changes_review(reviewer)
+            executor = RecordingExecutor()
+            pr_root = tmp_path / "pr-loop"
+            argv = _common_args(reviewer.path, pr_root) + ["--format", "json"]
+            result = _CliRunner().run(argv, executor=executor)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            expected = self._expected_cycle_dir(pr_root, 1) / "executor.prompt.md"
+            self.assertEqual(Path(payload["prompt_path"]), expected)
+            self.assertIn(f"/{self.PR_NUMBER}/cycle-1/", payload["prompt_path"])
+
+    def test_cycles_are_isolated_between_prs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            reviewer = FakeReviewer(tmp_path / "review")
+            self._request_changes_review(reviewer)
+            executor = RecordingExecutor()
+            pr_root = tmp_path / "pr-loop"
+            other_pr_args = _common_args(reviewer.path, pr_root)
+            other_pr_args[0] = "42"
+            first_result = _CliRunner().run(other_pr_args, executor=executor)
+            self.assertEqual(first_result.returncode, 0, msg=first_result.stderr)
+            self.assertTrue(
+                (pr_root / "42" / "cycle-1" / "executor.prompt.md").is_file()
+            )
+            self.assertFalse((pr_root / "13").exists())
+            self.assertEqual(executor.call_count(), 1)
+            self.assertEqual(
+                executor.calls[0]["prompt_path"],
+                pr_root / "42" / "cycle-1" / "executor.prompt.md",
+            )
 
 
 if __name__ == "__main__":
