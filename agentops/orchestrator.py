@@ -36,6 +36,8 @@ from .git_ops import (
     rev_parse,
 )
 from .models import (
+    EXECUTOR_IDLE_TIMEOUT,
+    EXECUTOR_NO_OUTPUT_STARTUP,
     DiffSnapshot,
     ReviewVerdict,
     RoadmapConfig,
@@ -127,6 +129,13 @@ class RunOptions:
     # Override the roadmap-level review policy at runtime (e.g. operator chose
     # --no-codex). ``None`` means honor the roadmap config.
     force_reviewer: str | None = None  # "codex" | "heuristic" | None
+    # Per-task executor watchdogs. When set, the runner terminates the
+    # executor process and surfaces a non-success task state with
+    # failure_category ``executor_no_output_startup`` /
+    # ``executor_idle_timeout`` if the executor's combined log is still
+    # empty / stalled for that many seconds.
+    executor_startup_timeout: float | None = None
+    executor_idle_timeout: float | None = None
 
 
 @dataclass
@@ -400,7 +409,14 @@ class Orchestrator:
                 roadmap.roadmap_id, task.id, TaskState.EXECUTOR_RUNNING, {"attempt": attempt_no}
             )
 
-            result = self._runner_for(task).run(task, prompt, execution_cwd, attempt_dir)
+            result = self._runner_for(task).run(
+                task,
+                prompt,
+                execution_cwd,
+                attempt_dir,
+                startup_timeout=self.options.executor_startup_timeout,
+                idle_timeout=self.options.executor_idle_timeout,
+            )
             self.state.finish_attempt(
                 roadmap.roadmap_id, task.id, attempt_id, result.exit_code, None, state="executor_finished"
             )
@@ -410,6 +426,92 @@ class Orchestrator:
             self.state.record_artifact(
                 roadmap.roadmap_id, task.id, attempt_id, "executor_stderr", result.stderr_path
             )
+            if result.combined_log_path is not None:
+                self.state.record_artifact(
+                    roadmap.roadmap_id, task.id, attempt_id, "executor_combined", result.combined_log_path
+                )
+
+            # Per-task executor watchdog hit. We surface this as a
+            # ``BLOCKED`` transition with a clear failure_category and a
+            # dedicated event so the run summary and the morning
+            # checklist can grep for it. The watchdogs are the per-task
+            # analogue of the operator-run harness watchdogs: they only
+            # fire when the executor process is alive but the combined
+            # log is empty / stalled, so a normal non-zero exit never
+            # gets reclassified.
+            if result.failure_category == EXECUTOR_NO_OUTPUT_STARTUP:
+                self._record_roadmap_event(
+                    roadmap, "task.executor_no_output_startup", task.id,
+                    extra={
+                        "failure_category": EXECUTOR_NO_OUTPUT_STARTUP,
+                        "exit_code": result.exit_code,
+                        "startup_for_seconds": result.startup_for_seconds,
+                        "watchdog_log_size_bytes": result.watchdog_log_size_bytes,
+                        "combined_log": str(result.combined_log_path) if result.combined_log_path else None,
+                        "stdout_log": str(result.stdout_path),
+                        "stderr_log": str(result.stderr_path),
+                        "attempt": attempt_no,
+                    },
+                )
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.BLOCKED,
+                    {
+                        "reason": EXECUTOR_NO_OUTPUT_STARTUP,
+                        "failure_category": EXECUTOR_NO_OUTPUT_STARTUP,
+                        "startup_for_seconds": result.startup_for_seconds,
+                        "watchdog_log_size_bytes": result.watchdog_log_size_bytes,
+                        "combined_log": str(result.combined_log_path) if result.combined_log_path else None,
+                        "stdout_log": str(result.stdout_path),
+                        "stderr_log": str(result.stderr_path),
+                        "attempt": attempt_no,
+                        "hint": (
+                            "Executor produced no log output within the startup window. "
+                            "Inspect the executor logs with `agentops task-tail <task-id> --follow` "
+                            "or `agentops logs <task-id>`. If the executor is genuinely alive but "
+                            "its first byte is slow, raise --executor-startup-timeout."
+                        ),
+                    },
+                )
+                return
+            if result.failure_category == EXECUTOR_IDLE_TIMEOUT:
+                self._record_roadmap_event(
+                    roadmap, "task.executor_idle_timeout", task.id,
+                    extra={
+                        "failure_category": EXECUTOR_IDLE_TIMEOUT,
+                        "exit_code": result.exit_code,
+                        "idle_for_seconds": result.idle_for_seconds,
+                        "watchdog_log_size_bytes": result.watchdog_log_size_bytes,
+                        "combined_log": str(result.combined_log_path) if result.combined_log_path else None,
+                        "stdout_log": str(result.stdout_path),
+                        "stderr_log": str(result.stderr_path),
+                        "attempt": attempt_no,
+                    },
+                )
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.BLOCKED,
+                    {
+                        "reason": EXECUTOR_IDLE_TIMEOUT,
+                        "failure_category": EXECUTOR_IDLE_TIMEOUT,
+                        "idle_for_seconds": result.idle_for_seconds,
+                        "watchdog_log_size_bytes": result.watchdog_log_size_bytes,
+                        "combined_log": str(result.combined_log_path) if result.combined_log_path else None,
+                        "stdout_log": str(result.stdout_path),
+                        "stderr_log": str(result.stderr_path),
+                        "attempt": attempt_no,
+                        "hint": (
+                            "Executor stalled mid-run: combined log stopped growing for longer "
+                            "than the idle window. Inspect the executor logs with "
+                            "`agentops task-tail <task-id> --follow` or `agentops logs <task-id>`. "
+                            "If the executor is alive but the run is slow, raise "
+                            "--executor-idle-timeout."
+                        ),
+                    },
+                )
+                return
 
             if task.execution_mode == "gitless_mirror" and runtime.mirror is not None:
                 copy_allowed_files_back(runtime.mirror, target_worktree, task.allowed_files)

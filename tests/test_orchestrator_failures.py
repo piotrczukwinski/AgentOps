@@ -58,7 +58,7 @@ class FakeShellRunner:
     def __init__(self, body: str = "") -> None:
         self._body = body
 
-    def run(self, task, prompt, cwd, artifact_dir):  # type: ignore[no-untyped-def]
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[no-untyped-def]
         from agentops.models import RunnerResult
         from agentops.runners import utc_now
         stdout_path = artifact_dir / "executor.stdout.log"

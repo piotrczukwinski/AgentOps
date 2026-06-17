@@ -4,10 +4,12 @@ import argparse
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .artifacts import safe_name
 from .config import ConfigError, load_roadmap
 from .models import TaskState
 from .orchestrator import Orchestrator, RunOptions
@@ -74,6 +76,31 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-tasks", type=int, default=None, help="Stop after N tasks.")
     run.add_argument("--workspaces-root", default=None, help="Override worktree workspace root.")
     run.add_argument("--artifacts-root", default=None, help="Override artifact root.")
+    run.add_argument(
+        "--executor-startup-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-task startup watchdog (seconds). If the executor's combined log is "
+            "still 0 bytes after this many seconds while the executor process is "
+            "alive, terminate it and mark the task BLOCKED with failure_category "
+            "``executor_no_output_startup``. Use ``agentops task-tail <task-id> "
+            "--follow`` to watch the combined log while the run is in progress. "
+            "Default: no startup timeout."
+        ),
+    )
+    run.add_argument(
+        "--executor-idle-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-task idle watchdog (seconds). If the executor's combined log has "
+            "already grown at least once and then stops growing for this many "
+            "seconds while the executor process is alive, terminate it and mark "
+            "the task BLOCKED with failure_category ``executor_idle_timeout``. "
+            "Default: no idle timeout."
+        ),
+    )
 
     status = sub.add_parser("status", help="Show task states.")
     status.add_argument("--roadmap-id", default=None, help="Filter by roadmap id.")
@@ -88,6 +115,57 @@ def build_parser() -> argparse.ArgumentParser:
 
     attempts = sub.add_parser("attempts", help="List attempts for a task.")
     attempts.add_argument("task_id")
+
+    # Task-tail: live tail the per-task executor combined log. Companion
+    # to ``operator-run --follow`` (which tails the *outer* operator
+    # prompt). When ``agentops run`` spawns an internal OpenCode/MiniMax
+    # executor the per-attempt log is the only place where the executor's
+    # progress is observable.
+    task_tail_cmd = sub.add_parser(
+        "task-tail",
+        help="Tail the per-task executor combined log (the internal roadmap executor, not the outer operator prompt).",
+        description=(
+            "Print the last N lines of ``.agentops/runs/<roadmap>/<task>/<attempt>/executor.combined.log`` "
+            "and (with --follow) keep streaming new lines until the task leaves the "
+            "executor_running state. Use this to diagnose a task that is stuck in "
+            "``executor_running`` with no visible output. It is the per-task "
+            "analogue of ``operator-run --follow`` and the replacement for "
+            "``raw opencode | tee`` emergency fallbacks."
+        ),
+    )
+    task_tail_cmd.add_argument("task_id", help="Task id to tail (e.g. STAB-001-OPERATOR-ACCEPTANCE-MATRIX).")
+    task_tail_cmd.add_argument(
+        "--roadmap",
+        default=None,
+        help="Roadmap id the task belongs to. Default: use the first roadmap that owns the task.",
+    )
+    task_tail_cmd.add_argument(
+        "--attempt",
+        type=int,
+        default=None,
+        help="1-based attempt number. Default: the latest attempt recorded for the task.",
+    )
+    task_tail_cmd.add_argument(
+        "--lines",
+        type=int,
+        default=80,
+        help="How many trailing lines to print on every refresh. Default: 80.",
+    )
+    task_tail_cmd.add_argument(
+        "--follow",
+        action="store_true",
+        help=(
+            "Keep streaming the combined log until the task leaves the executor_running "
+            "state (or the operator hits Ctrl+C). Without --follow the command prints the "
+            "last --lines lines and exits."
+        ),
+    )
+    task_tail_cmd.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Polling interval (seconds) used by --follow. Default: 2.",
+    )
 
     review_queue = sub.add_parser(
         "review-queue",
@@ -458,6 +536,8 @@ def main(argv: list[str] | None = None) -> int:
                 force_reviewer=args.reviewer,
                 workspaces_root=Path(args.workspaces_root).expanduser().resolve() if args.workspaces_root else None,
                 artifacts_root=Path(args.artifacts_root).expanduser().resolve() if args.artifacts_root else None,
+                executor_startup_timeout=args.executor_startup_timeout,
+                executor_idle_timeout=args.executor_idle_timeout,
             )
             count = Orchestrator(state, options).run_roadmap(roadmap)
             print(f"Processed {count} task(s) from roadmap {roadmap.roadmap_id}")
@@ -474,6 +554,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "attempts":
             return _cmd_attempts(state, args.task_id)
+
+        if args.command == "task-tail":
+            return _cmd_task_tail(state, args)
 
         if args.command == "review-queue":
             return _cmd_review_queue(state, args.roadmap_id)
@@ -709,6 +792,188 @@ def _cmd_attempts(state: StateStore, task_id: str) -> int:
     return 0
 
 
+def _task_tail_attempt_dir(state_root: Path, roadmap_id: str, task_id: str, attempt_no: int) -> Path:
+    """Resolve the per-attempt artifact directory for a task.
+
+    The path mirrors :meth:`ArtifactStore.attempt_dir` so the operator
+    and ``task-tail`` agree on the layout: ``<root>/runs/<roadmap>/<task>/<attempt>/``.
+    We resolve relative to ``state_root`` (the parent of ``state.sqlite``,
+    typically the repo's ``.agentops``) when the path is not absolute.
+    """
+    return (state_root / "runs" / safe_name(roadmap_id) / safe_name(task_id) / str(attempt_no)).resolve()
+
+
+def _task_tail_print_missing(task_id: str, roadmap_id: str, attempt_no: int, expected_log: Path, current_state: str | None, attempt_dir: Path) -> int:
+    """Print a friendly, diagnostic message when the combined log is missing.
+
+    The mission brief is explicit: when ``executor.combined.log`` is
+    missing the command must not crash; it must report the current task
+    state, the expected log path, the available artifact files, and a
+    suggested next step. That way an operator who pings ``task-tail``
+    mid-incident always gets actionable information.
+    """
+    print(f"task-tail: no executor.combined.log for task {task_id!r} (roadmap {roadmap_id!r}, attempt #{attempt_no})", file=sys.stderr)
+    print(f"  current state: {current_state or '(unknown)'}", file=sys.stderr)
+    print(f"  expected path: {expected_log}", file=sys.stderr)
+    print(f"  attempt dir:   {attempt_dir}", file=sys.stderr)
+    if attempt_dir.is_dir():
+        siblings = sorted(p.name for p in attempt_dir.iterdir())
+        if siblings:
+            print(f"  available files: {', '.join(siblings)}", file=sys.stderr)
+        else:
+            print("  available files: (empty)", file=sys.stderr)
+    else:
+        print("  attempt dir does not exist yet; the executor may not have started", file=sys.stderr)
+    print(
+        "  suggested action: confirm the task is actually running with `agentops status`; "
+        "if the task never reached executor_running, inspect the roadmap with `agentops plan`; "
+        "if the executor is alive but produced no log, raise --executor-startup-timeout on the next run.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _read_tail_lines(path: Path, lines: int) -> list[str]:
+    """Return the last ``lines`` lines of ``path`` (0 returns []).
+
+    Implementation notes:
+
+    * We open the file in binary mode and split on ``b"\\n"`` to avoid
+      the cost of decoding the entire log for the common "tail the
+      end" case; the bytes are then decoded with ``errors="replace"``
+      so a stray invalid sequence can never crash the watcher.
+    * When the file is empty (the first bytes are a single trailing
+      newline or no newline at all) we return ``[]`` so the follow
+      loop can detect "still empty" without printing misleading
+      output.
+    """
+    if not path.exists():
+        return []
+    with path.open("rb") as handle:
+        data = handle.read()
+    if not data:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    pieces = text.splitlines()
+    if not pieces:
+        return []
+    if pieces and pieces[-1] == "":
+        pieces = pieces[:-1]
+    if lines > 0 and len(pieces) > lines:
+        return pieces[-lines:]
+    return pieces
+
+
+def _cmd_task_tail(state: StateStore, args: argparse.Namespace) -> int:
+    """Tail the per-task executor combined log.
+
+    Two modes:
+
+    * default: print the last ``--lines`` lines of the combined log
+      and exit. Useful in scripts and one-off diagnostic calls.
+    * ``--follow``: keep tailing the combined log until the task
+      leaves ``executor_running`` (or the operator hits Ctrl+C). The
+      loop polls the log file and the SQLite state every
+      ``--interval`` seconds. Ctrl+C exits cleanly without
+      terminating the underlying executor process.
+    """
+    state.init()
+    task_id = args.task_id
+    roadmap_id = getattr(args, "roadmap", None)
+    attempt_no = getattr(args, "attempt", None)
+    follow = bool(getattr(args, "follow", False))
+    lines = max(1, int(getattr(args, "lines", 80) or 80))
+    interval = max(0.1, float(getattr(args, "interval", 2.0) or 2.0))
+
+    attempts = state.attempts_for_task(task_id, roadmap_id=roadmap_id)
+    if not attempts:
+        print(f"task-tail: no attempts recorded for task {task_id!r}.", file=sys.stderr)
+        print("  hint: confirm the task id with `agentops status`.", file=sys.stderr)
+        return 1
+
+    if attempt_no is None:
+        chosen = attempts[0]
+        attempt_no = int(chosen["attempt_no"])
+    else:
+        chosen = next(
+            (row for row in attempts if int(row["attempt_no"]) == int(attempt_no)),
+            None,
+        )
+        if chosen is None:
+            print(
+                f"task-tail: no attempt #{attempt_no} for task {task_id!r}. "
+                f"Available: {', '.join(str(r['attempt_no']) for r in attempts)}",
+                file=sys.stderr,
+            )
+            return 1
+
+    roadmap_id = str(chosen["roadmap_id"]) if not roadmap_id else str(roadmap_id)
+
+    db_path = Path(state.db_path).expanduser().resolve()
+    state_root = db_path.parent
+    attempt_dir = _task_tail_attempt_dir(state_root, roadmap_id, task_id, attempt_no)
+    expected_log = attempt_dir / "executor.combined.log"
+
+    if not follow:
+        if not expected_log.exists():
+            current_state = state.task_latest_state(task_id, roadmap_id=roadmap_id)
+            return _task_tail_print_missing(
+                task_id, roadmap_id, attempt_no, expected_log, current_state, attempt_dir
+            )
+        tail = _read_tail_lines(expected_log, lines)
+        if not tail:
+            print(f"(empty) {expected_log}")
+            return 0
+        for line in tail:
+            print(line)
+        return 0
+
+    # --follow mode. We poll until the task leaves executor_running.
+    # The check on the task state is what makes the watch
+    # self-terminating: when the executor finishes (or the watchdog
+    # fires and the orchestrator transitions the task to BLOCKED)
+    # task-tail returns 0 instead of waiting forever.
+    print(
+        f"task-tail: following executor.combined.log for task {task_id!r} "
+        f"(roadmap {roadmap_id!r}, attempt #{attempt_no}); refresh every {interval}s",
+        file=sys.stderr,
+    )
+    print(f"  log: {expected_log}", file=sys.stderr)
+
+    last_offset = 0
+    last_size_printed = -1
+    try:
+        while True:
+            current_state = state.task_latest_state(task_id, roadmap_id=roadmap_id)
+            if expected_log.exists():
+                size = expected_log.stat().st_size
+                if size != last_size_printed:
+                    with expected_log.open("rb") as handle:
+                        handle.seek(last_offset)
+                        chunk = handle.read(size - last_offset)
+                    last_offset = size
+                    last_size_printed = size
+                    if chunk:
+                        sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                        sys.stdout.flush()
+            else:
+                size = 0
+            if current_state is not None and current_state != "executor_running":
+                print(
+                    f"\ntask-tail: task state is now {current_state!r}; leaving follow mode.",
+                    file=sys.stderr,
+                )
+                return 0
+            if size == 0 and (current_state is None or current_state != "executor_running"):
+                return _task_tail_print_missing(
+                    task_id, roadmap_id, attempt_no, expected_log, current_state, attempt_dir
+                )
+            time.sleep(interval)
+    except KeyboardInterrupt:  # noqa: PERF203 - CLI boundary
+        print("\ntask-tail: interrupted; leaving follow mode (the executor is unaffected).", file=sys.stderr)
+        return 130
+
+
 def _cmd_review_queue(state: StateStore, roadmap_id: str | None) -> int:
     state.init()
     with state.connect() as conn:
@@ -895,6 +1160,54 @@ def export_summary(state: StateStore, roadmap_id: str | None = None) -> str:
         for row in rows:
             if row["state"] == "blocked":
                 lines.append(f"- task `{row['id']}` (roadmap `{row['roadmap_id']}`)")
+        lines.append("")
+
+    # Surface executor watchdog hits specifically. The run verdict is
+    # already non-pass whenever any task is blocked, but the morning
+    # checklist needs to be able to grep ``executor_no_output_startup``
+    # / ``executor_idle_timeout`` straight from the summary. We pull
+    # them out of the event log rather than the task rows so the
+    # summary stays compatible with the BLOCKED-only state model.
+    executor_watchdog_rows: list[tuple[str, str, str]] = []
+    with state.connect() as conn:
+        for category in ("executor_no_output_startup", "executor_idle_timeout"):
+            cur = conn.execute(
+                "SELECT roadmap_id, task_id, payload_json, created_at FROM events "
+                "WHERE type IN (?, ?) ORDER BY seq",
+                (f"task.{category}", category),
+            )
+            for row in cur.fetchall():
+                try:
+                    payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+                except json.JSONDecodeError:
+                    payload = {}
+                hint = ""
+                if category == "executor_no_output_startup":
+                    hint = (
+                        f"startup_for_seconds={payload.get('startup_for_seconds')!r} "
+                        f"last_log_size_bytes={payload.get('watchdog_log_size_bytes')!r} "
+                        f"combined_log={payload.get('combined_log')!r}"
+                    )
+                else:
+                    hint = (
+                        f"idle_for_seconds={payload.get('idle_for_seconds')!r} "
+                        f"last_log_size_bytes={payload.get('watchdog_log_size_bytes')!r} "
+                        f"combined_log={payload.get('combined_log')!r}"
+                    )
+                executor_watchdog_rows.append((row["roadmap_id"], row["task_id"], f"{category} ({hint})"))
+    if executor_watchdog_rows:
+        lines.append("## Executor watchdog terminations")
+        lines.append(
+            "The following tasks were terminated because their executor was alive "
+            "but the combined log was empty (`executor_no_output_startup`) or had "
+            "stopped growing (`executor_idle_timeout`). The run summary never reports "
+            "``passed`` when any of these fired. Inspect the executor logs with "
+            "`agentops task-tail <task-id> --follow` and re-run the task with a "
+            "larger `--executor-startup-timeout` / `--executor-idle-timeout` when "
+            "the executor is genuinely alive but slow."
+        )
+        for roadmap_id, task_id, hint in executor_watchdog_rows:
+            lines.append(f"- task `{task_id}` (roadmap `{roadmap_id}`) {hint}")
         lines.append("")
 
     if awaiting_review_count:

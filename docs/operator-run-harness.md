@@ -63,6 +63,35 @@ python -m agentops operator-stop <run-id> --dir /home/czuki/AgentOps
 python -m agentops operator-stop <run-id> --dir /home/czuki/AgentOps --force
 ```
 
+## Observability split: outer prompt vs internal task executor
+
+The Operator Run Harness covers the **outer** operator prompt — a
+long prompt the operator ran by hand, e.g. the prompt that drives
+a BusinessAgent batch or a STAB stabilisation PR. When the
+operator's prompt itself is "execute a roadmap that does X, Y,
+Z", AgentOps then spawns **internal** task executors (one per
+task in the roadmap) and each of those is observed through a
+different command:
+
+| Surface | Tail command | Log location | What it observes |
+|---|---|---|---|
+| Outer operator prompt | `agentops operator-run --follow` / `agentops operator-tail <run-id>` | `.operator-runs/<run-id>/combined.log` | The `opencode run` process the operator launched by hand |
+| Internal task executor | `agentops task-tail <task-id>` | `.agentops/runs/<roadmap>/<task>/<attempt>/executor.combined.log` | The `opencode run` process the gated runner spawned for one task |
+
+The two are deliberately separate. A `STAB-001-OPERATOR-ACCEPTANCE-MATRIX`
+task that is stuck in `executor_running` is *not* visible to
+`operator-tail`; it is only visible to `agentops task-tail`. The
+mission brief for the STAB-001 incident (the harness for the
+inner task executor was missing) is fixed by the gated-runner
+observability layer; the harness documented here is the outer
+prompt's observability layer.
+
+If both layers are wedged at once, follow the inner task
+executor with `agentops task-tail <task-id> --follow` first; the
+outer prompt can be re-issued with `operator-retry` once the
+inner task is unblocked.
+
+
 ## Storage layout
 
 Each run gets its own directory:
