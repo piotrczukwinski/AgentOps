@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .models import RunnerResult, TaskConfig
+from .models import (
+    EXECUTOR_IDLE_TIMEOUT,
+    EXECUTOR_NO_OUTPUT_STARTUP,
+    RunnerResult,
+    TaskConfig,
+)
 
 
 def utc_now() -> str:
@@ -50,29 +58,59 @@ def reviewer_env() -> dict[str, str]:
 
 
 class BaseRunner:
-    def run(self, task: TaskConfig, prompt: str, cwd: Path, artifact_dir: Path) -> RunnerResult:
+    def run(
+        self,
+        task: TaskConfig,
+        prompt: str,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        startup_timeout: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
         raise NotImplementedError
 
 
 class ShellRunner(BaseRunner):
     """Deterministic local runner for tests and internal harnesses."""
 
-    def run(self, task: TaskConfig, prompt: str, cwd: Path, artifact_dir: Path) -> RunnerResult:
+    def run(
+        self,
+        task: TaskConfig,
+        prompt: str,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        startup_timeout: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
         if not task.executor_command:
             raise ValueError(f"Task {task.id} uses shell executor but executor_command is empty")
-        return run_command(
+        return run_command_streaming(
             task.executor_command,
             cwd=cwd,
             artifact_dir=artifact_dir,
             stdout_name="executor.stdout.log",
             stderr_name="executor.stderr.log",
+            combined_name="executor.combined.log",
             timeout_seconds=task.timeout_seconds,
             env=executor_env(),
+            startup_timeout=startup_timeout,
+            idle_timeout=idle_timeout,
         )
 
 
 class OpenCodeRunner(BaseRunner):
-    def run(self, task: TaskConfig, prompt: str, cwd: Path, artifact_dir: Path) -> RunnerResult:
+    def run(
+        self,
+        task: TaskConfig,
+        prompt: str,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        startup_timeout: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
         # OpenCode must be rooted in the executor workspace. Relying only on
         # subprocess cwd is not enough in practice because OpenCode can keep or
         # infer a different project/session root. Passing --dir makes the target
@@ -97,14 +135,17 @@ class OpenCodeRunner(BaseRunner):
             command.append("--dangerously-skip-permissions")
         command.append(prompt)
 
-        return run_argv(
+        return run_argv_streaming(
             command,
             cwd=cwd,
             artifact_dir=artifact_dir,
             stdout_name="executor.stdout.log",
             stderr_name="executor.stderr.log",
+            combined_name="executor.combined.log",
             timeout_seconds=task.timeout_seconds,
             env=executor_env(),
+            startup_timeout=startup_timeout,
+            idle_timeout=idle_timeout,
         )
 
 
@@ -214,6 +255,13 @@ def run_command(
     timeout_seconds: int,
     env: dict[str, str] | None = None,
 ) -> RunnerResult:
+    """Run a shell command, capture stdout/stderr after the process exits.
+
+    Retained for callers (and tests) that do not need live, tailable
+    logs. New code should prefer :func:`run_command_streaming` so the
+    executor output is written to ``executor.combined.log`` as it is
+    produced and the operator can tail it with ``agentops task-tail``.
+    """
     stdout_path = artifact_dir / stdout_name
     stderr_path = artifact_dir / stderr_name
     started = utc_now()
@@ -247,6 +295,13 @@ def run_argv(
     timeout_seconds: int,
     env: dict[str, str] | None = None,
 ) -> RunnerResult:
+    """Run an argv command, capture stdout/stderr after the process exits.
+
+    Retained for callers (and tests) that do not need live, tailable
+    logs. New code should prefer :func:`run_argv_streaming` so the
+    executor output is written to ``executor.combined.log`` as it is
+    produced.
+    """
     stdout_path = artifact_dir / stdout_name
     stderr_path = artifact_dir / stderr_name
     started = utc_now()
@@ -267,3 +322,644 @@ def run_argv(
         stdout_path.write_text(exc.stdout or "", encoding="utf-8", errors="replace")
         stderr_path.write_text((exc.stderr or "") + f"\nTIMEOUT after {timeout_seconds}s\n", encoding="utf-8", errors="replace")
         return RunnerResult(124, stdout_path, stderr_path, started, utc_now(), timed_out=True)
+
+
+# ---------------------------------------------------------------------------
+# Streaming executor runs
+# ---------------------------------------------------------------------------
+#
+# The streaming variants write the executor's stdout, stderr, and combined
+# log to disk in real time, then optionally watch the combined log for a
+# startup or idle timeout. The two watchdogs are the per-task analogue of
+# the ``--startup-timeout`` / ``--idle-timeout`` watchdogs in the Operator
+# Run Harness. The combined log is the same artefact that
+# ``agentops task-tail`` reads, so a long-running executor never leaves
+# the operator without an inspectable, tailable surface.
+
+
+class _IdleWatchdog:
+    """Background watchdog that kills a stalled executor run.
+
+    The watchdog is created by :func:`_spawn_idle_watchdog` when the
+    orchestrator (or the CLI) passes ``idle_timeout``. It runs in a
+    daemon thread and polls the active ``executor.combined.log`` every
+    ``poll_interval`` seconds; if the file's size has not changed for
+    ``idle_timeout`` seconds *and* the process is still alive, the
+    watchdog terminates the process group and flags the run with
+    ``EXECUTOR_IDLE_TIMEOUT`` so the orchestrator can transition the
+    task to a non-success state.
+
+    The watchdog never deletes logs, never auto-retries, and never
+    modifies the persisted state. It only sets the ``triggered`` flag
+    and stores a small set of fields the foreground function reads
+    back.
+    """
+
+    def __init__(
+        self,
+        *,
+        log_path: Path,
+        pid: int,
+        idle_timeout: float,
+        poll_interval: float = 0.5,
+        sleep_fn: Callable[[float], None] | None = None,
+        now_fn: Callable[[], float] | None = None,
+        terminate_fn: Callable[[int], None] | None = None,
+        pid_alive_fn: Callable[[int], bool] | None = None,
+    ) -> None:
+        if idle_timeout <= 0:
+            raise ValueError("idle_timeout must be > 0")
+        self.log_path = Path(log_path)
+        self.pid = int(pid)
+        self.idle_timeout = float(idle_timeout)
+        self.poll_interval = max(0.05, float(poll_interval))
+        self._sleep = sleep_fn if sleep_fn is not None else time.sleep
+        self._now = now_fn if now_fn is not None else time.monotonic
+        self._terminate = terminate_fn if terminate_fn is not None else _terminate_process_tree
+        self._pid_alive = pid_alive_fn if pid_alive_fn is not None else _pid_alive
+        self._last_size: int = -1
+        self._last_growth_at: float = self._now()
+        self.triggered: bool = False
+        self.triggered_at: float | None = None
+        self.last_log_size: int = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample(self) -> int:
+        try:
+            size = self.log_path.stat().st_size
+        except OSError:
+            size = 0
+        if size != self._last_size:
+            self._last_size = size
+            self._last_growth_at = self._now()
+        self.last_log_size = size
+        return size
+
+    def _loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                self._sample()
+                if not self._pid_alive(self.pid):
+                    return
+                idle = self._now() - self._last_growth_at
+                if idle >= self.idle_timeout:
+                    self._terminate(self.pid)
+                    self.triggered = True
+                    self.triggered_at = self._now()
+                    return
+                if self._stop.wait(self.poll_interval):
+                    return
+        except Exception:  # noqa: BLE001 - background watchdog, never raise
+            return
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._last_growth_at = self._now()
+        self._sample()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="agentops-task-idle-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.poll_interval * 2)
+
+
+class _StartupWatchdog:
+    """Background watchdog that kills a run that never produced any output.
+
+    Mirrors the Operator Run Harness's ``_StartupWatchdog``: if the
+    combined log is still 0 bytes after ``startup_timeout`` seconds
+    while the process is still alive, terminate the process group and
+    flag the run with ``EXECUTOR_NO_OUTPUT_STARTUP``. The watchdog
+    only fires while the log is empty; as soon as the executor writes
+    anything the watchdog exits cleanly and the
+    ``--executor-idle-timeout`` watchdog takes over.
+    """
+
+    def __init__(
+        self,
+        *,
+        log_path: Path,
+        pid: int,
+        startup_timeout: float,
+        poll_interval: float = 0.2,
+        sleep_fn: Callable[[float], None] | None = None,
+        now_fn: Callable[[], float] | None = None,
+        terminate_fn: Callable[[int], None] | None = None,
+        pid_alive_fn: Callable[[int], bool] | None = None,
+    ) -> None:
+        if startup_timeout <= 0:
+            raise ValueError("startup_timeout must be > 0")
+        self.log_path = Path(log_path)
+        self.pid = int(pid)
+        self.startup_timeout = float(startup_timeout)
+        self.poll_interval = max(0.05, float(poll_interval))
+        self._sleep = sleep_fn if sleep_fn is not None else time.sleep
+        self._now = now_fn if now_fn is not None else time.monotonic
+        self._terminate = terminate_fn if terminate_fn is not None else _terminate_process_tree
+        self._pid_alive = pid_alive_fn if pid_alive_fn is not None else _pid_alive
+        self.triggered: bool = False
+        self.triggered_at: float | None = None
+        self.last_log_size: int = 0
+        self.elapsed: float = 0.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample(self) -> int:
+        try:
+            size = self.log_path.stat().st_size
+        except OSError:
+            size = 0
+        self.last_log_size = size
+        return size
+
+    def _loop(self) -> None:
+        try:
+            start = self._now()
+            while not self._stop.is_set():
+                size = self._sample()
+                if size > 0:
+                    return
+                if not self._pid_alive(self.pid):
+                    return
+                self.elapsed = self._now() - start
+                if self.elapsed >= self.startup_timeout:
+                    self._terminate(self.pid)
+                    self.triggered = True
+                    self.triggered_at = self._now()
+                    return
+                if self._stop.wait(self.poll_interval):
+                    return
+        except Exception:  # noqa: BLE001 - background watchdog, never raise
+            return
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._sample()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="agentops-task-startup-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.poll_interval * 2)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if a process with ``pid`` appears to be running."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_process_tree(pid: int) -> None:
+    """Best-effort terminate of ``pid``'s process group.
+
+    Falls back to a bare ``SIGTERM`` when the child shares the harness's
+    process group (e.g. in-process test runs). The watchdog never
+    escalates to SIGKILL: the foreground path calls :func:`_wait` which
+    is responsible for reaping the child.
+    """
+    if pid <= 0:
+        return
+    try:
+        os.killpg(os.getpgid(pid), 15)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, 15)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def _pump_stream(
+    stream,
+    out_file,
+    combined_file,
+    *,
+    stream_name: str,
+) -> None:
+    """Read ``stream`` line-by-line and mirror to ``out_file`` and ``combined_file``.
+
+    Runs on a daemon thread. Decodes bytes as utf-8 with replacement so
+    the log files are always valid text. Returns when ``stream.readline``
+    returns an empty line (EOF).
+    """
+    try:
+        for raw in iter(stream.readline, b""):
+            try:
+                text = raw.decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 - never let the pump crash
+                text = ""
+            if not text:
+                continue
+            out_file.write(text)
+            out_file.flush()
+            combined_file.write(text)
+            combined_file.flush()
+    except Exception:  # noqa: BLE001 - never let the pump crash
+        return
+    finally:
+        try:
+            stream.close()
+        except Exception:  # noqa: BLE001 - best-effort close
+            pass
+
+
+def _wait(proc: subprocess.Popen, timeout: float | None) -> None:
+    """Wait for ``proc`` to exit, optionally bounded by ``timeout`` seconds.
+
+    On timeout, the foreground function appends a ``[agentops]
+    subprocess killed by the harness`` banner to the combined log and
+    returns so the caller can build the :class:`RunnerResult`. The
+    function never reaps ``proc`` itself when the wait timed out
+    because the caller will consult the watchdog and reap on its own
+    schedule.
+    """
+    if timeout is None:
+        proc.wait()
+        return
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Best-effort: signal once and let the foreground path inspect
+        # the watchdog state.
+        _terminate_process_tree(proc.pid)
+        # Allow a short grace period for the process to exit.
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            try:
+                _terminate_process_tree(proc.pid)
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+
+
+def _run_with_watchdogs(
+    *,
+    popen_args: tuple,
+    cwd: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    combined_path: Path,
+    timeout_seconds: int,
+    startup_timeout: float | None,
+    idle_timeout: float | None,
+    env: dict[str, str] | None,
+) -> RunnerResult:
+    """Shared body for :func:`run_command_streaming` and :func:`run_argv_streaming`.
+
+    ``popen_args`` is the ``args=`` argument for ``subprocess.Popen``
+    (either a ``str`` for ``shell=True`` or a ``list[str]`` for
+    ``shell=False``). The function does not own the watchdogs'
+    construction beyond start/stop; callers (and tests) can pass
+    pre-built watchdogs via the ``_watchdog_factory`` global for
+    hermetic testing.
+    """
+    started = utc_now()
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    combined_path.parent.mkdir(parents=True, exist_ok=True)
+    # Truncate the log files so a stale partial file from a previous
+    # run does not leak into the new attempt. The task-tail command and
+    # the watchdogs both see the new run from byte 0.
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+    combined_path.write_text("", encoding="utf-8")
+
+    with stdout_path.open("a", encoding="utf-8") as stdout_fh, stderr_path.open(
+        "a", encoding="utf-8"
+    ) as stderr_fh, combined_path.open("a", encoding="utf-8") as combined_fh:
+        try:
+            proc = subprocess.Popen(
+                popen_args,
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                shell=isinstance(popen_args, str),
+                # Keep the executor in its own process group so the
+                # watchdog can signal the whole tree without affecting
+                # the harness. Tests can override ``start_new_session``
+                # by patching ``subprocess.Popen`` directly; production
+                # callers get the safe default.
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            stderr_fh.write(f"[agentops] failed to launch executor: {exc}\n")
+            stderr_fh.flush()
+            combined_fh.write(f"[agentops] failed to launch executor: {exc}\n")
+            combined_fh.flush()
+            ended = utc_now()
+            return RunnerResult(
+                127,
+                stdout_path,
+                stderr_path,
+                started,
+                ended,
+                combined_log_path=combined_path,
+                failure_category=None,
+            )
+
+        stdout_thread = threading.Thread(
+            target=_pump_stream,
+            args=(proc.stdout, stdout_fh, combined_fh),
+            kwargs={"stream_name": "stdout"},
+            name="agentops-task-stdout-pump",
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_pump_stream,
+            args=(proc.stderr, stderr_fh, combined_fh),
+            kwargs={"stream_name": "stderr"},
+            name="agentops-task-stderr-pump",
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        idle_watchdog = _spawn_idle_watchdog(
+            log_path=combined_path,
+            pid=proc.pid,
+            idle_timeout=idle_timeout,
+        )
+        startup_watchdog = _spawn_startup_watchdog(
+            log_path=combined_path,
+            pid=proc.pid,
+            startup_timeout=startup_timeout,
+        )
+
+        try:
+            try:
+                _wait(proc, timeout_seconds)
+            except KeyboardInterrupt:  # noqa: PERF203 - CLI boundary
+                _terminate_process_tree(proc.pid)
+                try:
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            if idle_watchdog is not None:
+                idle_watchdog.stop()
+            if startup_watchdog is not None:
+                startup_watchdog.stop()
+            # Drain the pump threads so all the buffered output lands
+            # in the log files before the result is returned.
+            stdout_thread.join(timeout=5.0)
+            stderr_thread.join(timeout=5.0)
+            # Close any still-open pipe handles so the OS does not warn
+            # about leaked file descriptors in tests.
+            for handle in (proc.stdout, proc.stderr):
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:  # noqa: BLE001 - best-effort
+                        pass
+            # Reap the child if it is still alive (it should not be,
+            # but a defensive ``wait()`` avoids a zombie).
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            # Append a small banner so operator-tail / task-tail can see
+            # the run finished marker even if the executor never flushed.
+            try:
+                ended = utc_now()
+                failure_category: str | None = None
+                if startup_watchdog is not None and startup_watchdog.triggered:
+                    failure_category = EXECUTOR_NO_OUTPUT_STARTUP
+                    extra = (
+                        f"\n[agentops] executor terminated by startup watchdog "
+                        f"after {startup_watchdog.elapsed:.0f}s without any "
+                        f"log output (last size {startup_watchdog.last_log_size} bytes) "
+                        f"at {ended}\n"
+                    )
+                    combined_fh.write(extra)
+                    combined_fh.flush()
+                elif idle_watchdog is not None and idle_watchdog.triggered:
+                    failure_category = EXECUTOR_IDLE_TIMEOUT
+                    extra = (
+                        f"\n[agentops] executor terminated by idle watchdog "
+                        f"after {idle_watchdog.idle_timeout:.0f}s without log "
+                        f"growth (last size {idle_watchdog.last_log_size} bytes) "
+                        f"at {ended}\n"
+                    )
+                    combined_fh.write(extra)
+                    combined_fh.flush()
+            except Exception:  # noqa: BLE001 - never let banner write fail the run
+                ended = utc_now()
+                failure_category = None
+        exit_code = proc.returncode
+        if exit_code is None:
+            exit_code = 124
+        # If the overall ``timeout_seconds`` fired, mirror the
+        # capture-after-exit behaviour so the orchestrator still
+        # classifies the failure correctly. We require exit_code == 124
+        # (the conventional subprocess timeout exit code) and a non-None
+        # timeout, and we must NOT be a watchdog termination (those get
+        # the failure_category path instead). ``timed_out`` is the only
+        # signal callers have to distinguish a wall-clock timeout from
+        # a regular non-zero exit, so we never want to silence it just
+        # because the operator did not configure a watchdog.
+        timed_out = (
+            timeout_seconds is not None
+            and exit_code == 124
+            and (startup_watchdog is None or not startup_watchdog.triggered)
+            and (idle_watchdog is None or not idle_watchdog.triggered)
+        )
+
+        idle_for: float | None = None
+        startup_for: float | None = None
+        watchdog_size: int | None = None
+        if idle_watchdog is not None and idle_watchdog.triggered:
+            idle_for = float(idle_watchdog.idle_timeout)
+            watchdog_size = int(idle_watchdog.last_log_size)
+        elif startup_watchdog is not None and startup_watchdog.triggered:
+            startup_for = float(startup_watchdog.elapsed)
+            watchdog_size = int(startup_watchdog.last_log_size)
+
+        return RunnerResult(
+            exit_code=exit_code,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            started_at=started,
+            ended_at=ended,
+            timed_out=timed_out,
+            combined_log_path=combined_path,
+            failure_category=failure_category,
+            idle_for_seconds=idle_for,
+            startup_for_seconds=startup_for,
+            watchdog_log_size_bytes=watchdog_size,
+        )
+
+
+def _spawn_idle_watchdog(
+    *,
+    log_path: Path,
+    pid: int,
+    idle_timeout: float | None,
+) -> _IdleWatchdog | None:
+    """Start the idle watchdog if ``idle_timeout`` is set, else return ``None``."""
+    if idle_timeout is None or idle_timeout <= 0:
+        return None
+    factory = _watchdog_factory
+    if factory is not None:
+        return factory.idle(log_path=log_path, pid=pid, idle_timeout=idle_timeout)
+    watchdog = _IdleWatchdog(
+        log_path=log_path,
+        pid=pid,
+        idle_timeout=float(idle_timeout),
+    )
+    watchdog.start()
+    return watchdog
+
+
+def _spawn_startup_watchdog(
+    *,
+    log_path: Path,
+    pid: int,
+    startup_timeout: float | None,
+) -> _StartupWatchdog | None:
+    """Start the startup watchdog if ``startup_timeout`` is set, else return ``None``."""
+    if startup_timeout is None or startup_timeout <= 0:
+        return None
+    factory = _watchdog_factory
+    if factory is not None:
+        return factory.startup(log_path=log_path, pid=pid, startup_timeout=startup_timeout)
+    watchdog = _StartupWatchdog(
+        log_path=log_path,
+        pid=pid,
+        startup_timeout=float(startup_timeout),
+    )
+    watchdog.start()
+    return watchdog
+
+
+class _WatchdogFactory:
+    """Pluggable factory so tests can inject deterministic watchdogs.
+
+    The streaming executor uses the default factory (real threads,
+    real time). Tests that need to fire the watchdog without sleeping
+    for seconds swap in a factory that wires the watchdog with a
+    deterministic ``now_fn`` / ``sleep_fn``.
+    """
+
+    def idle(self, *, log_path: Path, pid: int, idle_timeout: float) -> _IdleWatchdog:
+        return _IdleWatchdog(log_path=log_path, pid=pid, idle_timeout=idle_timeout)
+
+    def startup(self, *, log_path: Path, pid: int, startup_timeout: float) -> _StartupWatchdog:
+        return _StartupWatchdog(log_path=log_path, pid=pid, startup_timeout=startup_timeout)
+
+
+# Module-level factory reference. Production code uses the default
+# factory; tests can patch :data:`_watchdog_factory` with a stub.
+_watchdog_factory: _WatchdogFactory | None = None
+
+
+def set_watchdog_factory(factory: _WatchdogFactory | None) -> _WatchdogFactory | None:
+    """Install a custom watchdog factory and return the previous one.
+
+    Tests use this to install a factory whose watchdogs drive the
+    loop off a deterministic clock; production code never calls it.
+    """
+    global _watchdog_factory
+    previous = _watchdog_factory
+    _watchdog_factory = factory
+    return previous
+
+
+def run_command_streaming(
+    command: str,
+    *,
+    cwd: Path,
+    artifact_dir: Path,
+    stdout_name: str = "executor.stdout.log",
+    stderr_name: str = "executor.stderr.log",
+    combined_name: str = "executor.combined.log",
+    timeout_seconds: int,
+    env: dict[str, str] | None = None,
+    startup_timeout: float | None = None,
+    idle_timeout: float | None = None,
+) -> RunnerResult:
+    """Run a shell command and stream stdout/stderr to per-attempt log files.
+
+    Equivalent to :func:`run_command`, but writes ``stdout_name``,
+    ``stderr_name``, and a third ``combined_name`` log file in real time
+    so the operator can tail the executor with ``agentops task-tail``
+    while the run is in progress. The combined log is the union of
+    stdout and stderr in the order bytes arrive from the OS pipes.
+
+    Optional ``startup_timeout`` and ``idle_timeout`` add a background
+    watchdog that terminates the executor process when the combined
+    log is still empty (startup) or has not grown (idle). The
+    resulting :class:`RunnerResult` carries a
+    :attr:`RunnerResult.failure_category` of
+    ``executor_no_output_startup`` or ``executor_idle_timeout`` so the
+    orchestrator can transition the task to a non-success state.
+    """
+    stdout_path = artifact_dir / stdout_name
+    stderr_path = artifact_dir / stderr_name
+    combined_path = artifact_dir / combined_name
+    return _run_with_watchdogs(
+        popen_args=command,
+        cwd=cwd,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        combined_path=combined_path,
+        timeout_seconds=timeout_seconds,
+        startup_timeout=startup_timeout,
+        idle_timeout=idle_timeout,
+        env=env,
+    )
+
+
+def run_argv_streaming(
+    command: list[str],
+    *,
+    cwd: Path,
+    artifact_dir: Path,
+    stdout_name: str = "executor.stdout.log",
+    stderr_name: str = "executor.stderr.log",
+    combined_name: str = "executor.combined.log",
+    timeout_seconds: int,
+    env: dict[str, str] | None = None,
+    startup_timeout: float | None = None,
+    idle_timeout: float | None = None,
+) -> RunnerResult:
+    """Run an argv command and stream stdout/stderr to per-attempt log files.
+
+    Equivalent to :func:`run_argv`, but with the same streaming and
+    watchdog behaviour as :func:`run_command_streaming`.
+    """
+    stdout_path = artifact_dir / stdout_name
+    stderr_path = artifact_dir / stderr_name
+    combined_path = artifact_dir / combined_name
+    return _run_with_watchdogs(
+        popen_args=command,
+        cwd=cwd,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        combined_path=combined_path,
+        timeout_seconds=timeout_seconds,
+        startup_timeout=startup_timeout,
+        idle_timeout=idle_timeout,
+        env=env,
+    )

@@ -325,3 +325,114 @@ one attempt. `max_total_task_attempts` is the optional
 *run-level* ceiling; when it is set it caps the cumulative
 attempts and is the source of `run_blocked_by_budget` for that
 field.
+
+## Per-task executor observability
+
+Every task attempt writes three log files under
+`.agentops/runs/<roadmap>/<task>/<attempt>/`:
+
+* `executor.stdout.log` — the executor's stdout, written as the
+  bytes arrive;
+* `executor.stderr.log` — the executor's stderr, written as the
+  bytes arrive;
+* `executor.combined.log` — the union of stdout and stderr in
+  arrival order, suitable for `tail -f`-style observation.
+
+The logs are streamed in real time (the runner uses
+`subprocess.Popen` with two `PIPE` streams and pumps them to disk
+on background threads), so the operator can `cat` or `tail -f` the
+combined log while the executor is still running. The
+`agentops task-tail` CLI is the AgentOps-native equivalent of
+`tail -f` and is the recommended way to observe a stuck task.
+
+### Per-task startup / idle watchdogs
+
+The runner supports two per-task watchdogs, both layered on top of
+the streaming combined log:
+
+* `--executor-startup-timeout SECONDS` — if the combined log is
+  still 0 bytes after this many seconds while the executor
+  process is alive, the runner terminates the process and marks
+  the task `BLOCKED` with
+  `failure_category: executor_no_output_startup` and a dedicated
+  `task.executor_no_output_startup` event. Designed to catch the
+  "executor hung on startup" case the STAB-001 incident exposed.
+* `--executor-idle-timeout SECONDS` — if the combined log has
+  already grown at least once and then stops growing for this
+  many seconds while the executor process is alive, the runner
+  terminates the process and marks the task `BLOCKED` with
+  `failure_category: executor_idle_timeout` and a dedicated
+  `task.executor_idle_timeout` event.
+
+Both watchdogs fail closed: a task hit by either watchdog is
+moved to `BLOCKED` and the run-level verdict is **not** `passed`.
+The morning checklist and the `agentops export-summary` output
+include a dedicated "Executor watchdog terminations" section
+that greps for these categories so the operator can see exactly
+which tasks were terminated and why.
+
+Recommended starting values for a typical opencode executor:
+
+* `--executor-startup-timeout 180` (3 minutes is generous for the
+  executor to write its first line),
+* `--executor-idle-timeout 900` (15 minutes is generous for a
+  slow LLM round-trip).
+
+Bump them up only when the executor is genuinely alive but slow
+(operator-run follow output corroborates); the watchdogs exist to
+kill stuck processes, not to throttle fast ones.
+
+### `agentops task-tail`
+
+```
+agentops task-tail <task-id>                            # last 80 lines of latest attempt
+agentops task-tail <task-id> --lines 200                # longer tail
+agentops task-tail <task-id> --follow                   # stream until the task leaves executor_running
+agentops task-tail <task-id> --attempt 2 --roadmap R-ID # tail a specific attempt
+agentops task-tail <task-id> --follow --interval 5      # slow down the poll
+```
+
+`task-tail` is the **per-task** equivalent of
+`operator-run --follow`. The two observability surfaces are
+distinct:
+
+* `operator-run --follow` follows the *outer* operator prompt —
+  the long prompt the operator ran by hand, e.g. via the local
+  harness. It tails `.operator-runs/<run-id>/combined.log`.
+* `agentops task-tail <task-id>` follows the *internal* task
+  executor — the opencode/MiniMax process that the gated runner
+  spawned to execute a single task in a roadmap. It tails
+  `.agentops/runs/<roadmap>/<task>/<attempt>/executor.combined.log`.
+
+If the log file is missing, `task-tail` prints a clear diagnostic
+(current task state, expected log path, available artifact files,
+suggested next step) instead of crashing. With `--follow`, the
+command polls every `--interval` seconds and exits automatically
+when the task leaves `executor_running`; Ctrl+C stops the
+watcher only and does **not** affect the underlying executor.
+
+### Diagnosing `executor_running` with no visible output
+
+The watchdog + tail pair is the canonical recipe:
+
+1. `agentops task-tail <task-id> --follow` — observe the
+   executor's combined log. If the file is empty, the
+   `--executor-startup-timeout` watchdog will fire soon (or has
+   already fired); if the file is not growing, the
+   `--executor-idle-timeout` watchdog will fire.
+2. `agentops logs <task-id>` — one-shot view of the executor's
+   stdout, stderr, repair prompts, and validation summary.
+3. `agentops status --events 50` — the recent event log; look
+   for `task.executor_no_output_startup` /
+   `task.executor_idle_timeout` and the matching BLOCKED
+   transition with `failure_category`.
+4. `agentops export-summary` — the run-level verdict; the
+   "Executor watchdog terminations" section is greppable.
+
+Raw `opencode | tee /tmp/log.txt` is a valid **emergency
+fallback** when the AgentOps CLI is itself broken, but the
+streaming combined log and `task-tail` exist so operators do not
+have to fall back to ad-hoc pipes. The fallback is documented
+deliberately: it is unsafe (no shell-quoting, no startup/idle
+watchdog, no clean state transition) and only useful for
+isolating the executor from a broken harness.

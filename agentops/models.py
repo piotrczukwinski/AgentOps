@@ -160,10 +160,39 @@ class RunnerResult:
     started_at: str
     ended_at: str
     timed_out: bool = False
+    # Optional path to the combined stdout+stderr log. Set when the runner
+    # streams its output to disk (so ``agentops task-tail`` can tail it
+    # live) and ``None`` for the legacy capture-after-exit path.
+    combined_log_path: Path | None = None
+    # Canonical failure category for non-zero exits. ``None`` when the run
+    # succeeded or when the failure is not a recognised watchdog trigger.
+    # The orchestrator copies this into the task transition payload so the
+    # morning checklist and the runbook can grep for it.
+    failure_category: str | None = None
+    # Wall-clock seconds the log was idle when a watchdog fired. ``None``
+    # for non-watchdog terminations.
+    idle_for_seconds: float | None = None
+    # Wall-clock seconds elapsed when the startup watchdog fired. ``None``
+    # for non-startup-watchdog terminations.
+    startup_for_seconds: float | None = None
+    # Log size in bytes at the moment a watchdog fired. ``None`` for
+    # non-watchdog terminations.
+    watchdog_log_size_bytes: int | None = None
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out
+        return self.exit_code == 0 and not self.timed_out and not self.failure_category
+
+
+# Canonical failure categories for the executor watchdog. Kept as module
+# constants so the orchestrator, the CLI, the docs, and the tests all
+# grep for the same string.
+EXECUTOR_NO_OUTPUT_STARTUP = "executor_no_output_startup"
+EXECUTOR_IDLE_TIMEOUT = "executor_idle_timeout"
+
+EXECUTOR_WATCHDOG_FAILURE_CATEGORIES = frozenset(
+    {EXECUTOR_NO_OUTPUT_STARTUP, EXECUTOR_IDLE_TIMEOUT}
+)
 
 
 @dataclass(frozen=True)

@@ -334,6 +334,49 @@ class StateStore:
             cur = conn.execute("SELECT * FROM artifacts WHERE task_id=? ORDER BY created_at", (task_id,))
             return list(cur.fetchall())
 
+    def attempts_for_task(self, task_id: str, roadmap_id: str | None = None) -> list[sqlite3.Row]:
+        """Return all attempts for ``task_id``, newest attempt first.
+
+        Used by ``agentops task-tail`` to locate the latest
+        ``executor.combined.log`` and by future tooling that needs to
+        reproduce a per-attempt state. When ``roadmap_id`` is provided
+        the lookup is scoped; otherwise we return every attempt for the
+        task id across every roadmap (a task id is unique within a
+        roadmap but may collide across roadmaps).
+        """
+        with self.connect() as conn:
+            if roadmap_id:
+                cur = conn.execute(
+                    "SELECT * FROM attempts WHERE task_id=? AND roadmap_id=? ORDER BY attempt_no DESC",
+                    (task_id, roadmap_id),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT * FROM attempts WHERE task_id=? ORDER BY attempt_no DESC",
+                    (task_id,),
+                )
+            return list(cur.fetchall())
+
+    def task_latest_state(self, task_id: str, roadmap_id: str | None = None) -> str | None:
+        """Return the latest recorded state for ``task_id`` or ``None``.
+
+        Used by ``agentops task-tail`` to decide whether the task is
+        still in ``executor_running`` (so --follow should keep waiting)
+        or has left it (so --follow should stop).
+        """
+        with self.connect() as conn:
+            if roadmap_id:
+                row = conn.execute(
+                    "SELECT state FROM tasks WHERE id=? AND roadmap_id=?",
+                    (task_id, roadmap_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT state FROM tasks WHERE id=? ORDER BY updated_at DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+        return row["state"] if row else None
+
 
 def _task_to_jsonable(task: TaskConfig) -> dict[str, Any]:
     return {

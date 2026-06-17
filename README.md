@@ -91,7 +91,7 @@ Implemented in this repository:
 - CLI commands: `init`, `run`, `status`, `logs`, `artifacts`, `attempts`,
   `review-queue`, `export-summary`, `plan`, `doctor`, `review`, `decide`,
   `serve`, `operator-run`, `operator-status`, `operator-tail`,
-  `operator-result`, `operator-retry`.
+  `operator-result`, `operator-retry`, `task-tail`.
 - Offline `plan` command for preflight linting of roadmaps.
 - Local browser UI over the same CLI/state (`agentops serve`, default `127.0.0.1:8765`).
 
@@ -274,6 +274,64 @@ panel integration.
 For overnight monitoring, see `docs/night-run-report.md` for
 the recommended `agentops operator-run` command and the
 morning checklist.
+
+## Per-task executor observability
+
+The Operator Run Harness covers the *outer* operator prompt.
+When `agentops run` spawns an internal opencode/MiniMax process
+for each task, the same recipe is available at the per-task
+level via the streaming executor logs and `agentops task-tail`:
+
+```bash
+# Recommended: enable the per-task watchdogs so a stuck executor
+# can never wedge the run.
+python -m agentops run --roadmap <path> --autonomous \
+    --executor-startup-timeout 180 \
+    --executor-idle-timeout 900
+
+# Tail the per-task combined log while the run is in progress.
+python -m agentops task-tail STAB-001-OPERATOR-ACCEPTANCE-MATRIX --follow
+python -m agentops task-tail STAB-001-OPERATOR-ACCEPTANCE-MATRIX --lines 200
+```
+
+Every task attempt writes three log files under
+`.agentops/runs/<roadmap>/<task>/<attempt>/`:
+
+* `executor.stdout.log` — the executor's stdout, streamed in real time
+* `executor.stderr.log` — the executor's stderr, streamed in real time
+* `executor.combined.log` — the union of stdout and stderr, suitable
+  for `task-tail`
+
+The two watchdogs (`--executor-startup-timeout`,
+`--executor-idle-timeout`) terminate the executor process group and
+move the task to `BLOCKED` with
+`failure_category: executor_no_output_startup` /
+`executor_idle_timeout` when:
+
+* the combined log is still 0 bytes after the startup window
+  (executor hung on startup), or
+* the combined log has stopped growing for the idle window
+  (executor stalled mid-run).
+
+Either watchdog is greppable from the run summary's
+"Executor watchdog terminations" section, and the run-level
+verdict is never `passed` when any of them fire. See
+`docs/gated-roadmap-runner.md` for the full reference and
+`docs/operator-reliability-audit.md` (section 9) for the
+production failure-mode audit entry that closed the STAB-001
+observability gap.
+
+The split between the two observability surfaces is deliberate:
+
+* `operator-run --follow` / `operator-tail` — for the *outer*
+  operator prompt (the long prompt the operator ran by hand)
+* `agentops task-tail <task-id>` — for the *internal* task
+  executor (the opencode/MiniMax process the gated runner
+  spawned for one task)
+
+A raw `opencode | tee /tmp/log.txt` is a documented **emergency
+fallback** only; the streaming combined log and `task-tail` exist
+so operators do not have to fall back to ad-hoc pipes.
 
 ## Local browser UI
 
