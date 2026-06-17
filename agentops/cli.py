@@ -538,9 +538,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="OWNER/REPO (recorded as metadata in the repair prompt).",
     )
     pr_loop_cmd.add_argument(
-        "--review-verdict-json",
+        "--review-json",
         required=True,
-        help="Path to a review verdict JSON file matching schemas/review_verdict.schema.json.",
+        dest="review_json",
+        help=(
+            "Path to a Codex-style review JSON file. The MVP accepts the lowercase "
+            "verdict enum (approve|request_changes|comment); the legacy uppercase "
+            "verdicts (ACCEPT/REQUEST_CHANGES/BLOCK) are also accepted for backward "
+            "compatibility."
+        ),
     )
     pr_loop_cmd.add_argument(
         "--executor-model",
@@ -2268,8 +2274,8 @@ def _cmd_pr_loop(args: argparse.Namespace) -> int:
         str(int(args.pr_number)),
         "--repo",
         str(args.repo),
-        "--review-verdict-json",
-        str(args.review_verdict_json),
+        "--review-json",
+        str(args.review_json),
         "--executor-model",
         str(args.executor_model),
         "--max-cycles",
