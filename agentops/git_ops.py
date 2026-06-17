@@ -123,6 +123,7 @@ def collect_diff(repo: Path, base_ref: str = "HEAD") -> DiffSnapshot:
     patch_tracked = run_git(repo, ["diff", "--binary", "--"], check=False).stdout
 
     untracked_patches: list[str] = []
+    untracked_stat_lines: list[str] = []
     untracked = run_git(repo, ["ls-files", "--others", "--exclude-standard"], check=False).stdout.splitlines()
 
     for path in untracked:
@@ -134,6 +135,9 @@ def collect_diff(repo: Path, base_ref: str = "HEAD") -> DiffSnapshot:
         name_status_lines.append(f"A\t{path}")
 
         content = file_path.read_text(encoding="utf-8", errors="replace")
+        added_lines = max(1, len(content.splitlines()))
+        plural = "+" if added_lines == 1 else "++"
+        untracked_stat_lines.append(f" {path} | {added_lines} {plural}")
         untracked_patches.append(
             f"diff --git a/{path} b/{path}\n"
             "new file mode 100644\n"
@@ -145,6 +149,8 @@ def collect_diff(repo: Path, base_ref: str = "HEAD") -> DiffSnapshot:
     patch = patch_tracked
     if untracked_patches:
         patch += "\n".join(untracked_patches)
+    if untracked_stat_lines:
+        stat = (stat.rstrip("\n") + "\n" if stat else "") + "\n".join(untracked_stat_lines) + "\n"
 
     head = rev_parse(repo, "HEAD") if is_git_repo(repo) else ""
     return DiffSnapshot(

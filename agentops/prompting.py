@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from .models import DiffSnapshot, PolicyResult, TaskConfig, ValidationResult
+from .models import DiffSnapshot, PolicyResult, ReviewVerdict, TaskConfig, ValidationResult
 from .policy import PolicyEngine
 
 EXECUTOR_CONTRACT = """# AgentOps executor contract
@@ -139,6 +139,36 @@ class PromptCompiler:
                 _bullet(task.allowed_files),
                 "# Validation failure",
                 details or "Unknown validation failure.",
+            ]
+        )
+
+    def repair_prompt_from_review(self, task: TaskConfig, verdict: ReviewVerdict) -> str:
+        issues = []
+        for issue in verdict.blocking_issues:
+            if isinstance(issue, dict):
+                file_name = issue.get("file", "-")
+                severity = issue.get("severity", "-")
+                text = issue.get("issue", "")
+                fix = issue.get("suggested_fix", "")
+                issues.append(
+                    f"- file: {file_name}\n  severity: {severity}\n  issue: {text}\n  suggested_fix: {fix}"
+                )
+            else:
+                issues.append(f"- {issue}")
+        return "\n".join(
+            [
+                "# AgentOps bounded repair task",
+                "Fix only the Codex review issues below. Do not broaden scope or modify files outside Allowed files.",
+                "# Original task id",
+                task.id,
+                "# Allowed files",
+                _bullet(task.allowed_files),
+                "# Review verdict",
+                verdict.verdict,
+                "# Review summary",
+                verdict.summary or "(none)",
+                "# Blocking issues",
+                "\n".join(issues) if issues else "(none)",
             ]
         )
 

@@ -62,6 +62,8 @@ class CollectDiffTests(unittest.TestCase):
             # Patch must contain real added content for both files.
             self.assertIn("docs/notes.md", diff.patch)
             self.assertIn("docs/other.md", diff.patch)
+            self.assertIn("docs/notes.md", diff.stat)
+            self.assertIn("docs/other.md", diff.stat)
 
     def test_nested_untracked_files_are_visible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:

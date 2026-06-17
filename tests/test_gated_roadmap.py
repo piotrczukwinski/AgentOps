@@ -255,6 +255,70 @@ class ScenarioAAcceptTests(unittest.TestCase):
             if base_branch:
                 git(repo, "checkout", "--quiet", base_branch)
 
+    def test_auto_merge_next_task_starts_from_integration_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("create files", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "gated-incremental",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "integration_branch": "integration/agentops",
+                        "merge_policy": {"auto_merge": True, "strategy": "cherry_pick"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('shared.txt').write_text('one\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["shared.txt"],
+                                "validations": ["test -f shared.txt"],
+                                "review": {"codex": "required"},
+                            },
+                            {
+                                "id": "T2",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; p=Path('shared.txt'); assert p.read_text(encoding='utf-8') == 'one\\n'; p.write_text('one\\ntwo\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["shared.txt"],
+                                "validations": ["grep -q two shared.txt"],
+                                "review": {"codex": "required"},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake = FakeCodexService(
+                [
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+            )
+            self.assertEqual(orch.run_roadmap(roadmap), 2)
+            rows = {row["id"]: row for row in state.task_rows("gated-incremental")}
+            self.assertEqual(rows["T1"]["state"], TaskState.MERGED.value)
+            self.assertEqual(rows["T2"]["state"], TaskState.MERGED.value)
+            git(repo, "checkout", "--quiet", "integration/agentops")
+            self.assertEqual((repo / "shared.txt").read_text(encoding="utf-8"), "one\ntwo\n")
+
 
 # ---------------------------------------------------------------------------
 # Scenario B: Codex REQUEST_CHANGES path with repair loop
@@ -337,6 +401,77 @@ class ScenarioBRequestChangesTests(unittest.TestCase):
                 [e["type"] for e in events],
                 "validation must pass before codex is consulted",
             )
+
+    def test_request_changes_without_repair_prompt_uses_review_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "gated-review-repair",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('ok\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["test -f out.txt"],
+                                "review": {"codex": "required"},
+                                "max_attempts": 2,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake = FakeCodexService(
+                [
+                    ScriptedVerdict(
+                        verdict="REQUEST_CHANGES",
+                        summary="Add missing dashboard field.",
+                        repair_prompt="",
+                        blocking_issues=(
+                            {
+                                "file": "agentops/web.py",
+                                "severity": "high",
+                                "issue": "snapshot omits task counts",
+                                "suggested_fix": "include task_state_counts",
+                            },
+                        ),
+                    ),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+            )
+            self.assertEqual(orch.run_roadmap(roadmap), 1)
+            repair_paths = [
+                Path(row["path"])
+                for row in state.artifacts_for_task("T1")
+                if row["kind"] == "repair_prompt"
+            ]
+            self.assertTrue(repair_paths)
+            repair_text = repair_paths[0].read_text(encoding="utf-8")
+            self.assertIn("Add missing dashboard field.", repair_text)
+            self.assertIn("snapshot omits task counts", repair_text)
+            self.assertIn("include task_state_counts", repair_text)
 
     def test_validation_failure_then_request_changes_then_accept(self) -> None:
         """max_attempts=3 is required for the combined path.
