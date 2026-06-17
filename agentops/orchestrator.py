@@ -23,6 +23,7 @@ from .artifacts import ArtifactStore
 from .budget import BudgetManager
 from .git_ops import (
     IntegrationBranchBlocked,
+    branch_exists,
     branch_for_task,
     collect_diff,
     commit,
@@ -69,6 +70,22 @@ ACCEPTED_OUTCOMES = {
 # is the install location in production) so it works both for editable
 # installs and for repository checkouts.
 DEFAULT_REVIEW_SCHEMA_PATH = "schemas/review_verdict.schema.json"
+
+
+def _integration_branch_exists(repo: Path, name: str) -> bool:
+    """Return True when ``name`` is a local branch in ``repo``.
+
+    This is the per-task helper that powers the integration-branch
+    continuation rule: subsequent tasks should base their worktree on
+    the integration branch when a prior task has already been merged
+    into it, not on the stale ``base_branch``.
+    """
+    if not name:
+        return False
+    try:
+        return branch_exists(repo, name)
+    except Exception:  # noqa: BLE001 - never let this helper fail the run
+        return False
 
 
 def _is_codex_failure_verdict(verdict: ReviewVerdict) -> bool:
@@ -330,7 +347,16 @@ class Orchestrator:
     ) -> None:
         runtime = _TaskRuntime()
         self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.PREFLIGHT)
-        runtime.base_sha = rev_parse(roadmap.repo.path, roadmap.repo.base_branch)
+        # When the integration branch exists (i.e. a prior task has
+        # already been merged into it), base the new task branch on the
+        # integration branch so the new task does not start from the
+        # stale base_branch. Falling back to ``base_branch`` keeps the
+        # initial run / single-task roadmap behavior identical.
+        base_ref_for_worktree = roadmap.repo.base_branch
+        integration_branch = roadmap.integration_branch
+        if integration_branch and _integration_branch_exists(roadmap.repo.path, integration_branch):
+            base_ref_for_worktree = integration_branch
+        runtime.base_sha = rev_parse(roadmap.repo.path, base_ref_for_worktree)
         runtime.branch = branch_for_task(task.branch_prefix, roadmap.roadmap_id, task.id)
 
         preflight = policy.preflight(task, runtime.branch)
@@ -348,7 +374,7 @@ class Orchestrator:
         artifact_root = self.options.artifacts_root or (roadmap.repo.path / ".agentops")
         artifact_store = ArtifactStore(artifact_root)
         target_worktree = create_worktree(
-            roadmap.repo.path, workspace_root, runtime.branch, roadmap.repo.base_branch
+            roadmap.repo.path, workspace_root, runtime.branch, base_ref_for_worktree
         )
         runtime.workspace = target_worktree
         execution_cwd = target_worktree
@@ -704,8 +730,14 @@ class Orchestrator:
             if verdict.verdict == "REQUEST_CHANGES":
                 self._record_roadmap_event(roadmap, "task.request_changes", task.id)
                 if attempt_no < max_attempts:
-                    runtime.repair_prompt = verdict.repair_prompt or compiler.repair_prompt_from_validation(
-                        task, validation
+                    # REQUEST_CHANGES is repairable. Build a bounded
+                    # repair prompt for the next executor attempt. The
+                    # compiler always includes the reviewer's
+                    # ``repair_prompt`` verbatim when present and falls
+                    # back to the summary + blocking_issues when the
+                    # reviewer left it empty.
+                    runtime.repair_prompt = compiler.repair_prompt_from_review(
+                        task, verdict, base=verdict.repair_prompt
                     )
                     repair_path = artifact_store.write_text(
                         attempt_dir, "repair.prompt.md", runtime.repair_prompt
@@ -722,23 +754,61 @@ class Orchestrator:
                         roadmap.roadmap_id, task.id, TaskState.REPAIR_PROMPT_READY
                     )
                     continue
+                # Max repair attempts exhausted. Block the task and
+                # include the last review JSON + attempt count so the
+                # operator can diagnose without scraping the artifacts
+                # directory.
+                blocked_payload = {
+                    "verdict": "REQUEST_CHANGES",
+                    "summary": verdict.summary,
+                    "reason": "max_repair_attempts",
+                    "attempt": attempt_no,
+                    "max_attempts": max_attempts,
+                    "blocking_issues": list(verdict.blocking_issues),
+                    "repair_prompt": verdict.repair_prompt,
+                    "safe_to_push": bool(verdict.safe_to_push),
+                    "safe_to_merge": bool(verdict.safe_to_merge),
+                    "last_review": verdict.raw or {},
+                }
                 self.state.transition_task(
                     roadmap.roadmap_id,
                     task.id,
                     TaskState.BLOCKED,
-                    {"verdict": "REQUEST_CHANGES", "summary": verdict.summary, "reason": "max_attempts"},
+                    blocked_payload,
                 )
-                self._record_roadmap_event(roadmap, "task.blocked_by_review", task.id)
+                self._record_roadmap_event(
+                    roadmap,
+                    "task.blocked_by_review",
+                    task.id,
+                    extra=blocked_payload,
+                )
                 return
 
             if verdict.verdict == "BLOCK":
+                # BLOCK is terminal: the reviewer explicitly refused
+                # the change. Never repair automatically. The last
+                # review JSON is recorded on the blocked transition so
+                # the operator can see why without scraping artifacts.
+                blocked_payload = {
+                    "verdict": "BLOCK",
+                    "summary": verdict.summary,
+                    "issues": list(verdict.blocking_issues),
+                    "attempt": attempt_no,
+                    "max_attempts": max_attempts,
+                    "last_review": verdict.raw or {},
+                }
                 self.state.transition_task(
                     roadmap.roadmap_id,
                     task.id,
                     TaskState.BLOCKED,
-                    {"verdict": "BLOCK", "summary": verdict.summary, "issues": list(verdict.blocking_issues)},
+                    blocked_payload,
                 )
-                self._record_roadmap_event(roadmap, "task.blocked_by_review", task.id)
+                self._record_roadmap_event(
+                    roadmap,
+                    "task.blocked_by_review",
+                    task.id,
+                    extra=blocked_payload,
+                )
                 return
 
             # ACCEPT
@@ -1260,6 +1330,21 @@ class Orchestrator:
         return runner_for(task)
 
     def _effective_max_attempts(self, task: TaskConfig, roadmap: RoadmapConfig) -> int:
+        """Return the effective per-task total executor attempt cap.
+
+        The resolution order is:
+
+        1. ``roadmap.max_repair_attempts`` (the explicit new field).
+        2. ``roadmap.max_attempts_per_task`` (legacy roadmap field).
+        3. ``task.max_attempts`` (per-task setting; the config loader
+           already resolved this from the task / defaults chain so the
+           default of 3 from :mod:`agentops.config` is honored here).
+
+        The value is always at least 1 so a task with ``max_attempts=0``
+        or unset defaults still gets a single attempt.
+        """
+        if roadmap.max_repair_attempts is not None:
+            return max(1, int(roadmap.max_repair_attempts))
         if roadmap.max_attempts_per_task is not None:
             return max(1, int(roadmap.max_attempts_per_task))
         return max(1, task.max_attempts)

@@ -133,6 +133,12 @@ class RoadmapConfig:
     continue_on_blocked: bool = False
     max_tasks: int | None = None
     max_attempts_per_task: int | None = None
+    # Default total executor attempts per task (including initial + repair
+    # attempts driven by REQUEST_CHANGES / validation failures). When the
+    # config omits this field, the orchestrator falls back to
+    # ``max_attempts_per_task`` and then ``task.max_attempts``. The
+    # canonical default lives in :func:`agentops.config.default_max_repair_attempts`.
+    max_repair_attempts: int | None = None
     review: ReviewConfig = field(default_factory=ReviewConfig)
     reviewer: str = "codex"  # codex|heuristic
 

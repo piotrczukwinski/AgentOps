@@ -119,10 +119,11 @@ def collect_diff(repo: Path, base_ref: str = "HEAD") -> DiffSnapshot:
             changed_files.append(path)
             name_status_lines.append(f"{status}\t{path}")
 
-    stat = run_git(repo, ["diff", "--stat", "--"], check=False).stdout
+    stat_tracked = run_git(repo, ["diff", "--stat", "--"], check=False).stdout
     patch_tracked = run_git(repo, ["diff", "--binary", "--"], check=False).stdout
 
     untracked_patches: list[str] = []
+    untracked_stat_lines: list[str] = []
     untracked = run_git(repo, ["ls-files", "--others", "--exclude-standard"], check=False).stdout.splitlines()
 
     for path in untracked:
@@ -141,6 +142,24 @@ def collect_diff(repo: Path, base_ref: str = "HEAD") -> DiffSnapshot:
             f"+++ b/{path}\n"
             + _simple_added_patch(content)
         )
+        # Synthesize a ``git diff --stat`` line for the new file so the
+        # reviewer sees a single, consistent stat block across tracked
+        # and untracked changes. The shape matches git's own:
+        # ``<additions> | <deletions> | <path>``. New files have only
+        # additions.
+        line_count = content.count("\n") + (0 if content.endswith("\n") else 1)
+        untracked_stat_lines.append(f" {line_count:>5} |{'':>7} {path}")
+
+    # Compose a single stat block: tracked diff first, then synthesized
+    # lines for the new untracked files. Stripping the trailing newline
+    # from ``stat_tracked`` keeps the join clean when both halves are
+    # non-empty.
+    stat_parts: list[str] = []
+    if stat_tracked.strip():
+        stat_parts.append(stat_tracked.rstrip("\n"))
+    if untracked_stat_lines:
+        stat_parts.append("\n".join(untracked_stat_lines))
+    stat = "\n".join(stat_parts)
 
     patch = patch_tracked
     if untracked_patches:

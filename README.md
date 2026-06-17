@@ -28,6 +28,17 @@ preflight -> workspace -> executor -> diff -> policy -> validation
           -> commit -> push -> merge into integration branch -> next task
 ```
 
+A `REQUEST_CHANGES` verdict is **repairable**: the orchestrator writes
+a bounded repair prompt and re-runs the executor on the next attempt,
+looping until `ACCEPT` or the per-task attempt cap is hit. The default
+total executor attempts per task is **3** (initial + 2 repair
+attempts). The cap is configured per-roadmap via `max_repair_attempts`
+/ `max_review_repairs` and per-task via `max_attempts` (legacy). A
+`BLOCK` verdict is **terminal**: the orchestrator never repairs a
+`BLOCK` and the task transitions to `blocked` with the last review
+JSON on the payload. See `docs/gated-roadmap-runner.md` for the full
+contract.
+
 Codex is **not** a live watcher. AgentOps owns the workspace, the logs, the
 diff, the policy, the review-packet assembly, the budget, the retry, the
 commit, the push, and the integration-branch merge. Codex only sees a
