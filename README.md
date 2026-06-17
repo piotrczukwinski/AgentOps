@@ -138,7 +138,7 @@ agentops run --roadmap examples/roadmaps/gated-shell-review-smoke.json --no-code
 agentops review-queue
 ```
 
-See `docs/usability-mvp.md` for the full CLI reference, `docs/operator-runbook.md` for triage procedures, and `docs/gated-roadmap-runner.md` for the gated runner reference.
+See `docs/usability-mvp.md` for the full CLI reference, `docs/operator-runbook.md` for triage procedures, `docs/gated-roadmap-runner.md` for the gated runner reference, and `docs/operator-reliability-audit.md` for the production failure-mode audit (stale pid, missing result, codex-required fallback, merge_failed, etc.) with the prioritised list of next PRs.
 
 ## Operator Run Harness
 
