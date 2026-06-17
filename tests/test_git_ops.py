@@ -76,6 +76,85 @@ class CollectDiffTests(unittest.TestCase):
             diff = collect_diff(repo, "HEAD")
             self.assertIn("a/b/c/leaf.txt", diff.changed_files)
 
+    def test_base_sha_makes_diff_cumulative_against_older_commit(self) -> None:
+        """When ``base_sha`` is provided, the diff is computed against
+        that commit rather than the index. This is what makes the
+        orchestrator's per-attempt diff cumulative across repair
+        attempts: even if a later attempt runs ``git add`` (or the
+        executor did the equivalent), the diff against ``base_sha``
+        still shows the staged change.
+
+        The scenario below stages a change with ``git add`` and then
+        calls ``collect_diff`` with the original HEAD as ``base_sha``;
+        without ``base_sha`` the patch and stat are empty (because
+        the change is staged, not unstaged) even though the file is
+        listed in ``changed_files`` via ``git status --porcelain``.
+        With ``base_sha`` the diff is consistent: the file is listed
+        *and* the patch + stat contain the actual content.
+        """
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._init_repo(tmp)
+            (repo / "README.md").write_text("staged update\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+
+            from agentops.git_ops import collect_diff
+
+            # Without base_sha: the legacy "vs index" form shows the
+            # file in ``changed_files`` (via ``git status``) but the
+            # patch and stat are empty because the change is staged.
+            legacy = collect_diff(repo, "HEAD")
+            self.assertIn("README.md", legacy.changed_files)
+            self.assertEqual(legacy.patch, "")
+            self.assertEqual(legacy.stat, "")
+
+            # With base_sha pointing at the original commit: the diff
+            # is the staged change (cumulative against the base).
+            head_sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+            cumulative = collect_diff(repo, "HEAD", base_sha=head_sha)
+            self.assertIn("README.md", cumulative.changed_files)
+            self.assertIn("staged update", cumulative.patch)
+            self.assertIn("README.md", cumulative.stat)
+
+    def test_base_sha_picks_up_unstaged_and_staged_changes_combined(self) -> None:
+        """A repair attempt may leave both a staged change (from
+        attempt 1) and a new unstaged change (from attempt 2) in the
+        worktree. With ``base_sha`` the diff is the union: both files
+        appear in the cumulative snapshot.
+        """
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._init_repo(tmp)
+            (repo / "README.md").write_text("staged change\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            (repo / "out.txt").write_text("unstaged change\n", encoding="utf-8")
+
+            from agentops.git_ops import collect_diff
+
+            head_sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+            diff = collect_diff(repo, "HEAD", base_sha=head_sha)
+            self.assertIn("README.md", diff.changed_files)
+            self.assertIn("out.txt", diff.changed_files)
+            self.assertIn("staged change", diff.patch)
+            self.assertIn("unstaged change", diff.patch)
+
+    def test_base_sha_against_unmodified_worktree_yields_empty_diff(self) -> None:
+        """When the worktree matches ``base_sha`` exactly, the
+        cumulative diff must be empty (no changed files, empty patch,
+        empty stat) so ``files.empty_diff`` correctly fires.
+        """
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._init_repo(tmp)
+            head_sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+            from agentops.git_ops import collect_diff
+
+            diff = collect_diff(repo, "HEAD", base_sha=head_sha)
+            self.assertEqual(diff.changed_files, ())
+            self.assertEqual(diff.patch, "")
+            self.assertEqual(diff.stat, "")
+
 
 class BranchForTaskTests(unittest.TestCase):
     def test_branch_name_uses_prefix(self) -> None:

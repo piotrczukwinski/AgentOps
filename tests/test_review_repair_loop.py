@@ -38,6 +38,7 @@ from agentops.models import (
     ReviewConfig,
     ReviewVerdict,
     RoadmapConfig,
+    RunnerResult,
     TaskConfig,
     TaskState,
     ValidationResult,
@@ -45,6 +46,7 @@ from agentops.models import (
 from agentops.orchestrator import Orchestrator, RunOptions
 from agentops.policy import PolicyEngine
 from agentops.prompting import PromptCompiler
+from agentops.runners import BaseRunner, utc_now
 from agentops.state import StateStore
 
 from tests.test_gated_roadmap import (
@@ -1155,6 +1157,732 @@ class SafeToPushLocalRepairTests(unittest.TestCase):
                 state.task_rows("safe-to-push-repair")[0]["state"],
                 TaskState.ACCEPTED.value,
             )
+
+
+# ---------------------------------------------------------------------------
+# Cumulative diff across repair attempts (AO-ADMIN-001 fix)
+# ---------------------------------------------------------------------------
+
+
+class _FirstAttemptOnlyFakeRunner(BaseRunner):
+    """Deterministic ``BaseRunner`` for the repair-preserves-diff tests.
+
+    On ``attempt 1`` the runner creates the configured file in the
+    executor ``cwd`` (the task's worktree). On every later attempt it
+    exits 0 without touching any file. This is the exact shape of the
+    AO-ADMIN-001-BACKEND-SNAPSHOT production failure: the first
+    attempt produced a real diff, Codex returned ``REQUEST_CHANGES``,
+    and the executor on the repair attempt exited 0 without making
+    any additional edits.
+
+    The runner is wired up by passing it as ``shell_runner`` to
+    :class:`Orchestrator`, so no real shell is executed and the test
+    stays hermetic.
+    """
+
+    name = "first-attempt-only"
+
+    def __init__(self, file_to_create: str, contents: str = "from attempt 1\n") -> None:
+        self.file_to_create = file_to_create
+        self.contents = contents
+        self.calls: list[dict[str, Any]] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[no-untyped-def]
+        # The artifact_dir is ``<root>/runs/<roadmap>/<task>/<attempt>``
+        # per ArtifactStore.attempt_dir; the last component is the
+        # attempt number. We can use it to drive per-attempt behaviour
+        # without inspecting the prompt text.
+        attempt_no = int(Path(str(artifact_dir)).name)
+        self.calls.append(
+            {
+                "attempt_no": attempt_no,
+                "artifact_dir": str(artifact_dir),
+                "cwd": str(cwd),
+                "is_repair_prompt": "REQUEST_CHANGES" in (prompt or ""),
+            }
+        )
+        artifact = Path(str(artifact_dir))
+        artifact.mkdir(parents=True, exist_ok=True)
+        stdout_path = artifact / "executor.stdout.log"
+        stderr_path = artifact / "executor.stderr.log"
+        combined_path = artifact / "executor.combined.log"
+        if attempt_no == 1:
+            target = Path(str(cwd)) / self.file_to_create
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(self.contents, encoding="utf-8")
+            stdout_path.write_text(
+                f"attempt 1: wrote {self.file_to_create}\n", encoding="utf-8"
+            )
+        else:
+            stdout_path.write_text(
+                f"attempt {attempt_no}: no-op (cumulative diff from attempt 1 is still present)\n",
+                encoding="utf-8",
+            )
+        stderr_path.write_text("", encoding="utf-8")
+        combined_path.write_text(stdout_path.read_text(encoding="utf-8"), encoding="utf-8")
+        return RunnerResult(
+            exit_code=0,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            started_at=utc_now(),
+            ended_at=utc_now(),
+            combined_log_path=combined_path,
+            failure_category=None,
+        )
+
+
+class _ForbiddenFileFakeRunner(BaseRunner):
+    """Variant of the first-attempt-only runner that adds a forbidden file on attempt 2.
+
+    Used by the policy-blocks-cumulative-forbidden-file test (scenario
+    E). The first attempt creates the allowed file; the second
+    attempt creates a *different* file that is not in ``allowed_files``
+    so the policy engine must still block the task on the cumulative
+    diff.
+    """
+
+    name = "first-attempt-then-forbidden"
+
+    def __init__(self, allowed_file: str, forbidden_file: str) -> None:
+        self.allowed_file = allowed_file
+        self.forbidden_file = forbidden_file
+        self.calls: list[dict[str, Any]] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[no-untyped-def]
+        attempt_no = int(Path(str(artifact_dir)).name)
+        self.calls.append({"attempt_no": attempt_no})
+        artifact = Path(str(artifact_dir))
+        artifact.mkdir(parents=True, exist_ok=True)
+        stdout_path = artifact / "executor.stdout.log"
+        stderr_path = artifact / "executor.stderr.log"
+        combined_path = artifact / "executor.combined.log"
+        cwd_path = Path(str(cwd))
+        if attempt_no == 1:
+            (cwd_path / self.allowed_file).write_text("allowed\n", encoding="utf-8")
+            stdout_path.write_text("attempt 1: allowed file\n", encoding="utf-8")
+        else:
+            # Repair: create a file outside the allowed set.
+            (cwd_path / self.forbidden_file).write_text("forbidden\n", encoding="utf-8")
+            stdout_path.write_text(
+                f"attempt {attempt_no}: created out-of-scope file {self.forbidden_file}\n",
+                encoding="utf-8",
+            )
+        stderr_path.write_text("", encoding="utf-8")
+        combined_path.write_text(stdout_path.read_text(encoding="utf-8"), encoding="utf-8")
+        return RunnerResult(
+            exit_code=0,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            started_at=utc_now(),
+            ended_at=utc_now(),
+            combined_log_path=combined_path,
+            failure_category=None,
+        )
+
+
+def _diff_artifact(state: StateStore, roadmap_id: str, task_id: str, attempt_no: int, kind: str) -> Path:
+    """Return the absolute path of the per-attempt diff artifact.
+
+    ``kind`` is one of ``"diff_patch"``, ``"diff_stat"``, ``"changed_files"``.
+    The orchestrator records these as ``kind`` rows in the
+    ``artifacts`` table on each attempt.
+    """
+    with state.connect() as conn:
+        rows = conn.execute(
+            "SELECT a.path, a.kind, att.attempt_no FROM artifacts a "
+            "LEFT JOIN attempts att ON a.attempt_id = att.id "
+            "WHERE a.task_id=? AND a.kind=? ORDER BY att.attempt_no, a.created_at",
+            (task_id, kind),
+        ).fetchall()
+    if not rows:
+        raise AssertionError(f"no {kind} artifact recorded for task {task_id}")
+    if len(rows) < attempt_no:
+        raise AssertionError(
+            f"only {len(rows)} {kind} artifacts recorded, expected at least {attempt_no}"
+        )
+    return Path(rows[attempt_no - 1]["path"])
+
+
+def _policy_statuses(state: StateStore, task_id: str) -> list[dict[str, Any]]:
+    """Return the policy_check rows for ``task_id`` in attempt order.
+
+    The orchestrator records policy decisions in the ``policy_checks``
+    table (not as events) so the tests can grep the cumulative policy
+    verdict per attempt.
+    """
+    with state.connect() as conn:
+        rows = conn.execute(
+            "SELECT pc.id, pc.status, pc.name, pc.details_json, att.attempt_no "
+            "FROM policy_checks pc "
+            "LEFT JOIN attempts att ON pc.attempt_id = att.id "
+            "WHERE pc.task_id=? ORDER BY att.attempt_no, pc.created_at",
+            (task_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+class CumulativeRepairDiffTests(unittest.TestCase):
+    """Pin the AO-ADMIN-001 cumulative-diff semantics for repair loops.
+
+    The orchestrator must treat each attempt's diff artifacts as the
+    *cumulative* diff against the task base, not just the delta of the
+    latest executor process. Concretely:
+
+    * Attempt 1 makes a real change in an allowed file. Codex returns
+      ``REQUEST_CHANGES``.
+    * Attempt 2's fake executor exits 0 without editing any file.
+    * The cumulative diff must remain non-empty on attempt 2.
+    * The task must NOT fail ``files.empty_diff`` on attempt 2.
+    * The second review must receive the cumulative patch, not an
+      empty patch.
+    """
+
+    def _build_roadmap(
+        self,
+        root: Path,
+        repo: Path,
+        *,
+        allowed_files: tuple[str, ...] = ("out.txt",),
+        max_attempts: int = 3,
+    ) -> Path:
+        prompt = root / "prompt.md"
+        prompt.write_text("create out.txt", encoding="utf-8")
+        roadmap_path = root / "r.json"
+        roadmap_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "roadmap_id": "cum-repair",
+                    "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                    "tasks": [
+                        {
+                            "id": "T1",
+                            "kind": "implementation",
+                            "executor": "shell",
+                            "executor_command": "true",
+                            "prompt": str(prompt),
+                            "allowed_files": list(allowed_files),
+                            "validations": ["true"],
+                            "review": {"codex": "required"},
+                            "max_attempts": max_attempts,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return roadmap_path
+
+    def test_scenario_a_request_changes_repair_preserves_initial_diff(self) -> None:
+        """Scenario A: REQUEST_CHANGES repair preserves the initial diff.
+
+        Attempt 1 writes ``out.txt``; Codex returns REQUEST_CHANGES.
+        Attempt 2 does nothing. The task must end in ``ACCEPT`` after
+        the second review (which sees the cumulative patch) and must
+        never transition to ``BLOCKED`` with ``files.empty_diff``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = self._build_roadmap(root, repo)
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(
+                        verdict="REQUEST_CHANGES",
+                        summary="needs more content",
+                        repair_prompt="add a second line",
+                    ),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            fake_runner = _FirstAttemptOnlyFakeRunner(file_to_create="out.txt")
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                shell_runner=fake_runner,
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("cum-repair")[0]
+            self.assertEqual(row["state"], TaskState.ACCEPTED.value)
+            self.assertEqual(row["current_attempt"], 2)
+            # The executor ran twice; second attempt was a no-op.
+            self.assertEqual(len(fake_runner.calls), 2)
+            self.assertEqual(fake_runner.calls[0]["attempt_no"], 1)
+            self.assertEqual(fake_runner.calls[1]["attempt_no"], 2)
+            self.assertTrue(fake_runner.calls[1]["is_repair_prompt"])
+            # No empty_diff blocking event.
+            events = [
+                json.loads(e["payload_json"])
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1" and e["type"] == "task.blocked"
+            ]
+            self.assertEqual(
+                events,
+                [],
+                "task must not be blocked on empty_diff while cumulative diff is non-empty",
+            )
+            # The diff artifacts for attempt 2 are non-empty and reference out.txt.
+            changed = _diff_artifact(state, "cum-repair", "T1", 2, "changed_files")
+            self.assertIn("out.txt", changed.read_text(encoding="utf-8"))
+            patch = _diff_artifact(state, "cum-repair", "T1", 2, "diff_patch")
+            self.assertGreater(len(patch.read_text(encoding="utf-8")), 0)
+            stat = _diff_artifact(state, "cum-repair", "T1", 2, "diff_stat")
+            self.assertGreater(len(stat.read_text(encoding="utf-8")), 0)
+
+    def test_scenario_b_empty_diff_still_blocks_when_cumulative_is_empty(self) -> None:
+        """Scenario B: a task with no cumulative diff must still fail
+        ``files.empty_diff``. The repair loop must never bypass the
+        empty-diff protection.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("noop", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            # Both attempts run ``true`` so the executor exits 0 without
+            # touching any file. The cumulative diff is empty.
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "cum-empty",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                                "max_attempts": 3,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            # The fake runner targets a path that is in the
+            # ``allowed_files`` list but the runner is configured to
+            # *not* create it. We do this by passing a sentinel
+            # ``file_to_create`` and then replacing the runner with
+            # one that always no-ops.
+            class _NoopRunner(BaseRunner):
+                name = "noop"
+
+                def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[no-untyped-def]
+                    artifact = Path(str(artifact_dir))
+                    artifact.mkdir(parents=True, exist_ok=True)
+                    stdout_path = artifact / "executor.stdout.log"
+                    stderr_path = artifact / "executor.stderr.log"
+                    combined_path = artifact / "executor.combined.log"
+                    stdout_path.write_text("noop\n", encoding="utf-8")
+                    stderr_path.write_text("", encoding="utf-8")
+                    combined_path.write_text("noop\n", encoding="utf-8")
+                    return RunnerResult(
+                        exit_code=0,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        started_at=utc_now(),
+                        ended_at=utc_now(),
+                        combined_log_path=combined_path,
+                        failure_category=None,
+                    )
+
+            fake_runner = _NoopRunner()
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                shell_runner=fake_runner,
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("cum-empty")[0]
+            # The runner never created any file, so the diff is empty
+            # and the policy must block on files.empty_diff. The task
+            # must NOT reach review/ACCEPT.
+            self.assertEqual(row["state"], TaskState.BLOCKED.value)
+            events = [
+                json.loads(e["payload_json"])
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1" and e["type"] == "task.blocked"
+            ]
+            self.assertGreaterEqual(len(events), 1)
+            issues = events[0].get("issues") or []
+            names = {issue.get("name") for issue in issues}
+            self.assertIn(
+                "files.empty_diff",
+                names,
+                "empty_diff must remain enforced for tasks with no cumulative changes",
+            )
+            # The review service should NOT have been consulted.
+            self.assertEqual(len(fake_codex.calls), 0)
+
+    def test_scenario_c_attempt_two_diff_artifacts_are_cumulative(self) -> None:
+        """Scenario C: the diff artifacts for attempt 2 must reference
+        the file changed in attempt 1 even though the executor made no
+        new edits.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = self._build_roadmap(root, repo)
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(
+                        verdict="REQUEST_CHANGES",
+                        summary="more",
+                        repair_prompt="add more",
+                    ),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            fake_runner = _FirstAttemptOnlyFakeRunner(
+                file_to_create="out.txt", contents="from attempt 1\n"
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                shell_runner=fake_runner,
+            )
+            orch.run_roadmap(roadmap)
+            # Attempt 1 artifacts
+            changed1 = _diff_artifact(state, "cum-repair", "T1", 1, "changed_files")
+            patch1 = _diff_artifact(state, "cum-repair", "T1", 1, "diff_patch")
+            stat1 = _diff_artifact(state, "cum-repair", "T1", 1, "diff_stat")
+            # Attempt 2 artifacts
+            changed2 = _diff_artifact(state, "cum-repair", "T1", 2, "changed_files")
+            patch2 = _diff_artifact(state, "cum-repair", "T1", 2, "diff_patch")
+            stat2 = _diff_artifact(state, "cum-repair", "T1", 2, "diff_stat")
+            # Both attempts record out.txt.
+            self.assertIn("out.txt", changed1.read_text(encoding="utf-8"))
+            self.assertIn("out.txt", changed2.read_text(encoding="utf-8"))
+            # Both attempts have non-empty diff content.
+            self.assertIn("out.txt", patch1.read_text(encoding="utf-8"))
+            self.assertIn("out.txt", patch2.read_text(encoding="utf-8"))
+            self.assertIn("out.txt", stat1.read_text(encoding="utf-8"))
+            self.assertIn("out.txt", stat2.read_text(encoding="utf-8"))
+            # The cumulative patch is what the reviewer sees.
+            review_patches = [
+                Path(a["path"])
+                for a in state.artifacts_for_task("T1")
+                if a["kind"] == "review_prompt"
+            ]
+            self.assertGreaterEqual(len(review_patches), 2)
+            second_prompt = review_patches[1].read_text(encoding="utf-8")
+            self.assertIn("out.txt", second_prompt)
+            # The attempt number is in the second review prompt.
+            self.assertIn("Attempt: 2", second_prompt)
+
+    def test_scenario_d_two_repairs_then_accept_with_no_new_edits(self) -> None:
+        """Scenario D: REQUEST_CHANGES twice then ACCEPT with no
+        additional edits on either repair can still succeed because
+        the cumulative diff is valid.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = self._build_roadmap(root, repo, max_attempts=4)
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(verdict="REQUEST_CHANGES", summary="r1", repair_prompt="f1"),
+                    ScriptedVerdict(verdict="REQUEST_CHANGES", summary="r2", repair_prompt="f2"),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            fake_runner = _FirstAttemptOnlyFakeRunner(file_to_create="out.txt")
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                shell_runner=fake_runner,
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("cum-repair")[0]
+            self.assertEqual(row["state"], TaskState.ACCEPTED.value)
+            self.assertEqual(row["current_attempt"], 3)
+            self.assertEqual(len(fake_codex.calls), 3)
+            # The third review (after two no-op repairs) still sees the
+            # cumulative diff in its packet.
+            review_patches = [
+                Path(a["path"])
+                for a in state.artifacts_for_task("T1")
+                if a["kind"] == "review_prompt"
+            ]
+            self.assertGreaterEqual(len(review_patches), 3)
+            final_prompt = review_patches[2].read_text(encoding="utf-8")
+            self.assertIn("out.txt", final_prompt)
+            self.assertIn("Attempt: 3", final_prompt)
+
+    def test_scenario_e_policy_still_blocks_out_of_scope_cumulative_files(self) -> None:
+        """Scenario E: the policy must still block on a forbidden /
+        out-of-scope file even when the file only appeared in a later
+        attempt. The cumulative diff still drives the decision.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "cum-forbidden",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                                "max_attempts": 3,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            # Force attempt 2 via REQUEST_CHANGES, then have the
+            # forbidden-file runner add an out-of-scope file. The
+            # cumulative diff on attempt 2 includes both out.txt and
+            # intruder.md, so the policy must block on the intruder.
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(verdict="REQUEST_CHANGES", summary="r1", repair_prompt="f1"),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            fake_runner = _ForbiddenFileFakeRunner(
+                allowed_file="out.txt", forbidden_file="intruder.md"
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                shell_runner=fake_runner,
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("cum-forbidden")[0]
+            self.assertEqual(row["state"], TaskState.BLOCKED.value)
+            # The runner ran twice (initial + repair).
+            self.assertEqual(len(fake_runner.calls), 2)
+            # Locate the blocked transition. There may be multiple
+            # ``task.blocked`` events if the task went through several
+            # states; the *last* one is the final block.
+            blocked_events = [
+                json.loads(e["payload_json"])
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1" and e["type"] == "task.blocked"
+            ]
+            self.assertGreaterEqual(len(blocked_events), 1)
+            payload = blocked_events[-1]
+            issues = payload.get("issues") or []
+            names = {issue.get("name") for issue in issues}
+            self.assertIn(
+                "files.not_allowed",
+                names,
+                "cumulative out-of-scope file must be blocked by policy",
+            )
+            # Codex was consulted at least once (REQUEST_CHANGES on
+            # attempt 1) but the second review was never reached
+            # because the policy caught the intruder file first.
+            self.assertGreaterEqual(len(fake_codex.calls), 1)
+            self.assertLess(len(fake_codex.calls), 2)
+
+    def test_scenario_f_ao_admin_001_pattern_no_op_repair(self) -> None:
+        """Scenario F: regression for the AO-ADMIN-001-BACKEND-SNAPSHOT
+        pattern. Allowed file in ``allowed_files``; first attempt
+        modifies it; Codex returns REQUEST_CHANGES; second attempt
+        does nothing; second review gets the cumulative patch.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            # The allowed file is the canonical AO-ADMIN-001 path.
+            # We seed an empty file so the worktree already has it.
+            allowed_file = "agentops/pr_loop.py"
+            (repo / "agentops").mkdir(parents=True, exist_ok=True)
+            (repo / "agentops" / "pr_loop.py").write_text("# seed\n", encoding="utf-8")
+            git(repo, "add", "agentops/pr_loop.py")
+            git(repo, "commit", "-m", "seed pr_loop")
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "ao-admin-001",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "AO-ADMIN-001",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "allowed_files": [allowed_file],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                                "max_attempts": 3,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(
+                        verdict="REQUEST_CHANGES",
+                        summary="first review",
+                        repair_prompt="improve",
+                    ),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            fake_runner = _FirstAttemptOnlyFakeRunner(
+                file_to_create=allowed_file,
+                contents="# new content from attempt 1\n",
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                shell_runner=fake_runner,
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("ao-admin-001")[0]
+            self.assertEqual(row["state"], TaskState.ACCEPTED.value)
+            self.assertEqual(row["current_attempt"], 2)
+            # The second review prompt must include the cumulative diff
+            # for the allowed file, not an empty patch.
+            review_patches = [
+                Path(a["path"])
+                for a in state.artifacts_for_task("AO-ADMIN-001")
+                if a["kind"] == "review_prompt"
+            ]
+            self.assertGreaterEqual(len(review_patches), 2)
+            second_prompt = review_patches[1].read_text(encoding="utf-8")
+            self.assertIn(allowed_file, second_prompt)
+            self.assertIn("new content from attempt 1", second_prompt)
+            self.assertIn("Attempt: 2", second_prompt)
+            # And the policy checker must have accepted the file (it is
+            # in allowed_files).
+            policy_rows = _policy_statuses(state, "AO-ADMIN-001")
+            # Two policy checks (one per attempt). Both must be "passed".
+            self.assertGreaterEqual(len(policy_rows), 2)
+            self.assertEqual(policy_rows[0]["status"], "passed")
+            self.assertEqual(policy_rows[-1]["status"], "passed")
+
+
+# ---------------------------------------------------------------------------
+# PromptCompiler.review_prompt: attempt number in the packet
+# ---------------------------------------------------------------------------
+
+
+class ReviewPromptAttemptNumberTests(unittest.TestCase):
+    """The review packet must include the attempt number and a note
+    that the diff is cumulative so a no-op repair is not treated as
+    an empty patch.
+    """
+
+    def _build(self, attempt: int | None) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "task.md"
+            prompt.write_text("x", encoding="utf-8")
+            task = TaskConfig(
+                id="T1",
+                kind="implementation",
+                prompt_path=prompt,
+                allowed_files=("out.txt",),
+                validations=("true",),
+            )
+            roadmap = RoadmapConfig(
+                version=1,
+                roadmap_id="r",
+                repo=RepoConfig(id="repo", path=root),
+                tasks=(task,),
+            )
+            compiler = PromptCompiler(PolicyEngine(roadmap))
+            policy = PolicyResult(ok=True, issues=())
+            validation = ValidationResult(ok=True, commands=())
+            diff = DiffSnapshot(
+                changed_files=("out.txt",),
+                name_status="M\tout.txt",
+                stat=" out.txt | 1 +",
+                patch="diff --git a/out.txt b/out.txt\n@@ -0,0 +1 @@\n+hi\n",
+                base_ref="HEAD",
+                head_ref="HEAD",
+            )
+            return compiler.review_prompt(task, diff, policy, validation, attempt=attempt)
+
+    def test_review_prompt_contains_attempt_number_when_provided(self) -> None:
+        text = self._build(attempt=2)
+        self.assertIn("Attempt: 2", text)
+        self.assertIn("cumulative", text.lower())
+
+    def test_review_prompt_defaults_to_attempt_one_when_not_provided(self) -> None:
+        text = self._build(attempt=None)
+        self.assertIn("Attempt: 1", text)
+
+    def test_review_prompt_attempt_3_announces_no_op_repair(self) -> None:
+        text = self._build(attempt=3)
+        self.assertIn("Attempt: 3", text)
+        self.assertIn("no additional edits", text.lower())
 
 
 if __name__ == "__main__":

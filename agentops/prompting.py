@@ -75,6 +75,8 @@ class PromptCompiler:
         diff: DiffSnapshot,
         policy: PolicyResult,
         validation: ValidationResult,
+        *,
+        attempt: int | None = None,
     ) -> str:
         validation_summary = [
             {
@@ -89,11 +91,22 @@ class PromptCompiler:
         changed_files_block = _bullet(diff.changed_files) or "- (none)"
         forbidden_globs = tuple(self.policy_engine.global_forbidden) + tuple(task.forbidden_globs)
         scope_table = _scope_table(diff.changed_files, task.allowed_files, forbidden_globs)
+        attempt_block = (
+            f"Attempt: {attempt}\n"
+            "The diff below is cumulative against the task base. If this is a repair\n"
+            "attempt and the executor made no additional edits since the previous\n"
+            "attempt, the cumulative diff is still the right artifact to review:\n"
+            "do not block merely because the latest executor process was a no-op."
+            if attempt is not None
+            else "Attempt: 1"
+        )
         return "\n".join(
             [
                 "# AgentOps Codex review packet",
                 "You are the strong reviewer. Do not edit files. Review only the completed executor attempt.",
                 "Return only a JSON object matching the configured schema.",
+                "",
+                attempt_block,
                 "",
                 "# Review decision options",
                 "- ACCEPT: task is safe, scoped, validated, and aligned with policy.",

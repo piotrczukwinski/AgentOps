@@ -47,6 +47,14 @@ preflight  →  workspace  →  executor  →  diff  →  policy  →  validatio
 * diffs that contain a secret-like value,
 * branches in the protected set.
 
+The empty-diff check is **cumulative**: it inspects the *task* diff
+against the task base, not the per-executor-process delta. A
+`REQUEST_CHANGES` repair attempt that exits 0 without editing any
+file does **not** fail `files.empty_diff` when the prior attempt
+already produced changes — the cumulative diff is still non-empty.
+See [Cumulative diff across repair attempts](#cumulative-diff-across-repair-attempts)
+for the full semantics.
+
 `validation` runs the deterministic commands listed in `validations:` and
 short-circuits on first failure.
 
@@ -136,6 +144,58 @@ review verdict itself; a `REQUEST_CHANGES` verdict with
 `safe_to_push=false` still goes through the local repair loop
 (``safe_to_push`` only blocks the final push). The verifier is in
 `agentops/review.py::parse_review_verdict_file`.
+
+## Cumulative diff across repair attempts
+
+Repair attempts operate on the **cumulative** task diff, not on the
+per-executor-process delta. This is the contract that fixes the
+`AO-ADMIN-001-BACKEND-SNAPSHOT` incident.
+
+* The task worktree is created once per task and **reused across
+  repair attempts**. Attempt 2 does not start from a clean baseline;
+  it runs against the same workspace that already contains attempt
+  1's changes.
+* For every attempt, the per-attempt diff artifacts (`changed_files.txt`,
+  `diff.patch`, `diff.stat`) are the **cumulative** diff against the
+  task base SHA (`runtime.base_sha`), not the working-tree-vs-index
+  delta. The implementation is in
+  `agentops/git_ops.py::collect_diff` (parameter `base_sha`) and is
+  wired up by `agentops/orchestrator.py::_run_task`.
+* A `REQUEST_CHANGES` repair attempt that exits 0 without editing any
+  file is **not** blocked by `files.empty_diff` when the prior
+  attempt already produced changes. The cumulative diff is still
+  non-empty, the policy check sees it, and the task proceeds to the
+  second review.
+* The review packet sent to Codex after a repair attempt contains the
+  cumulative `changed_files`, `diff.patch`, and `diff.stat`, the
+  latest validation result, and the attempt number. The reviewer is
+  explicitly told that a no-op repair may legitimately see no new
+  changes since the previous attempt.
+* If the cumulative diff is truly empty (no attempt produced any
+  file change), `files.empty_diff` still fires. The protection is
+  cumulative-aware, not disabled.
+
+`git diff` against the task base SHA also picks up **staged** changes
+(an executor that ran `git add` on its own changes), which the
+legacy working-tree-vs-index form would have silently missed. This
+removes a related class of false-empty-diff failures: the
+orchestrator previously saw the file in `changed_files` (via
+`git status --porcelain`) but produced an empty `diff.patch` (via
+`git diff`); with `base_sha` the patch and stat are consistent with
+the changed-files list.
+
+The verification surface lives in:
+
+* `tests/test_git_ops.py::CollectDiffTests` — `base_sha` semantics
+  (cumulative, staged + unstaged, empty-when-clean).
+* `tests/test_review_repair_loop.py::CumulativeRepairDiffTests` — end-to-end
+  scenarios A through F (REQUEST_CHANGES repair preserves diff,
+  empty diff still blocks, attempt 2 artifacts are cumulative,
+  two repairs then ACCEPT, policy blocks out-of-scope cumulative
+  files, AO-ADMIN-001 regression).
+* `tests/test_review_repair_loop.py::ReviewPromptAttemptNumberTests` —
+  the review packet advertises the attempt number and the
+  cumulative-diff contract.
 
 ### Review packet scope rules
 
@@ -241,6 +301,15 @@ was blocked. The new default of 3 lets the loop run
 
 before blocking. Operators can override the cap via
 `max_repair_attempts` (roadmap-level) or `max_attempts` (task-level).
+
+A repair attempt that exits 0 without editing any file is treated
+as a no-op: the cumulative task diff is still the artifact under
+review (see [Cumulative diff across repair attempts](#cumulative-diff-across-repair-attempts)),
+so the reviewer sees the same `changed_files`, `diff.patch`, and
+`diff.stat` it would have seen if the repair had added no new
+content. The repair prompt is still emitted, the attempt counter
+still advances, and the cap still applies — the only thing that
+does not change is the diff.
 
 ### Backward compatibility with the legacy `codex_review.schema.json`
 
