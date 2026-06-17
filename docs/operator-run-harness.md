@@ -102,6 +102,7 @@ Launches a long operator prompt under `.operator-runs/<run-id>/`.
 | `--yolo` | off | Adds `--dangerously-skip-permissions` to the executor argv |
 | `--detach` | off | Starts the process in a new session and returns immediately |
 | `--no-detach` | on | Runs in the foreground, waits for the process to exit |
+| `--follow` | off | Foreground/attached only: stream the executor's live output to the terminal while the run is in progress. Cannot be combined with `--detach`; detached runs are observed via `operator-tail` / `operator-status` instead. See [`--follow` mode](#--follow-mode) below. |
 | `--idle-timeout` | unset | If set, terminate the process group when the active combined.log has not grown for N seconds. See [Idle watchdog](#idle-watchdog) below. |
 | `--startup-timeout` | unset | If set, terminate the process group when the active combined.log is still 0 bytes after N seconds. See [Startup watchdog](#startup-watchdog) below. |
 | `--retry-on-transient` | off | Classify failures; on transient ones, sleep and try again. See [Transient failure recovery](#transient-failure-recovery) below. |
@@ -377,6 +378,77 @@ python -m agentops operator-run \
   --idle-timeout 600
 ```
 
+## `--follow` mode
+
+`--follow` is the foreground/attached counterpart to `operator-tail`.
+It streams the executor's live output to the terminal while the run
+is in progress so the operator can see what the model is doing
+without having to `operator-tail` the run from a second terminal.
+
+```bash
+# Long operator prompt with a live terminal stream.
+python -m agentops operator-run \
+  --name schema-path-hardening \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --model minimax/MiniMax-M3 \
+  --follow
+```
+
+Properties of `--follow`:
+
+* **Foreground/attached only.** `--follow` and `--detach` cannot be
+  combined; combining them exits non-zero with the message
+  `--follow cannot be combined with --detach; use
+  operator-tail/operator-status for detached runs`. Detached runs are
+  meant to be observed from a different terminal with
+  `operator-tail` / `operator-status`; a live terminal stream on a
+  detached process is meaningless because the controlling terminal
+  is, by definition, not attached to the run.
+* **Live terminal stream, not a replacement for logs.** The executor
+  output is *additionally* written to the follow stream; the durable
+  `stdout.log`, `stderr.log`, `combined.log`, `status.json`,
+  `command.json`, `prompt.md`, and `result.json` are still written
+  exactly as in non-follow foreground mode. A broken follow stream
+  (closed pipe, redirected to a file that gets unlinked) does not
+  affect the on-disk logs.
+* **Same safety guarantees.** `--follow` still launches the executor
+  with `shell=False`, still sanitizes the env (no GitHub tokens, no
+  model API keys, no `XDG_DATA_HOME`, `GIT_TERMINAL_PROMPT=0`,
+  `GIT_ASKPASS=/bin/false`), and still passes the prompt *content* to
+  the executor as the last argv element (never the prompt *path*).
+* **Same retry / watchdog behavior.** `--follow` honors
+  `--retry-on-transient`, `--max-retries`, `--backoff`,
+  `--startup-timeout`, and `--idle-timeout`. The retry loop
+  reattaches the follow stream to each retry attempt so the live
+  output covers the full run.
+* **Same result extraction.** When the executor prints
+  `AGENTOPS_RESULT_JSON`, the foreground path still extracts the
+  block into `result.json`. `--follow` does not change how the
+  structured result is parsed or written.
+
+```bash
+# --follow + --retry-on-transient: live output across the initial
+# attempt and any transient retries.
+python -m agentops operator-run \
+  --name business-agent-batch-001 \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --follow \
+  --retry-on-transient \
+  --max-retries 3 \
+  --backoff 5,15,45
+
+# This combination is rejected: --follow is foreground-only.
+python -m agentops operator-run \
+  --name not-allowed \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --follow --detach
+# --follow cannot be combined with --detach; use
+# operator-tail/operator-status for detached runs
+```
+
 ## Lifecycle for foreground mode
 
 ```
@@ -472,6 +544,13 @@ In short:
   dependencies. It adds a new module (`agentops.operator_run`) and
   four new subcommands to the CLI; it does not touch the existing
   runners, orchestrator, or state machine.
+* `--follow` is a pure side channel: it adds a live terminal stream
+  on top of the durable logs but never changes the argv, the
+  sanitized env, the `shell=False` contract, the prompt-content
+  (not path) contract, the retry policy, the startup / idle
+  watchdogs, or the result extraction. `--follow` is rejected at
+  argument-parsing time when combined with `--detach`; detached
+  runs are observed via `operator-tail` / `operator-status` instead.
 
 ## Transient failure recovery
 

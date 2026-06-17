@@ -837,6 +837,8 @@ def launch_run(
     *,
     env: dict[str, str] | None = None,
     log_dir: Path | None = None,
+    follow_stream: Any | None = None,
+    follow_prefix: str = "",
 ) -> subprocess.Popen[bytes]:
     """Launch the executor subprocess.
 
@@ -852,6 +854,15 @@ def launch_run(
     optional override used by retry attempts so that each attempt's
     stdout/stderr/combined streams live in their own subdirectory under
     ``<run_dir>/attempts/<n>/``.
+
+    ``follow_stream`` and ``follow_prefix`` implement the ``--follow`` mode:
+    when ``follow_stream`` is not ``None``, the tee threads also write the
+    executor's combined output to that stream, prefixed with
+    ``follow_prefix`` on each line so the operator can distinguish
+    stdout from stderr in the live terminal view. The flag is
+    foreground-only; detached runs are meant to be observed via
+    ``operator-tail`` / ``operator-watch`` instead, and the CLI rejects
+    ``--follow --detach`` at argument-parsing time.
     """
     target_log_dir = log_dir if log_dir is not None else run_dir_path
     target_log_dir.mkdir(parents=True, exist_ok=True)
@@ -882,8 +893,22 @@ def launch_run(
     stdout_fh = stdout_log.open("ab", buffering=0)
     stderr_fh = stderr_log.open("ab", buffering=0)
     combined_fh = combined_log.open("ab", buffering=0)
-    stdout_thread = _start_tee_thread(proc.stdout, stdout_fh, combined_fh)  # type: ignore[arg-type]
-    stderr_thread = _start_tee_thread(proc.stderr, stderr_fh, combined_fh)  # type: ignore[arg-type]
+    stdout_thread = _start_tee_thread(
+        proc.stdout,  # type: ignore[arg-type]
+        stdout_fh,
+        combined_fh,
+        follow_stream=follow_stream,
+        follow_prefix="",
+        is_stderr=False,
+    )
+    stderr_thread = _start_tee_thread(
+        proc.stderr,  # type: ignore[arg-type]
+        stderr_fh,
+        combined_fh,
+        follow_stream=follow_stream,
+        follow_prefix=follow_prefix,
+        is_stderr=True,
+    )
     proc._agentops_stdout_fh = stdout_fh  # type: ignore[attr-defined]
     proc._agentops_stderr_fh = stderr_fh  # type: ignore[attr-defined]
     proc._agentops_combined_fh = combined_fh  # type: ignore[attr-defined]
@@ -894,7 +919,15 @@ def launch_run(
     return proc
 
 
-def _start_tee_thread(source, primary, combined) -> threading.Thread:
+def _start_tee_thread(
+    source,
+    primary,
+    combined,
+    *,
+    follow_stream: Any | None = None,
+    follow_prefix: str = "",
+    is_stderr: bool = False,
+) -> threading.Thread:
     """Spawn a daemon thread that copies ``source`` into ``primary`` and ``combined``.
 
     Both targets are written to in append-binary mode; reads happen in
@@ -902,6 +935,13 @@ def _start_tee_thread(source, primary, combined) -> threading.Thread:
     chunk (EOF) or raises. Any exception is swallowed because we are in a
     background thread; the operator can always inspect the per-stream
     log files for the actual content.
+
+    When ``follow_stream`` is not ``None`` the thread also writes the
+    chunk to that stream (after decoding as UTF-8 with the
+    ``replace`` error handler) prefixed with ``follow_prefix`` on each
+    line. ``follow_prefix`` is intended to be a short marker like
+    ``"opencode-stderr: "`` so the operator can tell stdout and stderr
+    apart in the live terminal view.
     """
 
     def _pump() -> None:
@@ -914,15 +954,47 @@ def _start_tee_thread(source, primary, combined) -> threading.Thread:
                     primary.write(chunk)
                 with contextlib.suppress(Exception):  # noqa: BLE001 - best-effort logging
                     combined.write(chunk)
+                if follow_stream is not None:
+                    _emit_follow_chunk(follow_stream, chunk, follow_prefix)
         except Exception:  # noqa: BLE001 - best-effort logging
             return
         finally:
             with contextlib.suppress(Exception):  # noqa: BLE001 - best-effort cleanup
                 source.close()
 
-    thread = threading.Thread(target=_pump, name="agentops-operator-tee", daemon=True)
+    thread_name = "agentops-operator-tee-stderr" if is_stderr else "agentops-operator-tee-stdout"
+    thread = threading.Thread(target=_pump, name=thread_name, daemon=True)
     thread.start()
     return thread
+
+
+def _emit_follow_chunk(stream: Any, chunk: bytes, prefix: str) -> None:
+    """Best-effort write of a chunk to ``stream`` with per-line prefix.
+
+    The chunk is decoded as UTF-8 with the ``replace`` error handler so a
+    stray binary byte from the executor cannot kill the live view. The
+    function never raises; a broken pipe or a closed stream is silently
+    ignored so the foreground ``--follow`` run does not crash on a
+    detached viewer.
+    """
+    try:
+        text = chunk.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - decoding is best-effort
+        return
+    if not text:
+        return
+    with contextlib.suppress(Exception):  # noqa: BLE001 - stream is best-effort
+        if prefix:
+            if text.endswith("\n"):
+                text = text[:-1].replace("\n", "\n" + prefix) + "\n" + prefix
+            else:
+                text = text.replace("\n", "\n" + prefix)
+            stream.write(prefix + text)
+        else:
+            stream.write(text)
+        flush = getattr(stream, "flush", None)
+        if callable(flush):
+            flush()
 
 
 def _join_tee_threads(proc: subprocess.Popen[bytes], *, timeout: float = 5.0) -> None:
@@ -1303,6 +1375,7 @@ def run_foreground(
     env: dict[str, str] | None = None,
     idle_timeout: float | None = None,
     startup_timeout: float | None = None,
+    follow_stream: Any | None = None,
 ) -> dict[str, Any]:
     """Run the executor in the foreground, writing status/logs/result.
 
@@ -1320,8 +1393,16 @@ def run_foreground(
     operator (and the morning checklist) can tell the difference
     between "ran for a while then stalled" and "never produced
     any output at all".
+
+    ``follow_stream`` implements the ``--follow`` mode: when it is
+    not ``None`` the executor's combined output is also written to
+    the stream as it is produced, so the operator can watch a long
+    foreground run live in the terminal. ``follow_stream`` is
+    foreground-only; detached runs are meant to be observed via
+    ``operator-tail`` / ``operator-watch`` instead, and the CLI
+    rejects ``--follow --detach`` at argument-parsing time.
     """
-    proc = launch_run(spec, run_dir_path, argv, env=env)
+    proc = launch_run(spec, run_dir_path, argv, env=env, follow_stream=follow_stream)
     started_at: str = proc._agentops_started_at  # type: ignore[attr-defined]
     write_status(
         run_dir_path,
@@ -1616,6 +1697,7 @@ def run_attempt_foreground(
     attempt_status: str = RUNNING_STATUS,
     idle_timeout: float | None = None,
     startup_timeout: float | None = None,
+    follow_stream: Any | None = None,
 ) -> AttemptResult:
     """Run a single attempt and return its outcome.
 
@@ -1637,10 +1719,19 @@ def run_attempt_foreground(
     only while ``log_size_bytes`` is still 0; it is recorded with
     classification ``no_output_startup`` and exit code 137 so the
     retry loop can tell the two failure modes apart.
+
+    ``follow_stream`` implements the ``--follow`` mode: when it is
+    not ``None`` the attempt's combined output is also written to
+    the stream as it is produced, so the operator can watch a long
+    foreground retry run live in the terminal. Like the
+    ``run_foreground`` parameter, it is foreground-only; the CLI
+    refuses to combine it with ``--detach``.
     """
     target_log_dir = log_dir if log_dir is not None else run_dir_path
     target_log_dir.mkdir(parents=True, exist_ok=True)
-    proc = launch_run(spec, run_dir_path, argv, env=env, log_dir=target_log_dir)
+    proc = launch_run(
+        spec, run_dir_path, argv, env=env, log_dir=target_log_dir, follow_stream=follow_stream
+    )
     started_at: str = proc._agentops_started_at  # type: ignore[attr-defined]
     write_status(
         run_dir_path,
@@ -1789,6 +1880,7 @@ def run_foreground_with_retries(
     start_attempt_no: int = 1,
     idle_timeout: float | None = None,
     startup_timeout: float | None = None,
+    follow_stream: Any | None = None,
 ) -> dict[str, Any]:
     """Run the executor in the foreground with optional transient retry.
 
@@ -1809,6 +1901,12 @@ def run_foreground_with_retries(
     idle watchdog. Idle terminations are *not* considered transient; the
     retry loop stops immediately and the run is finalised with status
     ``needs_operator`` and reason ``idle_timeout``.
+
+    ``follow_stream`` is forwarded to every attempt's
+    :func:`run_attempt_foreground` so a ``--follow`` foreground run
+    streams the live output of the initial attempt and any retry
+    attempt alike. Like the ``run_foreground`` parameter, it is
+    foreground-only; the CLI refuses to combine it with ``--detach``.
 
     Returns the final ``status.json`` payload. The terminal status is:
 
@@ -1869,6 +1967,7 @@ def run_foreground_with_retries(
             attempt_status=attempt_status,
             idle_timeout=idle_timeout,
             startup_timeout=startup_timeout,
+            follow_stream=follow_stream,
         )
         if on_attempt is not None:
             on_attempt(result)
