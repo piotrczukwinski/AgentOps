@@ -483,8 +483,36 @@ The UI shows task status, latest events, active run subprocesses, and
 per-task logs/artifacts. The "Run" button always passes `--no-codex`; to
 run with Codex, use the CLI directly.
 
+The "Admin / Operator panel" card is a read-only roll-up intended for
+an overnight operator. It surfaces, in one glance:
+
+* **Roadmap state** — per-roadmap task totals and a `{state: count}` histogram
+  (e.g. `accepted: 3 failed: 1 running: 2`).
+* **Latest events** — the most recent 10 rows from the state event log.
+* **Operator-run status** — a `runtime_status` histogram plus the five
+  most recent operator-run projections (run id, runtime, pid-alive,
+  idle seconds, result presence, `suggested_action`).
+* **PR-loop cycles** — the existing `cycle-N` directories under
+  `.agentops/pr-loop/`, with the next available cycle number.
+* **Watchdog failures** — operator runs whose `runtime_status` is one
+  of `needs_operator`, `transient_failed`, `stale_pid`, or
+  `exited_or_stale` (the same set the morning checklist greps for).
+* **Recommended next commands** — a static list of CLI hints:
+  `agentops operator-status`, `agentops operator-tail`,
+  `agentops task-tail`, `agentops pr-loop`.
+
+The card is fed by `GET /api/admin` and polls every 3 seconds. There is
+no write endpoint; clicking the suggestion still requires the operator
+to run the CLI command in their terminal. When a data source is
+missing (no operator runs, no PR-loop root, etc.) the affected
+sub-section renders an explicit empty-state row so the dashboard is
+never broken-looking.
+
 See `docs/local-web-ui.md` for the full description, safety notes, and
-recommended workflow.
+recommended workflow, and `docs/operator-run-harness.md` for the
+failure-mode playbook (`no_output_startup`, `idle_timeout`,
+`missing_result`, `template_result`, `blocked_by_policy`) that pairs
+with the watchdog-failures section.
 
 
 ## Roadmap budget

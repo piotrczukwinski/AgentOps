@@ -717,6 +717,29 @@ class AdminPanelHtmlTests(unittest.TestCase):
         for forbidden in ("/api/exec", "/api/shell", "/api/command"):
             self.assertNotIn(forbidden, html)
 
+    def test_admin_html_contains_docs_visible_labels(self) -> None:
+        # Smoke-test the docs-visible labels the README and the local
+        # web UI docs reference. The JavaScript adds the four
+        # recommended commands at runtime, so the static HTML only
+        # carries the headings + empty-state strings.
+        html = web.render_index_html()
+        for label in (
+            "Roadmap state",
+            "Latest events",
+            "Operator-run status",
+            "PR-loop cycles",
+            "Watchdog failures",
+            "Recommended next commands",
+        ):
+            self.assertIn(label, html, label)
+        # The watchdog-failures sub-section must surface its empty
+        # state explicitly so a fresh checkout does not look broken.
+        self.assertIn("No watchdog failures detected", html)
+        # The empty states of the operator-run and pr-loop sub-sections
+        # advertise their CLI fallbacks (the docs reference these).
+        self.assertIn("agentops operator-run", html)
+        self.assertIn("agentops pr-loop", html)
+
 
 class AdminPanelApiTests(unittest.TestCase):
     """End-to-end tests for :func:`agentops.web.collect_admin_panel`.
@@ -735,7 +758,19 @@ class AdminPanelApiTests(unittest.TestCase):
         self.store.init()
 
     def test_admin_panel_empty_state_is_well_formed(self) -> None:
-        panel = web.collect_admin_panel(self.store)
+        # Isolate both the operator-runs root and the pr-loop root so the
+        # "empty state" assertions do not pick up the on-disk state of
+        # the actual repo.
+        empty_runs_root = self.tmp / "empty-operator-runs"
+        empty_pr_root = self.tmp / "empty-pr-loop"
+        with mock.patch.dict(
+            os.environ,
+            {"AGENTOPS_OPERATOR_RUNS_ROOT": str(empty_runs_root)},
+            clear=False,
+        ), mock.patch.object(
+            web, "_default_pr_loop_root", return_value=empty_pr_root
+        ):
+            panel = web.collect_admin_panel(self.store)
         # Top-level keys.
         for key in (
             "roadmap_state",
@@ -884,3 +919,72 @@ class AdminPanelApiTests(unittest.TestCase):
             panel = web.collect_admin_panel(self.store)
         popen.assert_not_called()
         self.assertIn("recommended_commands", panel)
+
+    def test_admin_panel_recommended_commands_match_docs(self) -> None:
+        # The README and docs/local-web-ui.md list the four CLI
+        # command hints surfaced by the panel. The panel's
+        # ``recommended_commands`` payload must list exactly these
+        # four, in the same order, with the same name field. This
+        # locks the docs-to-API contract so a future rename in either
+        # place triggers a test failure.
+        empty_runs_root = self.tmp / "empty-operator-runs"
+        empty_pr_root = self.tmp / "empty-pr-loop"
+        with mock.patch.dict(
+            os.environ,
+            {"AGENTOPS_OPERATOR_RUNS_ROOT": str(empty_runs_root)},
+            clear=False,
+        ), mock.patch.object(
+            web, "_default_pr_loop_root", return_value=empty_pr_root
+        ):
+            panel = web.collect_admin_panel(self.store)
+        names = [cmd["name"] for cmd in panel["recommended_commands"]]
+        self.assertEqual(
+            names,
+            [
+                "agentops operator-status",
+                "agentops operator-tail",
+                "agentops task-tail",
+                "agentops pr-loop",
+            ],
+        )
+        # Every command must carry a non-empty description (the docs
+        # copy these out as the "What it does" column).
+        for cmd in panel["recommended_commands"]:
+            self.assertTrue(cmd["description"], cmd)
+
+    def test_admin_panel_watchdog_failure_statuses_match_docs(self) -> None:
+        # The docs-visible "Watchdog failures" section must classify a
+        # run as a watchdog failure iff its ``runtime_status`` is one
+        # of the four canonical names the morning checklist greps for.
+        # This test seeds one run per status and asserts each is
+        # surfaced exactly once.
+        runs_root = self.tmp / "runs-root"
+        runs_root.mkdir()
+        for status in ("needs_operator", "transient_failed", "stale_pid", "exited_or_stale"):
+            run_id = f"20260617T000000Z-{status}-aaaaaaaa"
+            run_dir = runs_root / ".operator-runs" / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "name": "demo",
+                        "status": status,
+                        "exit_code": 0,
+                        "pid": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        with mock.patch.dict(
+            os.environ,
+            {"AGENTOPS_OPERATOR_RUNS_ROOT": str(runs_root)},
+            clear=False,
+        ):
+            panel = web.collect_admin_panel(self.store)
+        self.assertEqual(panel["watchdog_failures"]["count"], 4)
+        surfaced = {item["runtime_status"] for item in panel["watchdog_failures"]["items"]}
+        self.assertEqual(
+            surfaced,
+            {"needs_operator", "transient_failed", "stale_pid", "exited_or_stale"},
+        )

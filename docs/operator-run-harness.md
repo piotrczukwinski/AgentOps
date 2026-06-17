@@ -869,6 +869,20 @@ python -m agentops operator-run \
   --idle-timeout 600
 ```
 
+### Local UI admin / operator panel
+
+The same `operator-status --format json` projection feeds the local
+"Admin / Operator panel" card in the browser UI
+(`python -m agentops serve`, default `127.0.0.1:8765`). The panel
+card is read-only and polled by the dashboard JavaScript every three
+seconds; it never spawns a subprocess and never calls the
+`--yolo`/`--detach` flags. See `docs/local-web-ui.md` for the panel
+contract (`/api/admin`), the watchdog-failure roll-up, and the
+diagnostic table that maps `no_output_startup`, `idle_timeout`,
+`missing_result`, `template_result`, and `blocked_by_policy` to the
+matching `operator-tail` / `operator-retry` / `operator-stop` /
+`agentops status` CLI moves.
+
 ## PR repair loop (`agentops pr-loop`)
 
 `operator-run` covers the *outer* operator prompt. `agentops pr-loop`

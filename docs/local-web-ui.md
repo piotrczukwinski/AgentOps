@@ -171,6 +171,27 @@ empty-state row (for example, "No operator runs yet — start one
 with the CLI: `agentops operator-run …`") so the operator is not
 left wondering whether the page is broken.
 
+### Diagnosing failure modes from the panel
+
+The watchdog-failures and operator-run-status sub-sections expose the
+canonical failure categories the morning checklist greps for. Map
+each category to the same CLI the CLI-first playbook uses:
+
+| Category in panel | What it means | First CLI move |
+|---|---|---|
+| `no_output_startup` | `--startup-timeout` fired: executor alive but `combined.log` still 0 bytes. | `agentops operator-tail <run-id> --lines 200` then re-run with `--idle-timeout 600` in the foreground. |
+| `idle_timeout` | `--idle-timeout` fired: log stopped growing for the configured window. | `agentops operator-tail <run-id> --lines 200` to confirm the stall, then `agentops operator-retry <run-id>` or `agentops operator-stop <run-id>`. |
+| `missing_result` | Executor exited 0 but never printed `AGENTOPS_RESULT_JSON`. | `agentops operator-tail <run-id> --lines 200`; re-run the prompt with a closing `AGENTOPS_RESULT_JSON` block after real work. |
+| `template_result` | Executor printed a placeholder like `"done|blocked"` before producing a real result. | `agentops operator-tail <run-id> --lines 200` to confirm the stub; re-run the prompt. |
+| `blocked_by_policy` | Per-task policy violation (allowed/forbidden files, protected branch, etc.). The task transitioned to `BLOCKED` and the event `task.blocked_by_policy` was recorded. | `agentops status` to find the task, then `agentops logs <task-id>` for the policy JSON. |
+
+These five categories are the same set `docs/failure-modes.md`
+documents for the operator-run harness and the gated orchestrator.
+When the panel surfaces a row, click the run id in the "Operator runs
+(monitor)" card to load the latest attempt's `combined.log` (Tail
+button → `/api/operator-runs/<id>/tail?lines=200`), then run the
+matching CLI command from this table.
+
 ## Recommended workflow
 
 The recommended operator loop is still CLI-first; the UI is a read-mostly
