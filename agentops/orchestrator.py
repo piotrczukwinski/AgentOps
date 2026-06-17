@@ -543,7 +543,20 @@ class Orchestrator:
                 copy_allowed_files_back(runtime.mirror, target_worktree, task.allowed_files)
 
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.DIFF_COLLECTED)
-            diff = collect_diff(target_worktree, roadmap.repo.base_branch)
+            # Compute the diff against the task base SHA so the result is
+            # the *cumulative* task diff, not just the delta of the latest
+            # executor process. On repair attempts (REQUEST_CHANGES /
+            # validation failure) the previous attempt's changes still
+            # live in the worktree; using ``base_sha`` here keeps the
+            # diff non-empty so a no-op repair does not get falsely
+            # blocked by ``files.empty_diff``. The worktree itself is
+            # never recreated between attempts, so prior changes are
+            # preserved automatically.
+            diff = collect_diff(
+                target_worktree,
+                roadmap.repo.base_branch,
+                base_sha=runtime.base_sha,
+            )
             diff_patch_path = artifact_store.write_text(attempt_dir, "diff.patch", diff.patch)
             diff_stat_path = artifact_store.write_text(attempt_dir, "diff.stat", diff.stat)
             changed_path = artifact_store.write_text(
@@ -719,6 +732,7 @@ class Orchestrator:
                 attempt_dir=attempt_dir,
                 attempt_id=attempt_id,
                 artifact_store=artifact_store,
+                attempt_no=attempt_no,
             )
             runtime.review_verdict = verdict
 
@@ -852,10 +866,18 @@ class Orchestrator:
         attempt_dir: Path,
         attempt_id: str,
         artifact_store: ArtifactStore,
+        attempt_no: int,
     ) -> ReviewVerdict | None:
-        """Run the configured reviewer. Returns None on awaiting_review."""
+        """Run the configured reviewer. Returns None on awaiting_review.
+
+        ``attempt_no`` is included in the review packet so the reviewer
+        can distinguish the initial attempt from a repair attempt. This
+        matters on ``REQUEST_CHANGES`` repair loops where the diff is
+        cumulative and a no-op repair may legitimately see no new
+        changes since the prior attempt.
+        """
         review_prompt = PromptCompiler(self._policy_for(roadmap)).review_prompt(
-            task, diff, policy_result, validation
+            task, diff, policy_result, validation, attempt=attempt_no
         )
 
         # If the router decided not to call Codex, go straight to heuristic

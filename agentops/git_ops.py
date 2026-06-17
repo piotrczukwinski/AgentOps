@@ -94,7 +94,34 @@ def copy_allowed_files_back(mirror: Path, target_worktree: Path, allowed_files: 
             continue
 
 
-def collect_diff(repo: Path, base_ref: str = "HEAD") -> DiffSnapshot:
+def collect_diff(
+    repo: Path,
+    base_ref: str = "HEAD",
+    *,
+    base_sha: str | None = None,
+) -> DiffSnapshot:
+    """Build a :class:`DiffSnapshot` for ``repo`` against the task base.
+
+    ``base_ref`` is a label (branch name, ``HEAD``) that is stored on
+    the snapshot for downstream display. ``base_sha`` is the actual
+    commit SHA the diff is computed against and is the authoritative
+    knob for cumulative diffs across repair attempts.
+
+    When ``base_sha`` is provided the diff is the union of:
+
+    * working-tree and index changes from ``base_sha`` (``git diff
+      <base_sha>``) — this is what makes the diff cumulative across
+      attempts even when the executor did ``git add``;
+    * committed changes from ``base_sha`` to ``HEAD`` (because the
+      worktree's working tree contains the HEAD tree);
+    * untracked files (via ``ls-files --others --exclude-standard``).
+
+    Without ``base_sha`` the function falls back to the legacy
+    ``git diff --`` (working tree vs index) form so the existing
+    tests keep working. The orchestrator always passes
+    ``runtime.base_sha`` so repair attempts see the cumulative diff
+    even when the latest executor process did not edit any file.
+    """
     changed = run_git(repo, ["status", "--porcelain=v1"], check=True).stdout
     changed_files: list[str] = []
     name_status_lines: list[str] = []
@@ -119,8 +146,19 @@ def collect_diff(repo: Path, base_ref: str = "HEAD") -> DiffSnapshot:
             changed_files.append(path)
             name_status_lines.append(f"{status}\t{path}")
 
-    stat_tracked = run_git(repo, ["diff", "--stat", "--"], check=False).stdout
-    patch_tracked = run_git(repo, ["diff", "--binary", "--"], check=False).stdout
+    # Pick the diff comparison point. ``git diff <base_sha>`` includes
+    # both staged and unstaged changes since ``base_sha``; without a
+    # base SHA we fall back to the legacy working-tree-vs-index form.
+    if base_sha:
+        stat_tracked = run_git(
+            repo, ["diff", "--stat", base_sha, "--"], check=False
+        ).stdout
+        patch_tracked = run_git(
+            repo, ["diff", "--binary", base_sha, "--"], check=False
+        ).stdout
+    else:
+        stat_tracked = run_git(repo, ["diff", "--stat", "--"], check=False).stdout
+        patch_tracked = run_git(repo, ["diff", "--binary", "--"], check=False).stdout
 
     untracked_patches: list[str] = []
     untracked_stat_lines: list[str] = []
