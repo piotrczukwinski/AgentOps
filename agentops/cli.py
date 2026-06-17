@@ -165,6 +165,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Default: '5,15,45'."
         ),
     )
+    operator_run_cmd.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Watchdog timeout in seconds. If the active combined.log does not grow "
+            "for this many seconds while the process is still alive, terminate the "
+            "process group and mark the run with status 'needs_operator' and "
+            "reason 'idle_timeout'. Default: no idle timeout."
+        ),
+    )
 
     operator_status_cmd = sub.add_parser(
         "operator-status",
@@ -172,13 +183,24 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Read the durable status of every .operator-runs/<run-id>/ directory "
             "(or the single one named by --run-id) and report whether the pid is "
-            "still alive, the recorded exit_code, and the timestamps. When a "
-            "status.json says ``running`` but the pid is gone, the runtime is "
-            "reported as ``exited`` so stale 'running' entries do not mislead the operator."
+            "still alive, the recorded exit_code, the active attempt's combined.log, "
+            "and the wall-clock idle time. When a status.json says 'running' but the "
+            "pid is gone, the runtime is reported as 'stale_pid' (with the legacy "
+            "'exited' label preserved in 'runtime_status_alias' for backward "
+            "compatibility) so stale 'running' entries do not mislead the operator. "
+            "Use --format json to consume the same fields from a web/admin panel."
         ),
     )
     operator_status_cmd.add_argument("--dir", default=".", help="Working directory that owns .operator-runs/. Default: current directory.")
     operator_status_cmd.add_argument("--run-id", default=None, help="Inspect a single run id. Default: list all runs.")
+    operator_status_cmd.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format. 'text' (default) prints a one-line summary per run; "
+        "'json' prints a JSON object with the fields the web/admin panel can "
+        "consume. With --format json and no --run-id, the output is a JSON array.",
+    )
 
     operator_tail_cmd = sub.add_parser(
         "operator-tail",
@@ -265,6 +287,40 @@ def build_parser() -> argparse.ArgumentParser:
             "retry prompt, even if the working directory is a git repo with "
             "uncommitted changes. Default: append the hint."
         ),
+    )
+
+    operator_stop_cmd = sub.add_parser(
+        "operator-stop",
+        help="Terminate a running operator run safely.",
+        description=(
+            "Read the recorded pid for a run, terminate its process group "
+            "(SIGTERM, then SIGKILL after a short timeout), and update "
+            "status.json so the run is reported as 'stopped' with a "
+            "stopped_at timestamp and a stop_reason. Use --force to skip "
+            "SIGTERM and go straight to SIGKILL. Use --reason to record a "
+            "custom stop_reason (default 'operator_stop'). The command "
+            "never kills the harness's own process group."
+        ),
+    )
+    operator_stop_cmd.add_argument("run_id", help="Run id to stop (the directory name under .operator-runs/).")
+    operator_stop_cmd.add_argument("--dir", default=".", help="Working directory that owns .operator-runs/. Default: current directory.")
+    operator_stop_cmd.add_argument("--force", action="store_true", help="Skip SIGTERM and send SIGKILL immediately.")
+    operator_stop_cmd.add_argument(
+        "--reason",
+        default=None,
+        help="Optional human-readable reason recorded as stop_reason in status.json. Default: 'operator_stop'.",
+    )
+    operator_stop_cmd.add_argument(
+        "--timeout",
+        type=float,
+        default=5.0,
+        help="How long to wait (seconds) for the process group to exit after SIGTERM before escalating to SIGKILL. Default: 5.",
+    )
+    operator_stop_cmd.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format. 'text' (default) prints a one-line summary; 'json' prints a JSON object with the persisted fields.",
     )
 
     serve = sub.add_parser("serve", help="Start the local AgentOps web UI (local-only, default 127.0.0.1:8765).")
@@ -407,6 +463,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "operator-retry":
             return _cmd_operator_retry(args)
+
+        if args.command == "operator-stop":
+            return _cmd_operator_stop(args)
 
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
@@ -1029,6 +1088,8 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
     from .operator_run import (
         DEFAULT_MAX_RETRIES,
         DEFAULT_RETRY_BACKOFF,
+        NEEDS_OPERATOR_STATUS,
+        TRANSIENT_FAILED_STATUS,
         parse_backoff,
         run_detached,
         run_foreground,
@@ -1093,6 +1154,9 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
             f"operator-run: retry_on_transient max_retries={args.max_retries} "
             f"backoff={','.join(str(s) for s in backoff)}s"
         )
+    idle_timeout = getattr(args, "idle_timeout", None)
+    if idle_timeout is not None:
+        print(f"operator-run: idle_timeout={idle_timeout}s")
 
     if spec.detach:
         run_detached(spec, target, argv)
@@ -1110,9 +1174,12 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
             max_retries=int(args.max_retries or 0),
             backoff=backoff,
             retry_on_transient=True,
+            idle_timeout=idle_timeout,
         )
     else:
-        payload = run_foreground(spec, target, argv)
+        payload = run_foreground(
+            spec, target, argv, idle_timeout=idle_timeout
+        )
 
     # Always print the final result (or a clear "not found" note) so the
     # operator can copy/paste it into a status report without rerunning
@@ -1123,7 +1190,7 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
         print(result_path.read_text(encoding="utf-8"))
     else:
         transient_reason = payload.get("transient_reason")
-        if payload.get("status") == "transient_failed":
+        if payload.get("status") == TRANSIENT_FAILED_STATUS:
             print(
                 f"operator-run: status=transient_failed exit_code={payload.get('exit_code')} "
                 f"transient_reason={transient_reason or 'unknown'} "
@@ -1131,18 +1198,31 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
                 f"Inspect the log with 'agentops operator-tail {spec.run_id}' and try "
                 f"'agentops operator-retry {spec.run_id}' once the upstream is healthy."
             )
+        elif payload.get("status") == NEEDS_OPERATOR_STATUS and payload.get("error") == "idle_timeout":
+            print(
+                f"operator-run: status=needs_operator exit_code={payload.get('exit_code')} "
+                f"reason=idle_timeout idle_for_seconds={payload.get('idle_for_seconds')} "
+                f"idle_timeout={payload.get('idle_timeout')}s. "
+                f"Inspect the log with 'agentops operator-tail {spec.run_id}' and "
+                f"recover with 'agentops operator-retry {spec.run_id}'."
+            )
         else:
             print(
                 f"operator-run: exit_code={payload.get('exit_code')} no AGENTOPS_RESULT_JSON found in combined.log. "
                 f"Run 'agentops operator-result {spec.run_id}' to retry extraction."
             )
-    if payload.get("status") == "transient_failed":
+    if payload.get("status") == TRANSIENT_FAILED_STATUS:
         return 75  # conventional "temp fail" exit code
+    if payload.get("status") == NEEDS_OPERATOR_STATUS and payload.get("error") == "idle_timeout":
+        # The idle watchdog is not a retryable failure: the operator
+        # must inspect the log or rerun manually. Use 1 so the
+        # exit-code convention stays simple.
+        return 1
     return 0 if payload.get("exit_code") == 0 else 1
 
 
 def _cmd_operator_status(args: argparse.Namespace) -> int:
-    from .operator_run import format_status_line, latest_combined_log, list_status
+    from .operator_run import format_status_json, format_status_line, list_status
 
     root = _operator_run_root(args)
     if not root.exists():
@@ -1159,16 +1239,44 @@ def _cmd_operator_status(args: argparse.Namespace) -> int:
         if args.run_id:
             print(f"operator-status: no run with id {args.run_id!r} under {root}", file=sys.stderr)
             return 2
+        if getattr(args, "format", "text") == "json":
+            print("[]")
+            return 0
         print(f"No operator runs under {root / '.operator-runs'}. Start one with 'agentops operator-run --prompt-file <path>'.")
+        return 0
+
+    if getattr(args, "format", "text") == "json":
+        rows = []
+        for _, payload in entries:
+            json_payload = format_status_json(payload)
+            json_payload["result_json_present"] = bool(payload.get("result_json_present"))
+            rows.append(json_payload)
+        if args.run_id is not None and len(rows) == 1:
+            print(json.dumps(rows[0], indent=2, sort_keys=True))
+        else:
+            print(json.dumps(rows, indent=2, sort_keys=True))
         return 0
 
     for run_dir_path, payload in entries:
         print(format_status_line(payload))
         result_path = run_dir_path / "result.json"
-        combined_log = latest_combined_log(run_dir_path)
+        active_log = payload.get("active_combined_log") or "-"
         print(f"  prompt={payload.get('prompt_path', '-')}")
-        print(f"  combined_log={combined_log}")
+        print(f"  active_attempt={payload.get('active_attempt') or '-'}")
+        print(f"  active_combined_log={active_log}")
+        print(f"  log_size_bytes={payload.get('log_size_bytes', 0)}")
+        last_log_at = payload.get("last_log_at") or "-"
+        print(f"  last_log_at={last_log_at}")
+        idle = payload.get("idle_for_seconds")
+        if idle is not None:
+            print(f"  idle_for_seconds={idle}")
         print(f"  result_json={'present' if result_path.exists() else 'absent'}")
+        pid_alive = payload.get("pid_alive")
+        if pid_alive is not None:
+            print(f"  pid_alive={bool(pid_alive)}")
+        suggested = payload.get("suggested_action")
+        if suggested:
+            print(f"  suggested_action={suggested}")
         note = payload.get("runtime_status_note")
         if note:
             print(f"  note={note}")
@@ -1202,6 +1310,7 @@ def _cmd_operator_tail(args: argparse.Namespace) -> int:
 def _cmd_operator_result(args: argparse.Namespace) -> int:
     from .operator_run import (
         ResultNotFound,
+        TemplateResultRejected,
         latest_combined_log,
         resolve_run,
         write_result,
@@ -1221,8 +1330,28 @@ def _cmd_operator_result(args: argparse.Namespace) -> int:
     # Try the most recent attempt first, then fall back to the top-level
     # combined.log. The status overlay helps us give the operator useful
     # hints when the result is missing because the run failed transiently.
+    # Template placeholder results are surfaced separately so the
+    # operator knows the executor printed a stub and not a real result.
     try:
         payload = _extract_latest_result(target)
+    except TemplateResultRejected as exc:
+        status_payload = _read_status_or_none(target)
+        print(f"operator-result: {exc}", file=sys.stderr)
+        if status_payload is not None:
+            print(
+                f"  run_status={status_payload.get('status')} exit_code={status_payload.get('exit_code')} "
+                f"attempts={status_payload.get('attempt') or 1} "
+                f"active_combined_log={latest_combined_log(target)}",
+                file=sys.stderr,
+            )
+        print(
+            "Hint: the executor printed an AGENTOPS_RESULT_JSON block that looks like a "
+            "template/placeholder (e.g. 'done|blocked' or '...') before producing a real "
+            "result. Resume the run with 'agentops operator-retry <run-id>' or rerun the "
+            "prompt with a closing marker after the executor has done real work.",
+            file=sys.stderr,
+        )
+        return 1
     except ResultNotFound as exc:
         status_payload = _read_status_or_none(target)
         if status_payload is not None and status_payload.get("status") in {"transient_failed", "needs_operator"}:
@@ -1259,20 +1388,42 @@ def _cmd_operator_result(args: argparse.Namespace) -> int:
 
 
 def _extract_latest_result(run_dir_path: Path) -> dict[str, Any]:
-    """Try the latest attempt's combined.log first, then the top-level one."""
+    """Try the latest attempt's combined.log first, then the top-level one.
+
+    The function prefers the latest attempt directory when one exists so
+    that ``operator-result`` always reads what the executor most recently
+    wrote. Template placeholder results are caught here and re-raised as
+    :class:`TemplateResultRejected` so the CLI can show a clear error.
+    """
     from .operator_run import (
         ResultNotFound,
+        TemplateResultRejected,
         extract_result,
         latest_attempt_dir,
     )
 
+    errors: list[Exception] = []
     latest = latest_attempt_dir(run_dir_path)
-    if latest is not None:
+    candidates = [latest, run_dir_path] if latest is not None else [run_dir_path]
+    # Deduplicate while preserving order so a one-attempt run does not
+    # double-parse the top-level log.
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         try:
-            return extract_result(latest)
-        except ResultNotFound:
-            pass
-    return extract_result(run_dir_path)
+            return extract_result(candidate)
+        except (ResultNotFound, TemplateResultRejected) as exc:
+            errors.append(exc)
+    # Re-raise the most specific error: a template placeholder is more
+    # informative than a missing marker.
+    for err in errors:
+        if isinstance(err, TemplateResultRejected):
+            raise err
+    if errors:
+        raise errors[0]
+    raise ResultNotFound(f"No combined.log under {run_dir_path}")
 
 
 def _read_status_or_none(run_dir_path: Path) -> dict[str, Any] | None:
@@ -1461,6 +1612,47 @@ def _cmd_operator_retry(args: argparse.Namespace) -> int:
     if payload.get("status") in {"transient_failed", "needs_operator"}:
         return 75
     return 0 if payload.get("exit_code") == 0 else 1
+
+
+def _cmd_operator_stop(args: argparse.Namespace) -> int:
+    from .operator_run import (
+        format_status_json,
+        resolve_run,
+        stop_run,
+    )
+
+    root = _operator_run_root(args)
+    if not root.exists():
+        print(f"Workdir does not exist: {root}", file=sys.stderr)
+        return 2
+
+    try:
+        target = resolve_run(root, args.run_id)
+    except FileNotFoundError as exc:
+        print(f"operator-stop: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        payload = stop_run(
+            target,
+            force=bool(args.force),
+            reason=args.reason,
+            timeout=float(args.timeout),
+        )
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        print(f"operator-stop: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"operator-stop: run_id={payload.get('run_id') or args.run_id}")
+    print(f"operator-stop: status={payload.get('status')}")
+    print(f"operator-stop: stop_reason={payload.get('stop_reason')}")
+    if payload.get("stopped_at"):
+        print(f"operator-stop: stopped_at={payload.get('stopped_at')}")
+    if payload.get("pid") is not None:
+        print(f"operator-stop: pid={payload.get('pid')} (was_alive={payload.get('stopped_pid_was_alive')}, is_alive_after={payload.get('stopped_pid_is_alive_after')})")
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(format_status_json(payload), indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":

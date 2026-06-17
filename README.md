@@ -166,8 +166,10 @@ Inspect or recover the run from a different terminal with:
 
 ```bash
 python -m agentops operator-status --dir /home/czuki/AgentOps
+python -m agentops operator-status --run-id <id> --format json   # for the web/admin panel
 python -m agentops operator-tail <run-id> --dir /home/czuki/AgentOps --lines 200
 python -m agentops operator-result <run-id> --dir /home/czuki/AgentOps
+python -m agentops operator-stop <run-id> --dir /home/czuki/AgentOps   # SIGTERM, then SIGKILL
 ```
 
 A detached run survives a terminal close; a foreground run leaves
@@ -195,13 +197,58 @@ python -m agentops operator-retry <run-id> --dir /home/czuki/AgentOps \
   --retry-on-transient
 ```
 
-`operator-status` reports the canonical status (`succeeded`,
-`failed`, `transient_failed`, `needs_operator`, `retry_waiting`,
-`retrying`, etc.), the attempt counter, the last transient reason,
-and the most recent attempt's log path. `operator-result` extracts
-the `AGENTOPS_RESULT_JSON` from the latest attempt's `combined.log`
-and falls back to the top-level log for old runs. See
-`docs/operator-run-harness.md` for the full procedure.
+### Hung / stalled operator protection
+
+Long runs can wedge because the executor is waiting on a network
+call that never completes, or because the model API returned a
+token and silently hung. The harness has first-class protection for
+that:
+
+* **`--idle-timeout SECONDS`** runs a background watchdog on every
+  attempt. If the active `combined.log` has not grown for that
+  many seconds while the process is still alive, the watchdog
+  terminates the process group and the run is marked
+  `needs_operator` with reason `idle_timeout`. The watchdog never
+  auto-retries; the operator is expected to inspect the log and
+  run `operator-retry` themselves.
+* **`operator-status`** detects stale pids (the persisted status
+  says `running` but the recorded pid is gone) and reports them
+  with `runtime_status=stale_pid`, `pid_alive=false`, and a
+  `suggested_action=operator-retry` hint. The legacy
+  `exited`/`succeeded`/`failed` label is preserved in
+  `runtime_status_alias` for backward compatibility.
+* **`operator-status --format json`** is the contract for the
+  future admin web panel. The output includes the active attempt,
+  the active `combined.log` path/size/mtime, `idle_for_seconds`,
+  `pid_alive`, `result_json_present`, and `suggested_action`.
+* **`operator-tail`** and **`operator-result`** always read the
+  *latest* attempt's `combined.log` (falling back to the top-level
+  log for old single-attempt runs), so a stale top-level log can
+  no longer hide a fresh retry.
+* **`operator-result`** refuses to return a template placeholder
+  result (`"done|blocked"`, `"..."`, etc.) and exits non-zero with
+  a clear message, so the operator does not mistake a stub for a
+  real final answer.
+* **`operator-stop <run-id>`** safely terminates a wedged run,
+  records `stopped_at` and `stop_reason` in `status.json`, and
+  never kills the harness's own process group.
+
+The recommended command for long BusinessAgent / admin-web runs:
+
+```bash
+python -m agentops operator-run \
+  --name business-agent-batch-001 \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --detach \
+  --retry-on-transient \
+  --idle-timeout 600
+```
+
+See `docs/operator-run-harness.md` for the full procedure,
+including the JSON schema and the playbook for terminal disconnects,
+transient failures, stale pids, idle timeouts, and the admin web
+panel integration.
 
 ## Local browser UI
 

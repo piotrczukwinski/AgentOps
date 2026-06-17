@@ -22,6 +22,7 @@ the operator can point at a real ``opencode`` in production).
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import os
@@ -249,6 +250,13 @@ def write_status(
     transient: bool | None = None,
     next_retry_at: str | None = None,
     result_path: str | None = None,
+    stopped_at: str | None = None,
+    stop_reason: str | None = None,
+    stop_force: bool | None = None,
+    last_log_at: str | None = None,
+    idle_for_seconds: float | None = None,
+    idle_timeout: float | None = None,
+    idle_log_size_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Update ``status.json`` for a run.
 
@@ -305,6 +313,20 @@ def write_status(
         payload["next_retry_at"] = next_retry_at
     if result_path is not None:
         payload["result_path"] = result_path
+    if stopped_at is not None:
+        payload["stopped_at"] = stopped_at
+    if stop_reason is not None:
+        payload["stop_reason"] = stop_reason
+    if stop_force is not None:
+        payload["stop_force"] = bool(stop_force)
+    if last_log_at is not None:
+        payload["last_log_at"] = last_log_at
+    if idle_for_seconds is not None:
+        payload["idle_for_seconds"] = float(idle_for_seconds)
+    if idle_timeout is not None:
+        payload["idle_timeout"] = float(idle_timeout)
+    if idle_log_size_bytes is not None:
+        payload["idle_log_size_bytes"] = int(idle_log_size_bytes)
 
     status_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return payload
@@ -844,6 +866,259 @@ def _close_proc_handles(proc: subprocess.Popen[bytes]) -> None:
                 fh.close()
 
 
+# ---------------------------------------------------------------------------
+# Process group termination and idle watchdog
+# ---------------------------------------------------------------------------
+#
+# Operator runs are expected to outlive the controlling terminal (the
+# harness uses ``start_new_session=True`` when ``--detach`` is set). The
+# operator-stop and idle-watchdog code paths therefore talk to the whole
+# process *group* so they can reap the executor plus any helper children
+# the executor may have spawned (e.g. a model CLI that forks a sidecar).
+# We never fall back to ``os.killpg(os.getpgid(0), ...)``: that would
+# signal the harness itself. The harness always signals the *child* pid
+# (or its process group when one is available).
+
+IDLE_TIMEOUT_REASON = "idle_timeout"
+STOP_REASON = "operator_stop"
+
+
+def _get_pgid(pid: int) -> int | None:
+    """Return the process group id of ``pid`` or ``None`` if it cannot be determined."""
+    if pid <= 0:
+        return None
+    try:
+        return int(os.getpgid(pid))
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+
+
+def _harness_pgid() -> int | None:
+    """Return the harness's own process group id (``None`` if unavailable)."""
+    try:
+        return int(os.getpgid(0))
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+
+
+def _can_signal_pgid(pid: int) -> bool:
+    """Return True when it is safe to signal ``pid``'s process group.
+
+    It is only safe to signal the process group when it is *different*
+    from the harness's own process group. In a foreground run the
+    executor and the harness share a process group; killing the
+    process group would also kill the harness (and the test runner).
+    In detached runs the executor started a new session, so its
+    process group is different and it is safe to signal the whole
+    group.
+    """
+    pgid = _get_pgid(pid)
+    if pgid is None or pgid <= 0:
+        return False
+    harness_pgid = _harness_pgid()
+    return not (harness_pgid is not None and pgid == harness_pgid)
+
+
+def _terminate_pid(
+    pid: int,
+    *,
+    use_pg: bool = True,
+    signal_value: int = 15,  # SIGTERM
+) -> None:
+    """Send ``signal_value`` to ``pid`` or to its process group.
+
+    The function never raises; failures are swallowed because the caller
+    is usually racing with a process that is already exiting.
+    """
+    if pid <= 0:
+        return
+    target = pid
+    if use_pg and _can_signal_pgid(pid):
+        pgid = _get_pgid(pid)
+        if pgid is not None and pgid > 0:
+            target = pgid
+    try:
+        os.kill(target, signal_value)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+
+
+def terminate_process_group(
+    pid: int,
+    *,
+    timeout: float = 5.0,
+    force: bool = False,
+) -> bool:
+    """Terminate ``pid``'s process group, escalating to SIGKILL on timeout.
+
+    Returns ``True`` when the process (or its group leader) is no longer
+    alive when the call returns. ``force=True`` skips the SIGTERM phase
+    and goes straight to SIGKILL. The function never raises.
+
+    The function only signals the *whole* process group when the child
+    is in a different process group from the harness. In foreground
+    mode the executor and the harness share a process group; signalling
+    the group would also kill the harness. In that case the function
+    falls back to signalling the bare pid.
+    """
+    if pid <= 0:
+        return True
+    use_pg = _can_signal_pgid(pid)
+    if force:
+        if use_pg:
+            pgid = _get_pgid(pid)
+            with contextlib.suppress(Exception):  # noqa: BLE001 - best-effort
+                os.killpg(pgid, 9)
+        else:
+            _terminate_pid(pid, use_pg=False, signal_value=9)
+    else:
+        if use_pg:
+            pgid = _get_pgid(pid)
+            with contextlib.suppress(Exception):  # noqa: BLE001 - best-effort
+                os.killpg(pgid, 15)
+        else:
+            _terminate_pid(pid, use_pg=False, signal_value=15)
+
+    deadline = time.time() + max(0.0, float(timeout))
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.05)
+
+    # Escalate. Always SIGKILL on the process group when possible; that
+    # catches helper children that ignored SIGTERM.
+    if use_pg:
+        pgid = _get_pgid(pid)
+        with contextlib.suppress(Exception):  # noqa: BLE001 - best-effort
+            os.killpg(pgid, 9)
+    else:
+        _terminate_pid(pid, use_pg=False, signal_value=9)
+    deadline2 = time.time() + max(0.0, float(timeout))
+    while time.time() < deadline2:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    return not pid_alive(pid)
+
+
+class _IdleWatchdog:
+    """Background watchdog that kills a stalled foreground run.
+
+    The watchdog is created by :func:`run_attempt_foreground` when the
+    operator passes ``--idle-timeout``. It runs in a daemon thread and
+    polls the active combined.log every ``poll_interval`` seconds; if
+    the file's size has not changed for ``idle_timeout`` seconds *and*
+    the process is still alive, the watchdog terminates the process
+    group and flags the run as ``needs_operator`` with reason
+    ``idle_timeout``.
+
+    The watchdog never deletes logs, never auto-retries, and never
+    modifies the persisted ``status`` field directly. It only sets the
+    ``triggered`` flag and stores a small set of fields the foreground
+    function reads back via :attr:`last_log_size` and
+    :attr:`last_log_at`. The foreground function owns the
+    ``status.json`` writes so the on-disk state is consistent with the
+    exit semantics.
+    """
+
+    def __init__(
+        self,
+        *,
+        log_path: Path,
+        pid: int,
+        idle_timeout: float,
+        poll_interval: float = 1.0,
+        sleep_fn: Callable[[float], None] | None = None,
+    ) -> None:
+        if idle_timeout <= 0:
+            raise ValueError("idle_timeout must be > 0")
+        self.log_path = Path(log_path)
+        self.pid = int(pid)
+        self.idle_timeout = float(idle_timeout)
+        self.poll_interval = max(0.05, float(poll_interval))
+        self._sleep = sleep_fn if sleep_fn is not None else time.sleep
+        self._last_size: int = -1
+        self._last_growth_at: float = time.time()
+        self.triggered: bool = False
+        self.triggered_at: float | None = None
+        self.last_log_size: int = 0
+        self.last_log_at: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample(self) -> int | None:
+        stat = _safe_stat(self.log_path)
+        if stat is None:
+            return None
+        size, mtime = stat
+        if size != self._last_size:
+            self._last_size = size
+            self._last_growth_at = time.time()
+        self.last_log_size = size
+        self.last_log_at = mtime
+        return size
+
+    def _loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                self._sample()
+                if not pid_alive(self.pid):
+                    return
+                idle = time.time() - self._last_growth_at
+                if idle >= self.idle_timeout:
+                    # Process is still alive but the log has not grown.
+                    # Terminate the process group; the foreground
+                    # function will see the exit and consult the
+                    # ``triggered`` flag.
+                    terminate_process_group(self.pid, timeout=0.0)
+                    self.triggered = True
+                    self.triggered_at = time.time()
+                    return
+                # Sleep, but break out promptly on stop().
+                if self._stop.wait(self.poll_interval):
+                    return
+        except Exception:  # noqa: BLE001 - background watchdog, never raise
+            return
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._last_growth_at = time.time()
+        self._sample()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="agentops-idle-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.poll_interval * 2)
+
+
+def _read_idle_timeout_from_args(args: argparse.Namespace | None) -> float | None:
+    """Return the ``--idle-timeout`` value from ``args`` or ``None``.
+
+    Kept as a tiny helper so the CLI module can pass the raw ``argparse``
+    namespace to the foreground helpers without leaking argparse types
+    into the harness internals.
+    """
+    if args is None:
+        return None
+    value = getattr(args, "idle_timeout", None)
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return seconds
+
+
 def _append_combined(run_dir_path: Path, *, stdout_text: str, stderr_text: str) -> None:
     combined_log = run_dir_path / "combined.log"
     with combined_log.open("a", encoding="utf-8") as fh:
@@ -859,10 +1134,16 @@ def run_foreground(
     argv: list[str],
     *,
     env: dict[str, str] | None = None,
+    idle_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Run the executor in the foreground, writing status/logs/result.
 
     Returns the final ``status.json`` payload.
+
+    When ``idle_timeout`` is not ``None`` a background watchdog tracks
+    the active combined.log; if the log does not grow for that many
+    seconds the watchdog terminates the process group and the run is
+    finalised with status ``needs_operator`` and reason ``idle_timeout``.
     """
     proc = launch_run(spec, run_dir_path, argv, env=env)
     started_at: str = proc._agentops_started_at  # type: ignore[attr-defined]
@@ -872,6 +1153,11 @@ def run_foreground(
         spec=spec,
         pid=proc.pid,
         started_at=started_at,
+    )
+    watchdog = _start_idle_watchdog(
+        log_path=run_dir_path / "combined.log",
+        pid=proc.pid,
+        idle_timeout=idle_timeout,
     )
 
     try:
@@ -884,6 +1170,8 @@ def run_foreground(
                 proc.terminate()
             exit_code = proc.wait()
     finally:
+        if watchdog is not None:
+            watchdog.stop()
         # Always drain tee threads and close file handles so we do not
         # leak descriptors on errors. The tee threads exit when the
         # pipes see EOF after ``proc.wait()`` returns.
@@ -891,41 +1179,103 @@ def run_foreground(
         _close_proc_handles(proc)
 
     ended_at = utc_now()
+    idle_was_triggered = watchdog is not None and watchdog.triggered
     # Append a small banner to the combined log so operator-tail shows
     # the run finished marker even if the executor did not flush.
-    _append_combined(
-        run_dir_path,
-        stdout_text="",
-        stderr_text=f"\n[agentops] run finished exit_code={exit_code} at {ended_at}\n",
-    )
+    if idle_was_triggered:
+        extra = (
+            f"\n[agentops] run terminated by idle watchdog after "
+            f"{watchdog.idle_timeout:.0f}s without log growth "
+            f"(last size {watchdog.last_log_size} bytes) at {ended_at}\n"
+        )
+    else:
+        extra = f"\n[agentops] run finished exit_code={exit_code} at {ended_at}\n"
+    _append_combined(run_dir_path, stdout_text="", stderr_text=extra)
 
+    terminal_status, terminal_reason = _idle_terminal_status(
+        exit_code=exit_code, watchdog=watchdog
+    )
     payload = write_status(
         run_dir_path,
-        status="exited",
+        status=terminal_status,
         spec=spec,
         exit_code=exit_code,
         ended_at=ended_at,
+        error=terminal_reason,
+        **(_idle_status_kwargs(watchdog) or {}),
     )
 
     # Try to extract the structured result so the operator does not have to
     # grep the combined log manually. Failures here are non-fatal; the
-    # operator can rerun ``operator-result`` later.
+    # operator can rerun ``operator-result`` later. We also refuse
+    # template placeholder results so the operator does not mistake a
+    # stub for a real final answer.
     try:
         result = extract_result(run_dir_path)
-    except ResultNotFound:
+    except (ResultNotFound, TemplateResultRejected):
         return payload
 
     write_result(run_dir_path, result)
     payload["result_path"] = str(run_dir_path / "result.json")
     # Persist the result path in the status file as well.
-    write_status(
+    payload = write_status(
         run_dir_path,
-        status="exited",
+        status=terminal_status,
         spec=spec,
         exit_code=exit_code,
         ended_at=ended_at,
+        error=terminal_reason,
+        result_path=str(run_dir_path / "result.json"),
+        **(_idle_status_kwargs(watchdog) or {}),
     )
     return payload
+
+
+def _start_idle_watchdog(
+    *,
+    log_path: Path,
+    pid: int,
+    idle_timeout: float | None,
+) -> _IdleWatchdog | None:
+    """Start the idle watchdog if ``idle_timeout`` is set, else return ``None``."""
+    if idle_timeout is None or idle_timeout <= 0:
+        return None
+    watchdog = _IdleWatchdog(
+        log_path=log_path,
+        pid=pid,
+        idle_timeout=float(idle_timeout),
+    )
+    watchdog.start()
+    return watchdog
+
+
+def _idle_terminal_status(
+    *,
+    exit_code: int,
+    watchdog: _IdleWatchdog | None,
+) -> tuple[str, str | None]:
+    """Return the (terminal_status, error) pair to write after the attempt."""
+    if watchdog is not None and watchdog.triggered:
+        return (NEEDS_OPERATOR_STATUS, IDLE_TIMEOUT_REASON)
+    if exit_code == 0:
+        return (EXITED_STATUS, None)
+    return (EXITED_STATUS, None)
+
+
+def _idle_status_kwargs(watchdog: _IdleWatchdog | None) -> dict[str, Any] | None:
+    """Return extra ``write_status`` kwargs to record the watchdog state."""
+    if watchdog is None:
+        return None
+    out: dict[str, Any] = {}
+    if watchdog.last_log_at is not None:
+        out["last_log_at"] = datetime.fromtimestamp(
+            watchdog.last_log_at, tz=UTC
+        ).isoformat(timespec="seconds")
+    if watchdog.triggered:
+        out["idle_for_seconds"] = float(watchdog.idle_timeout)
+        out["idle_timeout"] = float(watchdog.idle_timeout)
+        out["idle_log_size_bytes"] = int(watchdog.last_log_size)
+    return out or None
 
 
 def run_detached(
@@ -997,6 +1347,7 @@ def run_attempt_foreground(
     log_dir: Path | None = None,
     env: dict[str, str] | None = None,
     attempt_status: str = RUNNING_STATUS,
+    idle_timeout: float | None = None,
 ) -> AttemptResult:
     """Run a single attempt and return its outcome.
 
@@ -1006,6 +1357,13 @@ def run_attempt_foreground(
     attempts are done. This split keeps the retry loop's status
     transitions explicit and prevents the final ``exited`` from being
     written before later attempts run.
+
+    When ``idle_timeout`` is not ``None`` the attempt is killed if its
+    ``combined.log`` does not grow for that many seconds; the returned
+    :class:`AttemptResult` records the watchdog's observations on its
+    ``classification.reason`` (``"idle_timeout"``) and on
+    ``exit_code=137`` so the retry loop can treat the attempt as
+    non-transient.
     """
     target_log_dir = log_dir if log_dir is not None else run_dir_path
     target_log_dir.mkdir(parents=True, exist_ok=True)
@@ -1019,6 +1377,11 @@ def run_attempt_foreground(
         started_at=started_at,
         attempt=attempt_no,
     )
+    watchdog = _start_idle_watchdog(
+        log_path=target_log_dir / "combined.log",
+        pid=proc.pid,
+        idle_timeout=idle_timeout,
+    )
 
     try:
         try:
@@ -1028,26 +1391,68 @@ def run_attempt_foreground(
                 proc.terminate()
             exit_code = proc.wait()
     finally:
+        if watchdog is not None:
+            watchdog.stop()
         _join_tee_threads(proc)
         _close_proc_handles(proc)
 
     ended_at = utc_now()
-    _append_combined(
-        target_log_dir,
-        stdout_text="",
-        stderr_text=f"\n[agentops] attempt {attempt_no} finished exit_code={exit_code} at {ended_at}\n",
-    )
+    idle_triggered = watchdog is not None and watchdog.triggered
+    if idle_triggered:
+        _append_combined(
+            target_log_dir,
+            stdout_text="",
+            stderr_text=(
+                f"\n[agentops] attempt {attempt_no} terminated by idle watchdog after "
+                f"{watchdog.idle_timeout:.0f}s without log growth "
+                f"(last size {watchdog.last_log_size} bytes) at {ended_at}\n"
+            ),
+        )
+        # Persist the watchdog state on the run-level status.json so a
+        # later ``operator-status`` query can see why the run stopped.
+        _idle_status_kwargs_dict = _idle_status_kwargs(watchdog)
+        if _idle_status_kwargs_dict is not None:
+            write_status(
+                run_dir_path,
+                status=attempt_status,
+                spec=spec,
+                pid=proc.pid,
+                started_at=started_at,
+                attempt=attempt_no,
+                error=IDLE_TIMEOUT_REASON,
+                **_idle_status_kwargs_dict,
+            )
+        # SIGKILL convention; the actual kill is SIGTERM in the watchdog
+        # but the exit code is reported as 137 so it is easy to spot.
+        reported_exit_code = 137
+    else:
+        _append_combined(
+            target_log_dir,
+            stdout_text="",
+            stderr_text=(
+                f"\n[agentops] attempt {attempt_no} finished exit_code={exit_code} at {ended_at}\n"
+            ),
+        )
+        reported_exit_code = int(exit_code)
     stdout_text, stderr_text = _read_attempt_log(target_log_dir)
+    classification: TransientClassification
+    if idle_triggered:
+        # Idle terminations are never transient: a stalled run will not
+        # recover on its own, so we want the retry loop (if any) to stop
+        # and the operator to be told to inspect the run.
+        classification = TransientClassification(transient=False, reason=IDLE_TIMEOUT_REASON)
+    else:
+        classification = classify_transient(int(exit_code), stdout_text, stderr_text)
     return AttemptResult(
         attempt_no=attempt_no,
-        exit_code=int(exit_code),
+        exit_code=reported_exit_code,
         started_at=started_at,
         ended_at=ended_at,
         pid=int(proc.pid),
         log_dir=target_log_dir,
         stdout_text=stdout_text,
         stderr_text=stderr_text,
-        classification=classify_transient(int(exit_code), stdout_text, stderr_text),
+        classification=classification,
     )
 
 
@@ -1076,6 +1481,7 @@ def run_foreground_with_retries(
     on_attempt: Callable[[AttemptResult], None] | None = None,
     start_log_dir: Path | None = None,
     start_attempt_no: int = 1,
+    idle_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Run the executor in the foreground with optional transient retry.
 
@@ -1092,6 +1498,11 @@ def run_foreground_with_retries(
     ``start_attempt_no=N`` so attempt N's logs are written to the
     per-attempt subdirectory.
 
+    When ``idle_timeout`` is not ``None`` every attempt is wrapped in an
+    idle watchdog. Idle terminations are *not* considered transient; the
+    retry loop stops immediately and the run is finalised with status
+    ``needs_operator`` and reason ``idle_timeout``.
+
     Returns the final ``status.json`` payload. The terminal status is:
 
     * ``exited`` (canonical: ``succeeded`` / ``failed``) when the last
@@ -1099,6 +1510,7 @@ def run_foreground_with_retries(
     * ``transient_failed`` (or ``needs_operator`` if the operator
       explicitly opted into the operator-attention status) when the
       retry budget was exhausted on a transient failure.
+    * ``needs_operator`` when the idle watchdog fired.
     """
     backoff_schedule = list(backoff) if backoff else list(DEFAULT_RETRY_BACKOFF)
     sleep = sleep_fn if sleep_fn is not None else time.sleep
@@ -1148,6 +1560,7 @@ def run_foreground_with_retries(
             log_dir=log_dir,
             env=env,
             attempt_status=attempt_status,
+            idle_timeout=idle_timeout,
         )
         if on_attempt is not None:
             on_attempt(result)
@@ -1167,7 +1580,8 @@ def run_foreground_with_retries(
             },
         )
 
-        # Decide whether to stop or retry.
+        # Decide whether to stop or retry. Idle terminations are never
+        # retried: a stalled run will not recover on its own.
         if not retry_on_transient or result.classification.transient is not True:
             break
         # The retry budget is in *additional* attempts after
@@ -1202,8 +1616,10 @@ def _finalize_attempts(
     """Write the terminal status and try to extract the result.
 
     If the last attempt was a transient failure with the retry budget
-    exhausted, the terminal status is ``transient_failed``. The caller
-    can later inspect the run with ``operator-status`` to see the
+    exhausted, the terminal status is ``transient_failed``. If the
+    last attempt was killed by the idle watchdog the terminal status
+    is ``needs_operator`` with reason ``idle_timeout``. The caller can
+    later inspect the run with ``operator-status`` to see the
     classified reason and use ``operator-retry`` to start over.
     """
     classification = last.classification
@@ -1212,13 +1628,18 @@ def _finalize_attempts(
         and classification.transient is True
         and last.exit_code != 0
     )
+    is_idle_termination = classification.reason == IDLE_TIMEOUT_REASON
     terminal_status = EXITED_STATUS
+    error: str | None = None
     if is_transient_exhaustion:
         # The spec lets the CLI choose between ``transient_failed`` and
         # ``needs_operator``. We default to ``transient_failed``; the CLI
         # sets the runtime overlay to ``needs_operator`` when the operator
         # explicitly asks for that state via ``operator-retry``.
         terminal_status = TRANSIENT_FAILED_STATUS
+    elif is_idle_termination:
+        terminal_status = NEEDS_OPERATOR_STATUS
+        error = IDLE_TIMEOUT_REASON
 
     payload = write_status(
         run_dir_path,
@@ -1232,6 +1653,7 @@ def _finalize_attempts(
         retry_on_transient=retry_on_transient,
         transient_reason=classification.reason,
         transient=classification.transient,
+        error=error,
     )
 
     # Try to extract the structured result from the most recent attempt
@@ -1240,7 +1662,7 @@ def _finalize_attempts(
     for candidate in (last.log_dir, run_dir_path):
         try:
             result = extract_result(candidate)
-        except ResultNotFound:
+        except (ResultNotFound, TemplateResultRejected):
             continue
         write_result(run_dir_path, result)
         payload["result_path"] = str(run_dir_path / "result.json")
@@ -1256,6 +1678,7 @@ def _finalize_attempts(
             retry_on_transient=retry_on_transient,
             transient_reason=classification.reason,
             transient=classification.transient,
+            error=error,
             result_path=str(run_dir_path / "result.json"),
         )
         break
@@ -1446,6 +1869,17 @@ class ResultNotFound(RuntimeError):
     """Raised when no AGENTOPS_RESULT_JSON block can be located in a log."""
 
 
+class TemplateResultRejected(RuntimeError):
+    """Raised when the extracted ``AGENTOPS_RESULT_JSON`` looks like a template.
+
+    The executor sometimes prints a placeholder result (for example
+    ``"done|blocked"`` or ``"..."``) before the run has actually produced a
+    real result. These placeholders are *valid JSON values* but they are
+    not real results, so :func:`extract_result` (and the
+    ``operator-result`` CLI command) refuse to return them.
+    """
+
+
 # Match a line that *starts* a JSON value, possibly preceded by whitespace.
 # The executor may print the marker on its own line, in a banner like
 # ``AGENTOPS_RESULT_JSON: { ... }`` (single line) or
@@ -1467,6 +1901,12 @@ def extract_result(run_dir_path: Path) -> dict[str, Any]:
     * trailing text after the JSON, *if* that trailing text does not contain
       a closing brace that would unbalance the parsed object. (We simply
       consume as much as ``json.loads`` will accept.)
+
+    The function refuses to return a "template" placeholder result (see
+    :func:`is_template_placeholder_result`). A run that prints
+    ``AGENTOPS_RESULT_JSON: "done|blocked"`` is treated as if no result
+    was produced at all and the caller is expected to surface a clear
+    "template result rejected" error to the operator.
     """
     log = run_dir_path / "combined.log"
     if not log.exists():
@@ -1483,18 +1923,80 @@ def extract_result(run_dir_path: Path) -> dict[str, Any]:
 
     # Try each header from last to first; the most recent one is preferred,
     # but if its body is not parseable we still report the last good result
-    # by falling through to earlier matches.
+    # by falling through to earlier matches. We also try to skip template
+    # placeholder results and report a clearer error in that case.
+    last_template: str | None = None
     for header in reversed(matches):
         body = _slice_json_body(text, header.end(), header_match=header)
         if body is None:
             continue
         try:
-            return json.loads(body)
+            payload = json.loads(body)
         except json.JSONDecodeError:
             continue
+        if is_template_placeholder_result(payload):
+            last_template = body.strip()
+            continue
+        if isinstance(payload, dict):
+            return payload
+        # Non-dict top-level JSON values are accepted as the result.
+        # Wrap them in a dict so downstream code can treat all results
+        # uniformly. The wrap records the original JSON type for
+        # diagnostics.
+        return {"value": payload, "_wrapped": True}
+    if last_template is not None:
+        raise TemplateResultRejected(
+            f"AGENTOPS_RESULT_JSON in {log} is a template placeholder "
+            f"({last_template!r}); the executor printed a stub before "
+            "producing a real result."
+        )
     raise ResultNotFound(
         f"Found {RESULT_MARKER} header(s) in {log} but no complete JSON block followed them"
     )
+
+
+# Strings that look like a placeholder the executor prints when it has
+# not produced a real result yet. The list is intentionally narrow and
+# deterministic; adding new entries here is the only way to widen the
+# set of recognised placeholders.
+_TEMPLATE_PLACEHOLDER_STRINGS = {
+    "...",
+    "todo",
+    "tbd",
+    "pending",
+    "none",
+    "null",
+    "done|blocked",
+    "passed|awaiting_review|failed|blocked",
+    "passed|awaiting_review|failed",
+    "passed|failed",
+    "done|blocked|needs_review",
+}
+
+
+def is_template_placeholder_result(payload: Any) -> bool:
+    """Return True if ``payload`` looks like a template/placeholder result.
+
+    A run is considered to have produced a *template* result (rather
+    than a real one) when the parsed JSON is one of:
+
+    * a non-dict value whose string representation matches a known
+      placeholder (``"..."``, ``"done|blocked"``, etc.),
+    * a dict whose ``status`` field matches a placeholder.
+    """
+    if isinstance(payload, str):
+        return payload.strip().lower() in _TEMPLATE_PLACEHOLDER_STRINGS
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        if isinstance(status, str) and status.strip().lower() in _TEMPLATE_PLACEHOLDER_STRINGS:
+            return True
+        # A dict with only one field that is itself a placeholder string
+        # is also treated as a template.
+        if len(payload) == 1:
+            only_value = next(iter(payload.values()))
+            if isinstance(only_value, str) and only_value.strip().lower() in _TEMPLATE_PLACEHOLDER_STRINGS:
+                return True
+    return False
 
 
 def _slice_json_body(
@@ -1525,13 +2027,18 @@ def _slice_json_body(
         if line_end == -1:
             line_end = n
         # The marker text itself is between the match start (which already
-        # includes the leading whitespace on the line) and the end of the
-        # marker token. ``re.search`` on the same line is the most robust
+        # includes the leading whitespace on the line) and the end of
+        # the marker token. ``re.search`` on the same line is the most robust
         # way to find where the JSON value starts.
         line_text = text[line_start:line_end]
         marker_token_end = line_text.find(RESULT_MARKER) + len(RESULT_MARKER)
         after_marker = line_text[marker_token_end:]
-        for ch in ("{", "["):
+        # ``raw_decode`` can consume any JSON value, including a quoted
+        # string. We only need the first non-whitespace character; the
+        # actual decoding is handled below. Looking for the first
+        # value-starting character keeps us anchored to the marker line
+        # even when the body starts on the next line.
+        for ch in ("{", "[", '"'):
             idx = after_marker.find(ch)
             if idx != -1:
                 start = line_start + marker_token_end + idx
@@ -1608,6 +2115,98 @@ def _read_status_payload(run_dir_path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _safe_stat(path: Path) -> tuple[int, float] | None:
+    """Return ``(size, mtime)`` for ``path`` or ``None`` if it is missing/unreadable."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    return (int(st.st_size), float(st.st_mtime))
+
+
+def _active_log_info(run_dir_path: Path) -> dict[str, Any]:
+    """Return metadata about the run's currently-active combined.log.
+
+    The active log is the latest attempt's ``combined.log`` when one
+    exists, falling back to the top-level ``combined.log``. The metadata
+    is used by both the status overlay (so a JSON consumer can see which
+    log to tail) and by the idle watchdog (which needs the size and mtime
+    to decide whether the run is still making progress).
+    """
+    latest = latest_attempt_dir(run_dir_path)
+    if latest is not None:
+        candidate = latest / "combined.log"
+        stat = _safe_stat(candidate)
+        if stat is not None:
+            attempt_no: int | None
+            try:
+                attempt_no = int(latest.name)
+            except ValueError:
+                attempt_no = None
+            return {
+                "active_attempt": attempt_no,
+                "active_combined_log": str(candidate),
+                "log_size_bytes": stat[0],
+                "last_log_at": stat[1],
+            }
+    top = run_dir_path / "combined.log"
+    stat = _safe_stat(top)
+    if stat is None:
+        return {
+            "active_attempt": None,
+            "active_combined_log": None,
+            "log_size_bytes": 0,
+            "last_log_at": None,
+        }
+    # No attempts/ subdirectory exists yet; treat the top-level log as
+    # attempt 1 (the convention used by the retry loop).
+    return {
+        "active_attempt": 1 if latest is None else None,
+        "active_combined_log": str(top),
+        "log_size_bytes": stat[0],
+        "last_log_at": stat[1],
+    }
+
+
+def _idle_for_seconds(last_log_at: float | None) -> float | None:
+    """Return the wall-clock seconds since ``last_log_at`` (or ``None``)."""
+    if last_log_at is None:
+        return None
+    return max(0.0, time.time() - float(last_log_at))
+
+
+def _suggested_action(
+    *,
+    runtime_status: str,
+    canonical: str,
+    transient_reason: str | None,
+    idle_for_seconds: float | None,
+    idle_timeout: float | None,
+) -> str | None:
+    """Return a one-line operator hint based on the runtime state.
+
+    The hint is consumed by the CLI and the future admin web panel so
+    the operator does not have to remember the playbook for every
+    failure mode.
+    """
+    if runtime_status in {"exited_or_stale", "stale_pid"}:
+        return "operator-retry"
+    if (
+        runtime_status == RUNNING_STATUS
+        and idle_timeout is not None
+        and idle_for_seconds is not None
+        and idle_for_seconds >= float(idle_timeout)
+    ):
+        return "operator-tail then operator-stop"
+    if canonical == TRANSIENT_FAILED_STATUS and transient_reason:
+        return "operator-retry"
+    if canonical == NEEDS_OPERATOR_STATUS:
+        return "inspect log then operator-retry"
+    return None
+
+
 def _resolve_runtime_status(run_dir_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     """Overlay liveness on top of the persisted status.
 
@@ -1618,38 +2217,78 @@ def _resolve_runtime_status(run_dir_path: Path, payload: dict[str, Any]) -> dict
     statuses from PR #6 are normalised to the canonical names
     ``pending`` / ``succeeded`` / ``failed`` so the CLI output stays
     consistent across the two persistence formats.
+
+    The function also surfaces the *active* attempt's combined.log path,
+    size and mtime so the operator (and the future admin web panel) can
+    see at a glance which log to tail, and so the idle watchdog has a
+    canonical source of truth.
     """
     out = dict(payload)
     persisted = payload.get("status")
     canonical = normalize_status(persisted, payload.get("exit_code"))
     out["canonical_status"] = canonical
 
+    # Surface the active log metadata so the JSON output and the runtime
+    # status hint are both derived from the same data.
+    log_info = _active_log_info(run_dir_path)
+    out["active_attempt"] = log_info["active_attempt"]
+    out["active_combined_log"] = log_info["active_combined_log"]
+    out["log_size_bytes"] = log_info["log_size_bytes"]
+    last_log_at = log_info["last_log_at"]
+    if last_log_at is not None:
+        out["last_log_at"] = datetime.fromtimestamp(last_log_at, tz=UTC).isoformat(
+            timespec="seconds"
+        )
+    out["idle_for_seconds"] = _idle_for_seconds(last_log_at)
+
     pid = payload.get("pid")
+    pid_value: int | None = None
+    if pid is not None:
+        try:
+            pid_value = int(pid)
+        except (TypeError, ValueError):
+            pid_value = None
+    out["pid_alive"] = bool(pid_value is not None and pid_alive(pid_value))
+
     if pid is None:
         # No pid recorded; runtime_status mirrors the canonical state.
         if "runtime_status" not in out:
             out["runtime_status"] = canonical
+        out["suggested_action"] = _suggested_action(
+            runtime_status=out["runtime_status"],
+            canonical=canonical,
+            transient_reason=payload.get("transient_reason"),
+            idle_for_seconds=out.get("idle_for_seconds"),
+            idle_timeout=None,
+        )
         return out
 
     if persisted == RUNNING_STATUS:
         if not pid_alive(int(pid)):
             # We know the process is gone but the persisted file may not
             # have recorded an exit_code (the agent died before updating
-            # ``status.json``). Fall back to the legacy ``exited`` label
-            # so existing tests and the on-call playbook still work.
+            # ``status.json``). Surface a ``stale_pid`` runtime_status so
+            # the CLI and the future web panel do not report a dead run
+            # as healthy. The legacy ``exited`` label is kept as an alias
+            # in ``runtime_status`` for backward compatibility with
+            # downstream tooling that already special-cases it.
             exit_code = payload.get("exit_code")
+            canonical_exit: str
             if exit_code is None:
-                out["runtime_status"] = "exited"
+                canonical_exit = "exited"
             elif int(exit_code) == 0:
-                out["runtime_status"] = SUCCEEDED_STATUS
+                canonical_exit = SUCCEEDED_STATUS
             else:
-                out["runtime_status"] = FAILED_STATUS
+                canonical_exit = FAILED_STATUS
+            out["runtime_status"] = "stale_pid"
+            out["runtime_status_alias"] = canonical_exit
             out["runtime_status_note"] = "pid not alive; process may have been reaped"
         else:
             out["runtime_status"] = RUNNING_STATUS
     elif persisted in {"created", PENDING_STATUS, None}:
         if not pid_alive(int(pid)):
-            out["runtime_status"] = "unknown"
+            out["runtime_status"] = "stale_pid"
+            out["runtime_status_alias"] = "unknown"
             out["runtime_status_note"] = "pid not alive; pre-launch state"
         else:
             out["runtime_status"] = RUNNING_STATUS
@@ -1669,6 +2308,14 @@ def _resolve_runtime_status(run_dir_path: Path, payload: dict[str, Any]) -> dict
         # needs_operator, exited) runtime_status is the same as the
         # canonical status unless overridden.
         out.setdefault("runtime_status", canonical)
+
+    out["suggested_action"] = _suggested_action(
+        runtime_status=out.get("runtime_status", canonical),
+        canonical=canonical,
+        transient_reason=payload.get("transient_reason"),
+        idle_for_seconds=out.get("idle_for_seconds"),
+        idle_timeout=None,
+    )
     return out
 
 
@@ -1740,7 +2387,9 @@ def list_status(root: Path, *, run_id: str | None = None) -> list[tuple[Path, di
         if payload is None:
             payload = {"run_id": target.name, "status": "unknown", "name": None}
         enriched = _enrich_status(target, payload)
-        out.append((target, _resolve_runtime_status(target, enriched)))
+        overlaid = _resolve_runtime_status(target, enriched)
+        overlaid["result_json_present"] = (target / "result.json").exists()
+        out.append((target, overlaid))
     return out
 
 
@@ -1763,6 +2412,187 @@ def _enrich_status(run_dir_path: Path, payload: dict[str, Any]) -> dict[str, Any
     return out
 
 
+# ---------------------------------------------------------------------------
+# operator-stop and JSON status output
+# ---------------------------------------------------------------------------
+
+
+def _read_pid_from_status(run_dir_path: Path) -> int | None:
+    """Return the recorded pid from ``status.json`` or the ``pid`` file.
+
+    ``status.json`` is the source of truth (it is what the foreground
+    function writes) and the ``pid`` file is the legacy/detached-mode
+    record. We prefer ``status.json`` when it carries a pid; otherwise
+    we fall back to the ``pid`` file.
+    """
+    status_path = run_dir_path / "status.json"
+    if status_path.exists():
+        try:
+            data = json.loads(status_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            pid = data.get("pid")
+            if pid is not None:
+                try:
+                    return int(pid)
+                except (TypeError, ValueError):
+                    return None
+    return read_pid(run_dir_path)
+
+
+def stop_run(
+    run_dir_path: Path,
+    *,
+    force: bool = False,
+    reason: str | None = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Terminate a running operator run and update ``status.json``.
+
+    The function reads the recorded pid, terminates its process group
+    (with a fallback to the bare pid), and rewrites ``status.json`` so
+    the runtime overlay reports the run as ``stopped`` with
+    ``stopped_at`` and ``stop_reason``. The function never raises; a
+    "pid not alive" run is treated as already-stopped and still gets a
+    status update so the operator can see the manual action.
+    """
+    pid = _read_pid_from_status(run_dir_path)
+    spec = _read_status_payload(run_dir_path) or {}
+    run_id = str(spec.get("run_id") or run_dir_path.name)
+
+    alive = bool(pid is not None and pid_alive(int(pid)))
+    if alive:
+        terminate_process_group(int(pid), timeout=timeout, force=force)
+        alive_after = pid_alive(int(pid))
+    else:
+        alive_after = False
+
+    stopped_at = utc_now()
+    stop_reason = reason or STOP_REASON
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "status": "stopped",
+        "stopped_at": stopped_at,
+        "stop_reason": stop_reason,
+    }
+    if pid is not None:
+        payload["pid"] = int(pid)
+    if force:
+        payload["stop_force"] = True
+    # Persist the stop on disk. ``write_status`` keeps the existing
+    # fields (run_id, name, prompt_path, ...) so the operator does not
+    # lose context.
+    try:
+        from_spec = RunSpec(
+            name=spec.get("name"),
+            run_id=run_id,
+            prompt_path=Path(str(spec.get("prompt_path", run_dir_path / "prompt.md"))),
+            workdir=Path(str(spec.get("workdir", str(run_dir_path)))),
+            model=str(spec.get("model", DEFAULT_MODEL)),
+            runner=str(spec.get("runner", DEFAULT_RUNNER)),
+            yolo=bool(spec.get("yolo", False)),
+            detach=bool(spec.get("detach", False)),
+            created_at=str(spec.get("created_at", stopped_at)),
+        )
+    except (TypeError, ValueError):
+        from_spec = RunSpec(
+            name=spec.get("name") if isinstance(spec.get("name"), str) else None,
+            run_id=run_id,
+            prompt_path=run_dir_path / "prompt.md",
+            workdir=run_dir_path,
+            model=DEFAULT_MODEL,
+            runner=DEFAULT_RUNNER,
+            yolo=False,
+            detach=False,
+            created_at=str(spec.get("created_at", stopped_at)),
+        )
+    merged = write_status(
+        run_dir_path,
+        status="stopped",
+        spec=from_spec,
+        pid=pid,
+        stopped_at=stopped_at,
+        stop_reason=stop_reason,
+        **( {"stop_force": True} if force else {} ),
+    )
+    payload.update({k: v for k, v in merged.items() if k not in payload})
+    payload["pid_alive"] = bool(pid is not None and pid_alive(int(pid)))
+    payload["stopped_pid_was_alive"] = bool(alive)
+    payload["stopped_pid_is_alive_after"] = bool(alive_after)
+    return payload
+
+
+# JSON status fields that a web/admin panel can consume. The set is
+# intentionally narrow: the future web UI only needs the fields below to
+# render a status row and decide what action button to show. Everything
+# else stays inside the on-disk status.json.
+JSON_STATUS_FIELDS = (
+    "run_id",
+    "name",
+    "status",
+    "canonical_status",
+    "runtime_status",
+    "pid",
+    "pid_alive",
+    "attempt",
+    "max_retries",
+    "transient_reason",
+    "transient",
+    "exit_code",
+    "started_at",
+    "ended_at",
+    "updated_at",
+    "active_attempt",
+    "active_combined_log",
+    "log_size_bytes",
+    "last_log_at",
+    "idle_for_seconds",
+    "idle_timeout",
+    "stopped_at",
+    "stop_reason",
+    "result_path",
+    "suggested_action",
+    "runtime_status_note",
+    "runtime_status_alias",
+)
+
+
+def format_status_json(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project a status payload to the JSON-friendly schema.
+
+    The output is a plain dict with the same keys a web/admin panel
+    would consume. ``None`` values are dropped so the JSON is compact
+    and downstream code does not have to filter falsy values.
+    ``result_json_present`` is computed from the on-disk ``result.json``
+    when ``result_dir`` is supplied; otherwise the function assumes
+    ``result.json`` is the only result file.
+    """
+    out: dict[str, Any] = {}
+    for key in JSON_STATUS_FIELDS:
+        if key in payload and payload[key] is not None:
+            out[key] = payload[key]
+    if "result_json_present" in payload:
+        out["result_json_present"] = bool(payload.get("result_json_present"))
+    return out
+
+
+def _load_status_with_overlay(run_dir_path: Path) -> dict[str, Any]:
+    """Read ``status.json``, enrich and overlay runtime fields.
+
+    The result is the same payload the CLI and the future web UI should
+    consume: canonical + runtime status, active log fields, pid liveness
+    and the suggested action.
+    """
+    payload = _read_status_payload(run_dir_path)
+    if payload is None:
+        payload = {"run_id": run_dir_path.name, "status": "unknown", "name": None}
+    enriched = _enrich_status(run_dir_path, payload)
+    overlaid = _resolve_runtime_status(run_dir_path, enriched)
+    overlaid["result_json_present"] = (run_dir_path / "result.json").exists()
+    return overlaid
+
+
 __all__ = [
     "RESULT_MARKER",
     "DEFAULT_RUNNER",
@@ -1778,11 +2608,15 @@ __all__ = [
     "NEEDS_OPERATOR_STATUS",
     "RETRY_WAITING_STATUS",
     "RETRYING_STATUS",
+    "IDLE_TIMEOUT_REASON",
+    "STOP_REASON",
+    "TemplateResultRejected",
     "RETRY_CONFIG_FILENAME",
     "ATTEMPTS_DIRNAME",
     "ALL_PERSISTED_STATUSES",
     "CANONICAL_PERSISTED_STATUSES",
     "LEGACY_PERSISTED_STATUSES",
+    "JSON_STATUS_FIELDS",
     "RunSpec",
     "AttemptResult",
     "TransientClassification",
@@ -1794,10 +2628,12 @@ __all__ = [
     "build_resume_hint",
     "classify_transient",
     "extract_result",
+    "format_status_json",
     "format_status_line",
     "generate_run_id",
     "init_run_dir",
     "is_git_repo_with_changes",
+    "is_template_placeholder_result",
     "launch_run",
     "latest_attempt_dir",
     "latest_attempt_no",
@@ -1818,7 +2654,9 @@ __all__ = [
     "run_foreground_with_retries",
     "runs_root",
     "start_run",
+    "stop_run",
     "tail_combined",
+    "terminate_process_group",
     "utc_now",
     "write_pid",
     "write_result",
