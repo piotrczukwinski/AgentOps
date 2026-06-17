@@ -63,6 +63,21 @@ class ReviewConfig:
     schema_path: str | None = None
     # If true and codex is missing/disabled, route to heuristic reviewer.
     fallback_heuristic: bool = False
+    # Codex reviewer model override. When set, the runner emits
+    # ``-m <codex_model>`` so the codex CLI uses this model instead of
+    # its default. ``None`` means "use the codex default" (no -m flag).
+    # Resolution order: roadmap/task ``review.model`` ->
+    # ``AGENTOPS_CODEX_MODEL`` env var -> ``None``.
+    codex_model: str | None = None
+    # Codex model_reasoning_effort override. When set, the runner emits
+    # ``-c model_reasoning_effort=<value>`` (the current codex CLI
+    # rejects ``--reasoning-effort``). ``None`` means "no -c flag".
+    # Allowed values are ``low``, ``medium``, ``high``; the config
+    # layer validates the value before the runner sees it. Resolution
+    # order: roadmap/task ``review.model_reasoning_effort`` (or
+    # ``review.reasoning_effort`` alias) ->
+    # ``AGENTOPS_CODEX_MODEL_REASONING_EFFORT`` env var -> ``None``.
+    model_reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)

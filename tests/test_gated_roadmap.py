@@ -87,9 +87,23 @@ class FakeCodexService:
     def is_available(self) -> bool:
         return self.available
 
-    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds):
-        argv = build_codex_command(prompt_path, schema_path=schema_path, output_path=artifact_dir / "review.result.json", binary=self.binary)
-        self.calls.append({"argv": argv, "prompt": str(prompt_path)})
+    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
+        argv = build_codex_command(
+            prompt_path,
+            schema_path=schema_path,
+            output_path=artifact_dir / "review.result.json",
+            binary=self.binary,
+            model=model,
+            model_reasoning_effort=model_reasoning_effort,
+        )
+        self.calls.append(
+            {
+                "argv": argv,
+                "prompt": str(prompt_path),
+                "model": model,
+                "model_reasoning_effort": model_reasoning_effort,
+            }
+        )
         if not self._verdicts:
             raise AssertionError("FakeCodexService ran out of scripted verdicts")
         script = self._verdicts.pop(0)
@@ -142,7 +156,7 @@ class RecordingHeuristicReviewer(HeuristicReviewer):
         super().__init__()
         self.calls: list[dict[str, Any]] = []
 
-    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds):
+    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
         self.calls.append(
             {
                 "prompt": str(prompt_path) if prompt_path is not None else None,
@@ -150,7 +164,7 @@ class RecordingHeuristicReviewer(HeuristicReviewer):
                 "artifact_dir": str(artifact_dir),
             }
         )
-        return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
+        return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=model, model_reasoning_effort=model_reasoning_effort)
 
 
 # ---------------------------------------------------------------------------
@@ -1178,7 +1192,7 @@ class ReviewSchemaPathTests(unittest.TestCase):
             captured_schemas: list[Path | None] = []
 
             class _CapturingCodex(FakeCodexService):
-                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds):
+                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
                     captured_schemas.append(schema_path)
                     return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
 
@@ -1255,7 +1269,7 @@ class ReviewSchemaPathTests(unittest.TestCase):
             captured: list[Path | None] = []
 
             class _Cap(FakeCodexService):
-                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds):
+                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
                     captured.append(schema_path)
                     return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
 
@@ -1321,7 +1335,7 @@ class ReviewSchemaPathTests(unittest.TestCase):
             captured: list[Path | None] = []
 
             class _Cap(FakeCodexService):
-                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds):
+                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
                     captured.append(schema_path)
                     return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
 

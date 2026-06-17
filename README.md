@@ -87,7 +87,18 @@ Implemented in this repository:
   the safety contract; on current `codex-cli` builds (0.140.0+) the default
   approval policy is already `never`, so the older `--ask-for-approval
   never` flag is omitted because the CLI rejects it as an unexpected
-  argument.
+  argument. The reviewer model can be overridden per roadmap / per task
+  via `review.model` (and the `AGENTOPS_CODEX_MODEL` env var) and the
+  reasoning effort via `review.model_reasoning_effort` /
+  `review.reasoning_effort` (and the `AGENTOPS_CODEX_MODEL_REASONING_EFFORT`
+  env var). The runner translates these to:
+
+  ```bash
+  codex -m gpt-5.3-codex-spark -c model_reasoning_effort=high
+  ```
+
+  (the older `--reasoning-effort` flag is intentionally NOT emitted
+  because the local `codex` CLI rejects it).
 - Prompt compiler for executor, review, and repair prompts.
 - Allowed/forbidden file policy checks, including untracked-file detection.
 - Empty-diff detection: implementation tasks that produce no file changes are blocked.
@@ -150,6 +161,54 @@ agentops review-queue
 ```
 
 See `docs/usability-mvp.md` for the full CLI reference, `docs/operator-runbook.md` for triage procedures, `docs/gated-roadmap-runner.md` for the gated runner reference, and `docs/operator-reliability-audit.md` for the production failure-mode audit (stale pid, missing result, codex-required fallback, merge_failed, etc.) with the prioritised list of next PRs.
+
+### Pinning the codex reviewer model
+
+The default codex model can be 0%-rate-limited, but the local
+`codex` CLI works with an explicit model and reasoning-effort pair:
+
+```bash
+codex -m gpt-5.3-codex-spark -c model_reasoning_effort=high
+```
+
+AgentOps exposes this through the roadmap / task `review` config (and
+as an env-var fallback) instead of requiring a PATH wrapper:
+
+```json
+{
+  "review": {
+    "mode": "required",
+    "reviewer": "codex",
+    "model": "gpt-5.3-codex-spark",
+    "model_reasoning_effort": "high"
+  }
+}
+```
+
+The runner translates the config above to:
+
+```bash
+codex -m gpt-5.3-codex-spark -c model_reasoning_effort=high
+```
+
+The same fields can be set per task inside `tasks[].review`. The
+task-level values override the roadmap-level values; fields not set
+at the task level fall back to the roadmap-level review, then to
+the env var, then to the codex default (no flag).
+
+Env-var fallback:
+
+| Config key                  | Env var                              |
+|-----------------------------|--------------------------------------|
+| `review.model`              | `AGENTOPS_CODEX_MODEL`               |
+| `review.model_reasoning_effort` | `AGENTOPS_CODEX_MODEL_REASONING_EFFORT` |
+
+`review.reasoning_effort` is accepted as an alias for
+`review.model_reasoning_effort`. Allowed values are `low`, `medium`,
+`high`; an unknown value fails closed at `agentops plan` time. The
+runner intentionally emits `-c model_reasoning_effort=<value>` and
+never the legacy `--reasoning-effort` flag, because the local
+`codex` CLI rejects the latter as an unexpected argument.
 
 ## Operator Run Harness
 
