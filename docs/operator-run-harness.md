@@ -39,12 +39,28 @@ python -m agentops operator-run \
   --dir /home/czuki/AgentOps \
   --detach
 
+# Recommended recipe for long BusinessAgent / web-admin runs:
+# detach + idle watchdog + transient retry. The watchdog kills the
+# subprocess if its combined.log has not grown for 10 minutes.
+python -m agentops operator-run \
+  --name business-agent-batch-001 \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --detach \
+  --retry-on-transient \
+  --idle-timeout 600
+
 # Inspect the run from another terminal.
 python -m agentops operator-status --dir /home/czuki/AgentOps
 python -m agentops operator-tail <run-id> --dir /home/czuki/AgentOps --lines 200
 
 # Pull the structured result out of the combined log.
 python -m agentops operator-result <run-id> --dir /home/czuki/AgentOps
+
+# Stop a detached run that is wedged (e.g. stuck waiting on the
+# model API). Use --force to skip SIGTERM and go straight to SIGKILL.
+python -m agentops operator-stop <run-id> --dir /home/czuki/AgentOps
+python -m agentops operator-stop <run-id> --dir /home/czuki/AgentOps --force
 ```
 
 ## Storage layout
@@ -86,6 +102,10 @@ Launches a long operator prompt under `.operator-runs/<run-id>/`.
 | `--yolo` | off | Adds `--dangerously-skip-permissions` to the executor argv |
 | `--detach` | off | Starts the process in a new session and returns immediately |
 | `--no-detach` | on | Runs in the foreground, waits for the process to exit |
+| `--idle-timeout` | unset | If set, terminate the process group when the active combined.log has not grown for N seconds. See [Idle watchdog](#idle-watchdog) below. |
+| `--retry-on-transient` | off | Classify failures; on transient ones, sleep and try again. See [Transient failure recovery](#transient-failure-recovery) below. |
+| `--backoff` | `5,15,45` | Comma-separated seconds to sleep between retry attempts. |
+| `--max-retries` | `3` | Additional attempts after the first one when `--retry-on-transient` is set. |
 
 The harness writes `command.json` with the exact argv it will use. The
 argv is a list of strings (no shell interpolation), the env is
@@ -103,6 +123,8 @@ verbatim as the last argument.
 ```bash
 python -m agentops operator-status                       # list all runs
 python -m agentops operator-status --run-id <id>         # one run
+python -m agentops operator-status --format json         # JSON for the web/admin panel
+python -m agentops operator-status --run-id <id> --format json
 ```
 
 Each run is reported as a single line:
@@ -115,17 +137,109 @@ run_id=<id> name=<name> status=<runtime_status> pid=<pid> exit_code=<code> start
 
 * `running` — the recorded `pid` is alive **and** the persisted
   `status.json` says `running`.
-* `exited` — `status.json` says `running` but the `pid` is no longer
-  alive. The persisted file is left intact; this is a hint, not a write.
+* `stale_pid` — `status.json` says `running` but the `pid` is no
+  longer alive. The legacy `exited` / `succeeded` / `failed` label
+  is preserved in `runtime_status_alias` for downstream tools that
+  already special-case it. The persisted file is left intact; this
+  is a hint, not a write. The command also prints
+  `suggested_action=operator-retry` so the operator (and the future
+  web UI) does not have to remember the playbook.
+* `exited_or_stale` — `status.json` says `retrying` or
+  `retry_waiting` but the `pid` is no longer alive (the parent was
+  killed mid-retry).
 * `unknown` — `status.json` says `created` (or has no status) and the
   `pid` is no longer alive.
 
 This means a stale "running" entry in `status.json` from a previous
-session does not mislead the operator.
+session does not mislead the operator; `operator-status` will print a
+hint pointing the operator at `operator-retry <run-id>`.
 
-The command also prints the absolute path of `combined.log` and
-whether `result.json` is present, so the operator can `cat` or `tail`
-the log without leaving the harness.
+The text output also prints:
+
+* `active_attempt` and `active_combined_log` — the most recent
+  attempt's directory and combined.log so the operator knows which
+  log to tail even after retries,
+* `log_size_bytes` and `last_log_at` — the current size and mtime of
+  the active log,
+* `idle_for_seconds` — how long the log has been idle,
+* `pid_alive` — the liveness of the recorded pid,
+* `suggested_action` — a one-line hint for the operator and the
+  web/admin panel,
+* the absolute path of `combined.log` and whether `result.json` is
+  present.
+
+### JSON output for the web/admin panel
+
+```bash
+python -m agentops operator-status --run-id <id> --format json
+```
+
+The `--format json` mode is the contract the future admin web panel
+consumes. The output is a single JSON object (when `--run-id` is
+given) or a JSON array of objects (when listing all runs) with the
+following fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `run_id` | string |  |
+| `name` | string \| null |  |
+| `status` | string | Persisted `status.json` value |
+| `canonical_status` | string | Canonical name (succeeded / failed / needs_operator / …) |
+| `runtime_status` | string | `running` / `stale_pid` / `exited_or_stale` / `unknown` |
+| `pid` | int \| null |  |
+| `pid_alive` | bool |  |
+| `attempt` | int \| null | Most recent attempt number |
+| `max_retries` | int \| null |  |
+| `transient_reason` | string \| null |  |
+| `transient` | bool \| null |  |
+| `exit_code` | int \| null |  |
+| `started_at` | string \| null | ISO-8601 |
+| `ended_at` | string \| null | ISO-8601 |
+| `updated_at` | string \| null | ISO-8601 |
+| `active_attempt` | int \| null | Attempt number for `active_combined_log` |
+| `active_combined_log` | string \| null | Path to tail |
+| `log_size_bytes` | int | Size of `active_combined_log` |
+| `last_log_at` | string \| null | ISO-8601 mtime |
+| `idle_for_seconds` | float \| null | Wall-clock seconds since `last_log_at` |
+| `idle_timeout` | float \| null | Configured `--idle-timeout` for this run |
+| `stopped_at` | string \| null | Set by `operator-stop` |
+| `stop_reason` | string \| null | Set by `operator-stop` |
+| `result_path` | string \| null | Path to `result.json` when present |
+| `result_json_present` | bool | `true` when `result.json` exists on disk |
+| `suggested_action` | string \| null | e.g. `operator-retry`, `operator-tail then operator-stop` |
+| `runtime_status_note` | string \| null | Human-readable hint |
+| `runtime_status_alias` | string \| null | Legacy `exited`/`succeeded`/`failed` for backward compatibility |
+
+The web/admin panel can read the JSON output, render a status row,
+and use `suggested_action` to pick which action button to show.
+
+## `operator-stop`
+
+```bash
+python -m agentops operator-stop <run-id>                       # SIGTERM, then SIGKILL
+python -m agentops operator-stop <run-id> --force                # SIGKILL only
+python -m agentops operator-stop <run-id> --reason "stuck"       # custom stop_reason
+python -m agentops operator-stop <run-id> --timeout 10           # longer graceful window
+python -m agentops operator-stop <run-id> --format json          # JSON output
+```
+
+Reads the recorded pid for the run, terminates its process group
+(SIGTERM first, then SIGKILL after the configured `--timeout`), and
+updates `status.json` so the run is reported as `stopped` with
+`stopped_at` and `stop_reason`. The command:
+
+* Signals the *whole* process group when the child is in a different
+  process group from the harness (i.e. `--detach` runs). It never
+  signals the harness's own process group, so an operator running
+  `operator-stop` from a foreground terminal cannot kill their own
+  shell.
+* Falls back to signalling the bare pid when the child shares the
+  harness's process group (e.g. a foreground run the operator is
+  stopping via another process).
+* Skips the SIGTERM phase when `--force` is passed.
+* Records the operator-supplied `--reason` (default `operator_stop`).
+* Never throws on a missing or already-dead pid; it just writes
+  `stopped_at` so the operator can see the manual action.
 
 ## `operator-tail`
 
@@ -133,9 +247,13 @@ the log without leaving the harness.
 python -m agentops operator-tail <run-id> --lines 200
 ```
 
-Prints the last N lines of `.operator-runs/<run-id>/combined.log`. This
-command does not shell out to the external `tail` binary; it reads the
-file in Python so it works the same way on macOS, Linux, and CI.
+Prints the last N lines of `.operator-runs/<run-id>/combined.log`.
+When retries are recorded under `<run-dir>/attempts/<n>/`, the command
+reads the *latest* attempt's `combined.log` rather than the
+top-level one, so a stalled retry never hides behind a stale initial
+log. This command does not shell out to the external `tail` binary;
+it reads the file in Python so it works the same way on macOS, Linux,
+and CI.
 
 ## `operator-result`
 
@@ -143,8 +261,10 @@ file in Python so it works the same way on macOS, Linux, and CI.
 python -m agentops operator-result <run-id>
 ```
 
-Parses `combined.log` for the last `AGENTOPS_RESULT_JSON` block, writes
-the parsed object to `result.json`, and prints the JSON to stdout.
+Parses the *latest* attempt's `combined.log` for the last
+`AGENTOPS_RESULT_JSON` block, falls back to the top-level
+`combined.log` for runs that never retried, writes the parsed object
+to `result.json`, and prints the JSON to stdout.
 
 The parser tolerates:
 
@@ -160,7 +280,59 @@ that follows the marker.
 
 If the marker is missing or no parseable block follows it, the command
 exits non-zero and prints a hint explaining what the executor is
-supposed to print.
+supposed to print. If the parsed result looks like a
+*template/placeholder* (for example a quoted string
+`"done|blocked"` or `"passed|awaiting_review|failed|blocked"`, or a
+dict whose `status` field matches a known placeholder), the command
+also exits non-zero and tells the operator that the executor printed
+a stub before producing a real result. The list of recognised
+placeholders lives in `_TEMPLATE_PLACEHOLDER_STRINGS` in
+`agentops/operator_run.py` and is intentionally narrow so the
+harness never mistakes a real result for a stub.
+
+## Idle watchdog
+
+Long operator runs can stall because the executor is waiting on a
+network call that never completes, or because the model API returned
+a token and is silently hanging. Without a watchdog the run id stays
+`running` forever, the pid still exists, and the only signal is
+"the log has not grown in 20 minutes".
+
+`--idle-timeout SECONDS` adds a background watchdog to
+`operator-run` (and to every attempt of a `--retry-on-transient`
+run). The watchdog polls the active `combined.log` every second; if
+the log has not grown for `SECONDS` while the process is still
+alive, the watchdog terminates the process group, marks the run as
+`needs_operator` with reason `idle_timeout`, and records:
+
+* `idle_for_seconds` — the actual idle time,
+* `last_log_at` — the last mtime of the log,
+* `idle_log_size_bytes` — the log size when the watchdog fired,
+* `active_attempt` and `active_combined_log` — the attempt that
+  stalled.
+
+The watchdog never auto-retries: a stalled run is not a transient
+failure and the operator is expected to inspect the log and run
+`operator-retry` (or `operator-stop`) themselves.
+
+```bash
+# Long run with a 10-minute idle timeout. The watchdog will kill the
+# subprocess if the executor's combined.log has not grown for 10
+# minutes; the run id is marked needs_operator/idle_timeout.
+python -m agentops operator-run \
+  --name business-agent-batch-001 \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --detach \
+  --retry-on-transient \
+  --idle-timeout 600
+```
+
+The watchdog only signals the *whole* process group when the child
+is in a different process group from the harness; a foreground run
+that shares the harness's process group is signalled on the bare pid
+so the watchdog can never kill the test runner or the operator's
+shell.
 
 ## Lifecycle for foreground mode
 
@@ -294,15 +466,31 @@ The harness records one of these statuses in `status.json`:
 | `succeeded` | The last attempt exited 0 and an `AGENTOPS_RESULT_JSON` block was extracted (when present). (Legacy alias: `exited` with `exit_code=0`.) |
 | `failed` | The last attempt exited non-zero and the failure was classified as non-transient. (Legacy alias: `exited` with non-zero `exit_code`.) |
 | `transient_failed` | The retry budget was exhausted on a transient failure. |
-| `needs_operator` | Same as `transient_failed`; the operator asked for the explicit "needs attention" label via `operator-retry --needs-operator`. |
+| `needs_operator` | The run is wedged and the operator is the right next step. Recorded when the idle watchdog fires, or when the operator asks for the explicit "needs attention" label via `operator-retry --needs-operator`. |
+| `stopped` | The operator killed the run with `operator-stop`. `stopped_at` and `stop_reason` are set in `status.json`. |
 | `exited` | Legacy alias. `operator-status` reports it as `succeeded` or `failed` based on `exit_code`. |
 
 `operator-status` overlays a `canonical_status` field on the
 persisted payload and a `runtime_status` that checks whether the
-recorded pid is still alive. A status of `running` with a dead pid
-is reported as `exited` (or `succeeded`/`failed` when `exit_code`
-is known). A status of `retrying` with a dead pid is reported as
-`exited_or_stale` with a note that the retry was interrupted.
+recorded pid is still alive. The runtime overlay reports:
+
+* `running` when the pid is alive **and** the persisted status is
+  `running`,
+* `stale_pid` when the persisted status is `running` but the pid is
+  gone. The legacy `exited` / `succeeded` / `failed` label is
+  preserved in `runtime_status_alias` for backward compatibility.
+  `suggested_action` is set to `operator-retry` so the operator and
+  the web/admin panel do not have to remember the playbook.
+* `exited_or_stale` when the persisted status is `retrying` or
+  `retry_waiting` but the pid is gone.
+* `unknown` when the persisted status is `created` (or has no
+  status) and the pid is gone.
+
+The JSON output (`--format json`) also surfaces the active attempt
+number, the path and size of the active `combined.log`, its
+`last_log_at`, and the wall-clock `idle_for_seconds`. A future
+admin web panel can render a status row from this data and use
+`suggested_action` to pick the right action button.
 
 ### Transient error classifier
 
@@ -422,15 +610,27 @@ to rewrite the terminal status from `transient_failed` to
   are still on disk. A detached subprocess is still running. The
   operator can reattach with `operator-status`, `operator-tail`,
   `operator-result`. To recover from a transient failure the operator
-  can run `operator-retry <run-id>`.
-* **Full reboot.** The subprocess and its tee threads are reaped by
-  the OS. `combined.log` is frozen at the last write. `operator-status`
-  reports the run as `exited` (because the recorded pid is no longer
-  alive). `operator-tail` still prints the captured output.
-  `operator-result` extracts the JSON if the executor had time to
-  print the marker before the reboot; if not, the operator should run
-  `operator-retry <run-id>` to start a new attempt with the same
-  prompt and the same argv.
+  can run `operator-retry <run-id>`. To free the slot when the run
+  is wedged, the operator can run `operator-stop <run-id> --force`.
+* **Network transient failure** (timeout, 429, 502/503/504,
+  connection reset, DNS). The transient classifier labels the
+  failure; `--retry-on-transient` retries up to `--max-retries`
+  times with the configured `--backoff`. If the budget is exhausted
+  the run ends with `transient_failed` (or `needs_operator` when
+  the operator opted in via `operator-retry --needs-operator`).
+* **Stale pid** (the persisted status says `running` but the
+  recorded pid is gone). `operator-status` reports the run with
+  `runtime_status=stale_pid`, `pid_alive=false`, and
+  `suggested_action=operator-retry`. The operator can either run
+  `operator-retry <run-id>` to start a new attempt or
+  `operator-stop <run-id>` to mark the slot as stopped.
+* **Idle timeout.** When `--idle-timeout` is set, the watchdog
+  kills the subprocess if its `combined.log` has not grown for
+  `SECONDS` seconds. The run is marked `needs_operator` with
+  reason `idle_timeout`, the watchdog's `idle_for_seconds`,
+  `last_log_at`, and `idle_log_size_bytes` are recorded in
+  `status.json`, and `operator-status` exposes them via the JSON
+  output so the web/admin panel can render them.
 
 The workspace is preserved on disk: the per-run `prompt.md` and
 `command.json` survive a reboot, and each attempt's logs are kept in
@@ -452,4 +652,60 @@ actually did.
   retry.
 * The per-attempt directory layout (`attempts/<n>/`) keeps the
   old logs untouched; nothing is overwritten and nothing is deleted.
+* The idle watchdog only signals the *whole* process group when the
+  child is in a different process group from the harness. A
+  foreground run shares the harness's process group; the watchdog
+  signals the bare pid so it can never kill the operator's shell or
+  the test runner.
+* `operator-stop` only signals the recorded child pid and its
+  process group. It never reads or uses the harness's own pid and
+  never signals `os.getpgid(0)`.
+* Template placeholder result rejection is a closed list of
+  literal strings; widening the set is a deliberate code change in
+  `agentops/operator_run.py` (the
+  `_TEMPLATE_PLACEHOLDER_STRINGS` set) and cannot be triggered by
+  the executor's output alone.
+
+## Web / admin panel integration
+
+A future admin web panel can consume the operator run state without
+re-implementing the runtime overlay or the transient classifier.
+The contract is the JSON output of `operator-status --format json`:
+
+```bash
+python -m agentops operator-status --run-id <id> --format json
+```
+
+The panel renders one row per run, uses `runtime_status` to colour
+the row (`running` / `stale_pid` / `exited_or_stale` / `unknown` /
+canonical name), and shows the active log's path and size from
+`active_combined_log` and `log_size_bytes`. The `suggested_action`
+field is the contract for the action button:
+
+| `suggested_action` | When | UI button |
+|---|---|---|
+| `operator-retry` | Stale pid, retry budget exhausted, run wedged | "Retry" |
+| `operator-tail then operator-stop` | Run is running past the idle timeout | "Stop" |
+| `inspect log then operator-retry` | `needs_operator` run | "Inspect" |
+| (unset) | Healthy runs | (no action) |
+
+The panel can also call `operator-stop` directly with `--reason` to
+record *why* it killed the run. The recommended flow:
+
+1. `operator-status --format json --run-id <id>` to render the row,
+2. `operator-tail <id> --lines 200` to show the last log lines,
+3. `operator-stop <id>` to free the slot when the row is wedged,
+4. `operator-retry <id>` to start a new attempt.
+
+The recommended CLI for long BusinessAgent / web-admin runs:
+
+```bash
+python -m agentops operator-run \
+  --name business-agent-batch-001 \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --detach \
+  --retry-on-transient \
+  --idle-timeout 600
+```
 

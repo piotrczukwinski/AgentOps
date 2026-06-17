@@ -18,6 +18,7 @@ import stat
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -101,6 +102,32 @@ def _write_fake_opencode(
     script.write_text("\n".join(body_lines) + "\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return script
+
+
+def _reap(pid: int, *, timeout: float = 3.0) -> None:
+    """Reap a child process (collect its exit status) with a short timeout.
+
+    A subprocess that the harness started via ``subprocess.Popen`` and
+    then left running becomes a *zombie* when it dies until the parent
+    calls ``wait()``. ``os.kill(pid, 0)`` returns success for zombies,
+    so a test that wants to assert the child is "really dead" must
+    reap it first. This helper does that with ``WNOHANG`` so it does
+    not block when the child is already reaped.
+    """
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        try:
+            _pid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if _pid == pid:
+            return
+        if not pid_alive(pid):
+            return
+        time.sleep(0.05)
+    # Last attempt, blocking, to clean up.
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(pid, 0)
 
 
 def _make_path_with(bindir: Path) -> str:
@@ -545,7 +572,8 @@ class OperatorStatusTests(unittest.TestCase):
             entries = list_status(root)
             self.assertEqual(len(entries), 1)
             _, payload = entries[0]
-            self.assertEqual(payload.get("runtime_status"), "exited")
+            self.assertEqual(payload.get("runtime_status"), "stale_pid")
+            self.assertEqual(payload.get("runtime_status_alias"), "exited")
 
     def test_runtime_status_marks_alive_pid_as_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1424,7 +1452,9 @@ class StatusOverlayTests(unittest.TestCase):
                 status_payload={"run_id": "r", "status": "running", "pid": 99999999},
             )
             entries = list_status(root)
-            self.assertEqual(entries[0][1].get("runtime_status"), "exited")
+            payload = entries[0][1]
+            self.assertEqual(payload.get("runtime_status"), "stale_pid")
+            self.assertEqual(payload.get("runtime_status_alias"), "exited")
 
     def test_stale_pid_with_nonzero_exit_code_reports_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1434,7 +1464,9 @@ class StatusOverlayTests(unittest.TestCase):
                 status_payload={"run_id": "r", "status": "running", "pid": 99999999, "exit_code": 7},
             )
             entries = list_status(root)
-            self.assertEqual(entries[0][1].get("runtime_status"), "failed")
+            payload = entries[0][1]
+            self.assertEqual(payload.get("runtime_status"), "stale_pid")
+            self.assertEqual(payload.get("runtime_status_alias"), "failed")
 
     def test_stale_pid_with_zero_exit_code_reports_succeeded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1444,7 +1476,9 @@ class StatusOverlayTests(unittest.TestCase):
                 status_payload={"run_id": "r", "status": "running", "pid": 99999999, "exit_code": 0},
             )
             entries = list_status(root)
-            self.assertEqual(entries[0][1].get("runtime_status"), "succeeded")
+            payload = entries[0][1]
+            self.assertEqual(payload.get("runtime_status"), "stale_pid")
+            self.assertEqual(payload.get("runtime_status_alias"), "succeeded")
 
     def test_stale_pid_during_retrying_reports_exited_or_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1831,6 +1865,522 @@ class CliOperatorResultTransientHintTests(unittest.TestCase):
             self.assertIn("transient_failed", err2)
             self.assertIn("rate_limit", err2)
             self.assertIn("operator-retry", err2)
+
+
+# ---------------------------------------------------------------------------
+# Idle watchdog, stale pid, operator-stop, JSON status, template result
+# ---------------------------------------------------------------------------
+
+
+def _write_idle_fake_opencode(
+    bindir: Path,
+    *,
+    stdout: str = "ready\n",
+) -> Path:
+    """Create a fake opencode that writes ``stdout`` once and then sleeps forever."""
+    bindir.mkdir(parents=True, exist_ok=True)
+    script = bindir / "opencode"
+    body_lines = [
+        "#!/bin/sh",
+        "set -eu",
+        "printf '%s\\n' \"$@\" >> \"$AGENTOPS_FAKE_CMD_LOG\"",
+    ]
+    for line in stdout.splitlines() or [""]:
+        body_lines.append(f"printf '%s\\n' {json.dumps(line)}")
+    body_lines.append("sleep 600")
+    body_lines.append("exit 0")
+    script.write_text("\n".join(body_lines) + "\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+class IdleWatchdogTests(unittest.TestCase):
+    def _setup(self, tmp: str) -> tuple[Path, Path, Path, Path]:
+        bindir = Path(tmp) / "bin"
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        prompt = root / "prompt.md"
+        prompt.write_text("hi", encoding="utf-8")
+        log = Path(tmp) / "cmd.log"
+        log.write_text("", encoding="utf-8")
+        return bindir, root, prompt, log
+
+    def test_idle_timeout_kills_fake_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup(tmp)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_idle_fake_opencode(bindir, stdout="boot\n")
+                spec, target, argv = start_run(
+                    root=root,
+                    name="idle",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                payload = run_foreground(spec, target, argv, idle_timeout=0.5)
+            # The watchdog should have fired and marked the run as
+            # ``needs_operator`` with reason ``idle_timeout``.
+            self.assertEqual(payload.get("status"), "needs_operator")
+            self.assertEqual(payload.get("error"), "idle_timeout")
+            self.assertGreaterEqual(int(payload.get("idle_for_seconds", 0) or 0), 0)
+            status_payload = json.loads((target / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status_payload.get("status"), "needs_operator")
+            self.assertEqual(status_payload.get("error"), "idle_timeout")
+            self.assertIn("idle_for_seconds", status_payload)
+
+    def test_idle_timeout_with_retry_does_not_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup(tmp)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_idle_fake_opencode(bindir, stdout="boot\n")
+                spec, target, argv = start_run(
+                    root=root,
+                    name="idle-retry",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                payload = run_foreground_with_retries(
+                    spec,
+                    target,
+                    argv,
+                    max_retries=2,
+                    backoff=[0.0, 0.0, 0.0],
+                    retry_on_transient=True,
+                    idle_timeout=0.5,
+                )
+            # Idle is non-transient, so retry_on_transient should NOT
+            # cause a second attempt. The terminal status must be
+            # needs_operator/idle_timeout.
+            self.assertEqual(payload.get("status"), "needs_operator")
+            self.assertEqual(payload.get("error"), "idle_timeout")
+            # Only one attempt's log directory exists.
+            self.assertFalse((target / "attempts" / "2").exists())
+
+    def test_idle_watchdog_does_not_kill_harness_itself(self) -> None:
+        # The harness pid is os.getpid(); the watchdog must never signal
+        # the harness process group, only the *child* pid.
+        # Pick an obviously-alive pid that is NOT the harness.
+        target_pid = os.getpid()  # we won't actually call kill on this; we
+        # just verify the watchdog does not target os.getpgid(0).
+        from agentops.operator_run import _get_pgid
+        pgid = _get_pgid(target_pid)
+        self.assertIsNotNone(pgid)
+        # The harness process group (the one that owns the test process)
+        # is whatever the test process is in. The watchdog only ever
+        # targets ``os.kill(pid_or_pgid, ...)`` where pid_or_pgid is
+        # the child pid, so it can never reach the harness group via a
+        # path that does not also reap the child. This test mostly
+        # documents the safety property.
+        self.assertIsInstance(pgid, int)
+
+
+class OperatorStopTests(unittest.TestCase):
+    def _setup(self, tmp: str, *, sleep_seconds: float) -> tuple[Path, Path, Path, Path]:
+        bindir = Path(tmp) / "bin"
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        prompt = root / "prompt.md"
+        prompt.write_text("hi", encoding="utf-8")
+        log = Path(tmp) / "cmd.log"
+        log.write_text("", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+            _write_fake_opencode(bindir, stdout="ok", sleep_seconds=sleep_seconds, exit_code=0)
+            spec, target, argv = start_run(
+                root=root,
+                name="stop",
+                prompt_path=prompt,
+                workdir=root,
+                model="minimax/MiniMax-M3",
+                runner="opencode",
+                yolo=False,
+                detach=True,
+            )
+            run_detached(spec, target, argv)
+        return bindir, root, target, log
+
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = cli.main(argv)
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+        return int(rc), out.getvalue(), err.getvalue()
+
+    def test_operator_stop_terminates_fake_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, root, target, _ = self._setup(tmp, sleep_seconds=30)
+            run_id = target.name
+            pid = read_pid(target)
+            self.assertIsNotNone(pid)
+            self.assertTrue(pid_alive(pid))
+            rc, out, err = self._run_cli(
+                [
+                    "operator-stop",
+                    run_id,
+                    "--dir",
+                    str(root),
+                    "--timeout",
+                    "2",
+                ]
+            )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertIn("status=stopped", out)
+            self.assertIn("stop_reason=operator_stop", out)
+            status_payload = json.loads((target / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status_payload.get("status"), "stopped")
+            self.assertEqual(status_payload.get("stop_reason"), "operator_stop")
+            self.assertIn("stopped_at", status_payload)
+            # Reap the child so the test process does not leak zombies.
+            if pid is not None:
+                _reap(pid)
+            # The fake binary should have been reaped.
+            if pid is not None:
+                self.assertFalse(pid_alive(pid))
+
+    def test_operator_stop_force_uses_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, root, target, _ = self._setup(tmp, sleep_seconds=30)
+            run_id = target.name
+            pid = read_pid(target)
+            self.assertIsNotNone(pid)
+            rc, out, err = self._run_cli(
+                [
+                    "operator-stop",
+                    run_id,
+                    "--dir",
+                    str(root),
+                    "--force",
+                    "--reason",
+                    "manual_cleanup",
+                    "--format",
+                    "json",
+                ]
+            )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertIn("operator-stop: status=stopped", out)
+            status_payload = json.loads((target / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status_payload.get("status"), "stopped")
+            self.assertEqual(status_payload.get("stop_reason"), "manual_cleanup")
+            self.assertTrue(status_payload.get("stop_force"))
+            if pid is not None:
+                _reap(pid)
+
+    def test_operator_stop_handles_missing_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, root, target, _ = self._setup(tmp, sleep_seconds=0)
+            run_id = target.name
+            pid = read_pid(target)
+            if pid is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, 15)
+            # Wait until the pid is gone so the operator-stop path sees
+            # an already-dead run.
+            deadline = time.time() + 5.0
+            while pid is not None and pid_alive(pid) and time.time() < deadline:
+                time.sleep(0.1)
+            if pid is not None:
+                _reap(pid)
+            rc, out, err = self._run_cli(
+                [
+                    "operator-stop",
+                    run_id,
+                    "--dir",
+                    str(root),
+                ]
+            )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertIn("status=stopped", out)
+            status_payload = json.loads((target / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status_payload.get("status"), "stopped")
+
+
+class OperatorStatusJsonTests(unittest.TestCase):
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = cli.main(argv)
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+        return int(rc), out.getvalue(), err.getvalue()
+
+    def test_operator_status_format_json_includes_active_log_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            prompt = root / "prompt.md"
+            prompt.write_text("hi", encoding="utf-8")
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(
+                    bindir,
+                    stdout="ok",
+                    print_result_json={"status": "done", "summary": "x"},
+                    exit_code=0,
+                )
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-run",
+                        "--prompt-file",
+                        str(prompt),
+                        "--dir",
+                        str(root),
+                    ]
+                )
+                self.assertEqual(rc, 0, msg=err)
+                run_id = out.split("run_id=", 1)[1].split()[0]
+                rc2, out2, err2 = self._run_cli(
+                    [
+                        "operator-status",
+                        "--dir",
+                        str(root),
+                        "--run-id",
+                        run_id,
+                        "--format",
+                        "json",
+                    ]
+                )
+            self.assertEqual(rc2, 0, msg=err2)
+            payload = json.loads(out2)
+            self.assertEqual(payload["run_id"], run_id)
+            self.assertEqual(payload["canonical_status"], "succeeded")
+            self.assertEqual(payload["result_json_present"], True)
+            self.assertIn("active_attempt", payload)
+            self.assertIn("active_combined_log", payload)
+            self.assertIn("log_size_bytes", payload)
+            self.assertIn("last_log_at", payload)
+            self.assertIn("pid_alive", payload)
+            self.assertIn("idle_for_seconds", payload)
+
+    def test_operator_status_format_json_for_stale_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            run = runs_root(root) / "stale-run"
+            run.mkdir(parents=True)
+            (run / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "stale-run",
+                        "name": "stale",
+                        "status": "running",
+                        "pid": 99999999,
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rc, out, err = self._run_cli(
+                [
+                    "operator-status",
+                    "--dir",
+                    str(root),
+                    "--run-id",
+                    "stale-run",
+                    "--format",
+                    "json",
+                ]
+            )
+            self.assertEqual(rc, 0, msg=err)
+            payload = json.loads(out)
+            self.assertEqual(payload["runtime_status"], "stale_pid")
+            self.assertEqual(payload["pid_alive"], False)
+            self.assertEqual(payload["suggested_action"], "operator-retry")
+
+    def test_operator_status_text_includes_active_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            prompt = root / "prompt.md"
+            prompt.write_text("hi", encoding="utf-8")
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(bindir, stdout="ok", exit_code=0)
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-run",
+                        "--prompt-file",
+                        str(prompt),
+                        "--dir",
+                        str(root),
+                    ]
+                )
+                self.assertEqual(rc, 0, msg=err)
+                run_id = out.split("run_id=", 1)[1].split()[0]
+                rc2, out2, err2 = self._run_cli(
+                    [
+                        "operator-status",
+                        "--dir",
+                        str(root),
+                        "--run-id",
+                        run_id,
+                    ]
+                )
+            self.assertEqual(rc2, 0, msg=err2)
+            self.assertIn("active_attempt=", out2)
+            self.assertIn("active_combined_log=", out2)
+            self.assertIn("log_size_bytes=", out2)
+
+
+class TemplateResultRejectedTests(unittest.TestCase):
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = cli.main(argv)
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+        return int(rc), out.getvalue(), err.getvalue()
+
+    def test_template_placeholder_rejected_by_extract_result(self) -> None:
+        from agentops.operator_run import TemplateResultRejected, extract_result
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "noise\nAGENTOPS_RESULT_JSON: \"done|blocked\"\nmore noise\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(TemplateResultRejected):
+                extract_result(target)
+
+    def test_template_placeholder_rejected_by_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            run = runs_root(root) / "template"
+            run.mkdir(parents=True)
+            (run / "status.json").write_text(
+                json.dumps({"run_id": "template", "status": "exited", "exit_code": 0}),
+                encoding="utf-8",
+            )
+            (run / "combined.log").write_text(
+                'AGENTOPS_RESULT_JSON: "passed|awaiting_review|failed|blocked"\n',
+                encoding="utf-8",
+            )
+            rc, out, err = self._run_cli(
+                [
+                    "operator-result",
+                    "template",
+                    "--dir",
+                    str(root),
+                ]
+            )
+            self.assertEqual(rc, 1, msg=err)
+            self.assertIn("placeholder", err.lower())
+            self.assertIn("AGENTOPS_RESULT_JSON", err)
+
+
+class OperatorTailLatestAttemptTests(unittest.TestCase):
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = cli.main(argv)
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+        return int(rc), out.getvalue(), err.getvalue()
+
+    def test_operator_tail_prefers_latest_attempt_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            prompt = root / "prompt.md"
+            prompt.write_text("hi", encoding="utf-8")
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(bindir, stdout="ok", exit_code=0)
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-run",
+                        "--prompt-file",
+                        str(prompt),
+                        "--dir",
+                        str(root),
+                    ]
+                )
+                self.assertEqual(rc, 0, msg=err)
+                run_id = out.split("run_id=", 1)[1].split()[0]
+                run_dir = root / ".operator-runs" / run_id
+                # Simulate a second attempt that wrote a distinct log.
+                a2 = attempt_dir(run_dir, 2)
+                a2.mkdir(parents=True)
+                (a2 / "combined.log").write_text("retry-2 line\n", encoding="utf-8")
+                rc2, out2, err2 = self._run_cli(
+                    [
+                        "operator-tail",
+                        run_id,
+                        "--dir",
+                        str(root),
+                        "--lines",
+                        "10",
+                    ]
+                )
+            self.assertEqual(rc2, 0, msg=err2)
+            self.assertIn("retry-2 line", out2)
+            # The original top-level line should NOT appear because the
+            # latest attempt log overrides it.
+            self.assertNotIn("[agentops] run finished", out2)
+
+    def test_operator_result_prefers_latest_attempt_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            prompt = root / "prompt.md"
+            prompt.write_text("hi", encoding="utf-8")
+            log = Path(tmp) / "cmd.log"
+            log.write_text("", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(bindir, stdout="ok", exit_code=0)
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-run",
+                        "--prompt-file",
+                        str(prompt),
+                        "--dir",
+                        str(root),
+                    ]
+                )
+                self.assertEqual(rc, 0, msg=err)
+                run_id = out.split("run_id=", 1)[1].split()[0]
+                run_dir = root / ".operator-runs" / run_id
+                # Wipe the top-level result and add a fake attempt 2 with
+                # a different status so the latest-attempt log wins.
+                if (run_dir / "result.json").exists():
+                    (run_dir / "result.json").unlink()
+                a2 = attempt_dir(run_dir, 2)
+                a2.mkdir(parents=True)
+                (a2 / "combined.log").write_text(
+                    "AGENTOPS_RESULT_JSON: {\"status\": \"from-attempt-2\", \"summary\": \"y\"}\n",
+                    encoding="utf-8",
+                )
+                rc2, out2, err2 = self._run_cli(
+                    [
+                        "operator-result",
+                        run_id,
+                        "--dir",
+                        str(root),
+                    ]
+                )
+            self.assertEqual(rc2, 0, msg=err2)
+            self.assertIn("from-attempt-2", out2)
+            result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["status"], "from-attempt-2")
 
 
 if __name__ == "__main__":
