@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover - stdlib always has unquote
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -333,6 +334,177 @@ def collect_artifacts(state: StateStore, task_id: str) -> dict[str, Any]:
     return {"task_id": task_id, "items": [_row_to_dict(row) for row in rows]}
 
 
+# ---------------------------------------------------------------------------
+# Admin / operator panel (read-only, loopback-only)
+# ---------------------------------------------------------------------------
+
+
+# Statuses that should be surfaced as watchdog-induced failures in the
+# admin panel. Kept in sync with operator_run.NEEDS_OPERATOR_STATUS plus
+# the transient-failure family so an operator can spot stalled runs at a
+# glance. This is a UI projection; the operator_run module remains the
+# source of truth.
+_WATCHDOG_FAILURE_STATUSES = frozenset(
+    {"needs_operator", "transient_failed", "stale_pid", "exited_or_stale"}
+)
+
+
+def _default_pr_loop_root() -> Path:
+    """Return the on-disk root for ``.agentops/pr-loop``.
+
+    Mirrors the CLI default so the UI agrees with ``agentops pr-loop``
+    when no explicit root is passed.
+    """
+    roots = _resolve_allowed_roots()
+    return roots.repo_root / ".agentops" / "pr-loop"
+
+
+def _summarise_roadmap_state(state: StateStore) -> dict[str, Any]:
+    """Roll up :func:`StateStore.task_rows` into a per-roadmap summary."""
+    state.init()
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in state.task_rows():
+        roadmap_id = row["roadmap_id"]
+        bucket = grouped.setdefault(
+            roadmap_id,
+            {
+                "roadmap_id": roadmap_id,
+                "total": 0,
+                "by_state": {},
+                "updated_at": row["updated_at"],
+            },
+        )
+        bucket["total"] += 1
+        task_state = row["state"]
+        bucket["by_state"][task_state] = bucket["by_state"].get(task_state, 0) + 1
+        current = bucket["updated_at"]
+        if current is None or (row["updated_at"] and row["updated_at"] > current):
+            bucket["updated_at"] = row["updated_at"]
+    roadmaps = sorted(grouped.values(), key=lambda item: item["roadmap_id"])
+    return {
+        "roadmaps": roadmaps,
+        "total_tasks": sum(item["total"] for item in roadmaps),
+        "roadmap_count": len(roadmaps),
+    }
+
+
+def _summarise_operator_runs() -> dict[str, Any]:
+    """Aggregate the operator-run projection for the admin panel.
+
+    Returns the same per-run dicts that :func:`collect_operator_runs`
+    exposes, plus a small status histogram. Tolerant of a missing
+    ``.operator-runs`` directory: it is reported as an empty summary
+    rather than raising.
+    """
+    try:
+        payload = collect_operator_runs()
+    except Exception:  # noqa: BLE001 - admin panel must never raise
+        log.exception("admin panel: collect_operator_runs failed")
+        payload = {"runs": []}
+    runs = payload.get("runs", [])
+    histogram: dict[str, int] = {}
+    for run in runs:
+        key = str(run.get("runtime_status") or run.get("canonical_status") or "unknown")
+        histogram[key] = histogram.get(key, 0) + 1
+    recent = runs[:5]
+    watchdog_items = [
+        run
+        for run in runs
+        if str(run.get("runtime_status") or "") in _WATCHDOG_FAILURE_STATUSES
+    ]
+    return {
+        "summary": {
+            "total": len(runs),
+            "running": sum(
+                1 for run in runs if run.get("pid_alive")
+            ),
+            "by_status": histogram,
+        },
+        "recent": recent,
+        "watchdog_failures": {
+            "count": len(watchdog_items),
+            "items": watchdog_items[:5],
+        },
+    }
+
+
+def _list_pr_loop_cycles() -> dict[str, Any]:
+    """List existing ``.agentops/pr-loop/cycle-N`` directories.
+
+    The PR loop keeps a cycle-N directory per Codex review pass; the
+    admin panel surfaces the cycle numbers it has seen so an operator
+    can decide whether to start a new one. The function never raises:
+    a missing root is reported with ``exists=False``.
+    """
+    root = _default_pr_loop_root()
+    cycles: list[dict[str, Any]] = []
+    if root.is_dir():
+        for child in sorted(root.iterdir(), key=lambda p: p.name):
+            if not child.is_dir():
+                continue
+            match = re.match(r"^cycle-(\d+)$", child.name)
+            if match is None:
+                continue
+            cycles.append(
+                {
+                    "cycle": int(match.group(1)),
+                    "path": str(child),
+                }
+            )
+    next_cycle = (max((c["cycle"] for c in cycles), default=0)) + 1
+    return {
+        "root": str(root),
+        "exists": root.is_dir(),
+        "cycles": cycles,
+        "next_cycle": next_cycle,
+    }
+
+
+_RECOMMENDED_COMMANDS: list[dict[str, str]] = [
+    {
+        "name": "agentops operator-status",
+        "description": "Show canonical/runtime status for every operator run.",
+    },
+    {
+        "name": "agentops operator-tail",
+        "description": "Stream the latest combined.log for a specific run id.",
+    },
+    {
+        "name": "agentops task-tail",
+        "description": "Follow a single task's executor.combined.log until the task leaves the running state.",
+    },
+    {
+        "name": "agentops pr-loop",
+        "description": "Drive a Codex review/repair cycle over a single PR (--pr-loop-root defaults to .agentops/pr-loop).",
+    },
+]
+
+
+def collect_admin_panel(state: StateStore) -> dict[str, Any]:
+    """Return the read-only payload backing the admin/operator card.
+
+    The function is intentionally side-effect free and tolerant of
+    missing data sources: the dashboard must always render *something*,
+    even on a fresh checkout with no roadmaps, no operator runs, and
+    no PR loop root yet.
+    """
+    state.init()
+    latest_events = [
+        _row_to_dict(row) for row in state.latest_events(10)
+    ]
+    roadmap_state = _summarise_roadmap_state(state)
+    operator_runs = _summarise_operator_runs()
+    pr_loop_cycles = _list_pr_loop_cycles()
+    return {
+        "roadmap_state": roadmap_state,
+        "latest_events": latest_events,
+        "operator_runs": operator_runs,
+        "pr_loop_cycles": pr_loop_cycles,
+        "watchdog_failures": operator_runs["watchdog_failures"],
+        "recommended_commands": list(_RECOMMENDED_COMMANDS),
+    }
+
+
 # --- HTTP handler ----------------------------------------------------------
 
 class _State:
@@ -447,6 +619,9 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/operator-runs":
             self._send_json(collect_operator_runs())
+            return
+        if path == "/api/admin":
+            self._send_json(collect_admin_panel(self._server_state().state))
             return
         if path.startswith("/api/operator-runs/") and path.endswith("/tail"):
             self._handle_operator_run_tail(path, query)
@@ -672,6 +847,67 @@ INDEX_TEMPLATE = """<!doctype html>
   </section>
 
   <section class="card">
+    <h2 style="margin-top:0;font-size:15px;">Admin / Operator panel</h2>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="pill" id="admin-total-tasks">tasks: -</span>
+      <span class="pill" id="admin-roadmap-count">roadmaps: -</span>
+      <span class="pill" id="admin-operator-runs">operator runs: -</span>
+      <span class="pill" id="admin-watchdog-failures">watchdog failures: -</span>
+      <span class="pill" id="admin-pr-loop-cycles">pr-loop cycles: -</span>
+    </div>
+
+    <h3 style="margin:6px 0 4px;font-size:13px;">Roadmap state</h3>
+    <table>
+      <thead>
+        <tr><th>Roadmap</th><th>Total</th><th>By state</th><th>Last update</th></tr>
+      </thead>
+      <tbody id="admin-roadmap-rows"><tr><td colspan="4" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+
+    <h3 style="margin:12px 0 4px;font-size:13px;">Latest events</h3>
+    <table>
+      <thead>
+        <tr><th>#</th><th>Time</th><th>Type</th><th>Task</th><th>Roadmap</th></tr>
+      </thead>
+      <tbody id="admin-event-rows"><tr><td colspan="5" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+
+    <h3 style="margin:12px 0 4px;font-size:13px;">Operator-run status</h3>
+    <div id="admin-operator-summary" class="muted" style="margin-bottom:6px;">loading&hellip;</div>
+    <table>
+      <thead>
+        <tr><th>Run id</th><th>Runtime</th><th>PID alive</th><th>Idle (s)</th><th>Result</th><th>Suggested</th></tr>
+      </thead>
+      <tbody id="admin-operator-rows"><tr><td colspan="6" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+
+    <h3 style="margin:12px 0 4px;font-size:13px;">PR-loop cycles</h3>
+    <div id="admin-pr-loop-root" class="muted" style="margin-bottom:4px;"></div>
+    <table>
+      <thead>
+        <tr><th>Cycle</th><th>Path</th></tr>
+      </thead>
+      <tbody id="admin-pr-loop-rows"><tr><td colspan="2" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+
+    <h3 style="margin:12px 0 4px;font-size:13px;">Watchdog failures</h3>
+    <table>
+      <thead>
+        <tr><th>Run id</th><th>Runtime</th><th>Suggested action</th></tr>
+      </thead>
+      <tbody id="admin-watchdog-rows"><tr><td colspan="3" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+
+    <h3 style="margin:12px 0 4px;font-size:13px;">Recommended next commands</h3>
+    <table>
+      <thead>
+        <tr><th>Command</th><th>What it does</th></tr>
+      </thead>
+      <tbody id="admin-commands-rows"><tr><td colspan="2" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="card">
     <h2 style="margin-top:0;font-size:15px;">Task detail</h2>
     <div class="row">
       <label for="task-input" class="muted">Task id:</label>
@@ -700,6 +936,19 @@ INDEX_TEMPLATE = """<!doctype html>
   const detailOutput = $("detail-output");
   const roadmapSelect = $("roadmap-select");
   const roadmapInput = $("roadmap-input");
+  const adminTotalTasks = $("admin-total-tasks");
+  const adminRoadmapCount = $("admin-roadmap-count");
+  const adminOperatorRuns = $("admin-operator-runs");
+  const adminWatchdogFailures = $("admin-watchdog-failures");
+  const adminPrLoopCycles = $("admin-pr-loop-cycles");
+  const adminRoadmapRows = $("admin-roadmap-rows");
+  const adminEventRows = $("admin-event-rows");
+  const adminOperatorSummary = $("admin-operator-summary");
+  const adminOperatorRows = $("admin-operator-rows");
+  const adminPrLoopRoot = $("admin-pr-loop-root");
+  const adminPrLoopRows = $("admin-pr-loop-rows");
+  const adminWatchdogRows = $("admin-watchdog-rows");
+  const adminCommandsRows = $("admin-commands-rows");
 
   let autoTimer = null;
 
@@ -807,6 +1056,9 @@ INDEX_TEMPLATE = """<!doctype html>
 
   const opRes = await fetchJson("/api/operator-runs");
   if (opRes.ok) renderOperatorRuns(opRes.data.runs);
+
+  const adminRes = await fetchJson("/api/admin");
+  if (adminRes.ok) renderAdmin(adminRes.data);
 }
 
 function renderOperatorRuns(runs) {
@@ -848,6 +1100,144 @@ async function tailOperatorRun() {
   operatorTailOutput.textContent = "loading...";
   const res = await fetchJson("/api/operator-runs/" + encodeURIComponent(runId) + "/tail?lines=200");
   operatorTailOutput.textContent = JSON.stringify(res.data, null, 2);
+}
+
+function renderAdmin(panel) {
+  if (!panel) {
+    if (adminRoadmapRows) adminRoadmapRows.innerHTML = '<tr><td colspan="4" class="muted">admin panel unavailable</td></tr>';
+    if (adminEventRows) adminEventRows.innerHTML = '<tr><td colspan="5" class="muted">admin panel unavailable</td></tr>';
+    if (adminOperatorRows) adminOperatorRows.innerHTML = '<tr><td colspan="6" class="muted">admin panel unavailable</td></tr>';
+    if (adminPrLoopRows) adminPrLoopRows.innerHTML = '<tr><td colspan="2" class="muted">admin panel unavailable</td></tr>';
+    if (adminWatchdogRows) adminWatchdogRows.innerHTML = '<tr><td colspan="3" class="muted">admin panel unavailable</td></tr>';
+    if (adminCommandsRows) adminCommandsRows.innerHTML = '<tr><td colspan="2" class="muted">admin panel unavailable</td></tr>';
+    return;
+  }
+
+  var roadmapState = panel.roadmap_state || { roadmaps: [], total_tasks: 0, roadmap_count: 0 };
+  var operatorRuns = panel.operator_runs || { summary: { total: 0, running: 0, by_status: {} }, recent: [], watchdog_failures: { count: 0, items: [] } };
+  var prLoop = panel.pr_loop_cycles || { root: "", exists: false, cycles: [], next_cycle: 1 };
+  var watchdog = panel.watchdog_failures || { count: 0, items: [] };
+  var commands = panel.recommended_commands || [];
+  var events = panel.latest_events || [];
+
+  if (adminTotalTasks) adminTotalTasks.textContent = "tasks: " + roadmapState.total_tasks;
+  if (adminRoadmapCount) adminRoadmapCount.textContent = "roadmaps: " + roadmapState.roadmap_count;
+  if (adminOperatorRuns) adminOperatorRuns.textContent = "operator runs: " + (operatorRuns.summary ? operatorRuns.summary.total : 0);
+  if (adminWatchdogFailures) adminWatchdogFailures.textContent = "watchdog failures: " + (watchdog.count || 0);
+  if (adminPrLoopCycles) adminPrLoopCycles.textContent = "pr-loop cycles: " + prLoop.cycles.length;
+
+  if (adminRoadmapRows) {
+    var roadmaps = roadmapState.roadmaps || [];
+    if (!roadmaps.length) {
+      adminRoadmapRows.innerHTML = '<tr><td colspan="4" class="muted">No roadmaps yet — plan or run a roadmap to populate the admin panel.</td></tr>';
+    } else {
+      adminRoadmapRows.innerHTML = roadmaps.map(function (r) {
+        var pairs = Object.keys(r.by_state || {}).sort().map(function (k) {
+          return escapeHtml(k) + ":" + escapeHtml(r.by_state[k]);
+        }).join(" ");
+        return "<tr>"
+          + "<td>" + escapeHtml(r.roadmap_id) + "</td>"
+          + "<td>" + escapeHtml(r.total) + "</td>"
+          + "<td>" + (pairs || "-") + "</td>"
+          + "<td>" + escapeHtml(r.updated_at || "-") + "</td>"
+          + "</tr>";
+      }).join("");
+    }
+  }
+
+  if (adminEventRows) {
+    if (!events.length) {
+      adminEventRows.innerHTML = '<tr><td colspan="5" class="muted">no events recorded yet</td></tr>';
+    } else {
+      adminEventRows.innerHTML = events.map(function (e) {
+        return "<tr>"
+          + "<td>" + escapeHtml(e.seq) + "</td>"
+          + "<td>" + escapeHtml(e.created_at) + "</td>"
+          + "<td>" + escapeHtml(e.type) + "</td>"
+          + "<td>" + escapeHtml(e.task_id || "-") + "</td>"
+          + "<td>" + escapeHtml(e.roadmap_id || "-") + "</td>"
+          + "</tr>";
+      }).join("");
+    }
+  }
+
+  if (adminOperatorSummary) {
+    var summary = operatorRuns.summary || { total: 0, running: 0, by_status: {} };
+    var histParts = Object.keys(summary.by_status || {}).sort().map(function (k) {
+      return escapeHtml(k) + ":" + escapeHtml(summary.by_status[k]);
+    });
+    var histText = histParts.length ? histParts.join(" ") : "no statuses";
+    adminOperatorSummary.textContent = "total=" + summary.total + " running=" + summary.running + " — " + histText;
+  }
+
+  if (adminOperatorRows) {
+    var recent = operatorRuns.recent || [];
+    if (!recent.length) {
+      adminOperatorRows.innerHTML = '<tr><td colspan="6" class="muted">No operator runs yet — start one with the CLI: agentops operator-run …</td></tr>';
+    } else {
+      adminOperatorRows.innerHTML = recent.map(function (r) {
+        var idle = r.idle_for_seconds == null ? "-" : Math.round(Number(r.idle_for_seconds));
+        var result = r.result_json_present ? "present" : "absent";
+        var suggested = r.suggested_action || "none";
+        return "<tr>"
+          + "<td>" + escapeHtml(r.run_id) + "</td>"
+          + "<td>" + escapeHtml(r.runtime_status || "-") + "</td>"
+          + "<td>" + (r.pid_alive ? "yes" : "no") + "</td>"
+          + "<td>" + escapeHtml(idle) + "</td>"
+          + "<td>" + escapeHtml(result) + "</td>"
+          + "<td>" + escapeHtml(suggested) + "</td>"
+          + "</tr>";
+      }).join("");
+    }
+  }
+
+  if (adminPrLoopRoot) {
+    adminPrLoopRoot.textContent = prLoop.exists
+      ? "root: " + prLoop.root + " (next cycle: " + prLoop.next_cycle + ")"
+      : "root not found: " + prLoop.root + " (next cycle will be 1) — agentops pr-loop creates it on first run";
+  }
+
+  if (adminPrLoopRows) {
+    var cycles = prLoop.cycles || [];
+    if (!cycles.length) {
+      adminPrLoopRows.innerHTML = '<tr><td colspan="2" class="muted">No PR-loop cycles yet — start one with: agentops pr-loop …</td></tr>';
+    } else {
+      adminPrLoopRows.innerHTML = cycles.map(function (c) {
+        return "<tr>"
+          + "<td>" + escapeHtml(c.cycle) + "</td>"
+          + "<td>" + escapeHtml(c.path) + "</td>"
+          + "</tr>";
+      }).join("");
+    }
+  }
+
+  if (adminWatchdogRows) {
+    var items = watchdog.items || [];
+    if (!items.length) {
+      adminWatchdogRows.innerHTML = '<tr><td colspan="3" class="muted">No watchdog failures detected.</td></tr>';
+    } else {
+      adminWatchdogRows.innerHTML = items.map(function (r) {
+        return "<tr>"
+          + "<td>" + escapeHtml(r.run_id) + "</td>"
+          + "<td>" + escapeHtml(r.runtime_status || "-") + "</td>"
+          + "<td>" + escapeHtml(r.suggested_action || "none") + "</td>"
+          + "</tr>";
+      }).join("");
+    }
+  }
+
+  if (adminCommandsRows) {
+    if (!commands.length) {
+      adminCommandsRows.innerHTML = '<tr><td colspan="2" class="muted">no commands available</td></tr>';
+    } else {
+      adminCommandsRows.innerHTML = commands.map(function (c) {
+        return "<tr>"
+          + "<td><code>" + escapeHtml(c.name) + "</code></td>"
+          + "<td>" + escapeHtml(c.description) + "</td>"
+          + "</tr>";
+      }).join("");
+    }
+  }
 }
 
   async function postJson(path, body) {

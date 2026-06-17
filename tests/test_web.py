@@ -659,3 +659,228 @@ class OperatorRunsEndpointTests(unittest.TestCase):
             status, data = self._get(forbidden)
             self.assertEqual(status, 404)
             self.assertIn("not found", data["error"].lower())
+
+
+# ---------------------------------------------------------------------------
+# Admin / operator panel (AO-ADMIN-002)
+# ---------------------------------------------------------------------------
+
+
+class AdminPanelHtmlTests(unittest.TestCase):
+    """Static-HTML contract for the admin/operator panel.
+
+    The admin card is rendered by :func:`agentops.web.render_index_html`
+    and polled by the dashboard JavaScript. The tests below lock down
+    the markers a developer would grep for when wiring the section.
+    """
+
+    def test_admin_section_present(self) -> None:
+        html = web.render_index_html()
+        self.assertIn("Admin / Operator panel", html)
+        self.assertIn("/api/admin", html)
+
+    def test_admin_section_has_key_subsections(self) -> None:
+        html = web.render_index_html()
+        for required in (
+            "Roadmap state",
+            "Latest events",
+            "Operator-run status",
+            "PR-loop cycles",
+            "Watchdog failures",
+            "Recommended next commands",
+        ):
+            self.assertIn(required, html, required)
+
+    def test_admin_section_has_empty_state_anchors(self) -> None:
+        # The empty-state rows must exist in the HTML so the JavaScript
+        # has a tbody to fall back to when no data is present.
+        html = web.render_index_html()
+        for row_id in (
+            "admin-roadmap-rows",
+            "admin-event-rows",
+            "admin-operator-rows",
+            "admin-pr-loop-rows",
+            "admin-watchdog-rows",
+            "admin-commands-rows",
+        ):
+            self.assertIn(f'id="{row_id}"', html, row_id)
+
+    def test_admin_section_renderer_wired_in_js(self) -> None:
+        html = web.render_index_html()
+        # The dashboard JavaScript must reference the admin renderer and
+        # poll the /api/admin endpoint.
+        self.assertIn("/api/admin", html)
+        self.assertIn("renderAdmin", html)
+
+    def test_admin_html_omits_unsafe_endpoints(self) -> None:
+        html = web.render_index_html()
+        for forbidden in ("/api/exec", "/api/shell", "/api/command"):
+            self.assertNotIn(forbidden, html)
+
+
+class AdminPanelApiTests(unittest.TestCase):
+    """End-to-end tests for :func:`agentops.web.collect_admin_panel`.
+
+    The admin panel is read-only; the tests below exercise the
+    function directly (no live HTTP server needed) and confirm the
+    payload is shaped the way the dashboard JavaScript expects.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.db = self.tmp / "state.sqlite"
+        self.store = StateStore(self.db)
+        self.store.init()
+
+    def test_admin_panel_empty_state_is_well_formed(self) -> None:
+        panel = web.collect_admin_panel(self.store)
+        # Top-level keys.
+        for key in (
+            "roadmap_state",
+            "latest_events",
+            "operator_runs",
+            "pr_loop_cycles",
+            "watchdog_failures",
+            "recommended_commands",
+        ):
+            self.assertIn(key, panel, key)
+        # Roadmap state on a fresh DB.
+        self.assertEqual(panel["roadmap_state"]["roadmaps"], [])
+        self.assertEqual(panel["roadmap_state"]["total_tasks"], 0)
+        self.assertEqual(panel["roadmap_state"]["roadmap_count"], 0)
+        # Latest events.
+        self.assertEqual(panel["latest_events"], [])
+        # Operator runs / watchdog failures.
+        self.assertEqual(panel["operator_runs"]["summary"]["total"], 0)
+        self.assertEqual(panel["operator_runs"]["summary"]["running"], 0)
+        self.assertEqual(panel["operator_runs"]["recent"], [])
+        self.assertEqual(panel["watchdog_failures"]["count"], 0)
+        self.assertEqual(panel["watchdog_failures"]["items"], [])
+        # PR-loop cycles.
+        self.assertFalse(panel["pr_loop_cycles"]["exists"])
+        self.assertEqual(panel["pr_loop_cycles"]["cycles"], [])
+        self.assertEqual(panel["pr_loop_cycles"]["next_cycle"], 1)
+        # Recommended commands must list all four CLI hints.
+        names = [cmd["name"] for cmd in panel["recommended_commands"]]
+        self.assertIn("agentops operator-status", names)
+        self.assertIn("agentops operator-tail", names)
+        self.assertIn("agentops task-tail", names)
+        self.assertIn("agentops pr-loop", names)
+
+    def test_admin_panel_rolls_up_roadmap_state(self) -> None:
+        from agentops.models import RepoConfig, TaskConfig, TaskState
+        from agentops.plan import RoadmapConfig
+
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        prompt = self.tmp / "prompt.md"
+        prompt.write_text("hi", encoding="utf-8")
+        tasks = (
+            TaskConfig(id="T-1", kind="guard", prompt_path=prompt),
+            TaskConfig(id="T-2", kind="guard", prompt_path=prompt),
+        )
+        roadmap = RoadmapConfig(
+            version=1,
+            roadmap_id="R1",
+            repo=RepoConfig(id="x", path=repo),
+            tasks=tasks,
+        )
+        self.store.import_roadmap(roadmap)
+        self.store.transition_task("R1", "T-1", TaskState.ACCEPTED)
+        self.store.transition_task("R1", "T-2", TaskState.FAILED)
+
+        panel = web.collect_admin_panel(self.store)
+        self.assertEqual(panel["roadmap_state"]["roadmap_count"], 1)
+        self.assertEqual(panel["roadmap_state"]["total_tasks"], 2)
+        entry = panel["roadmap_state"]["roadmaps"][0]
+        self.assertEqual(entry["roadmap_id"], "R1")
+        self.assertEqual(entry["total"], 2)
+        # The roll-up must report both states.
+        self.assertIn("accepted", entry["by_state"])
+        self.assertIn("failed", entry["by_state"])
+
+    def test_admin_panel_collects_pr_loop_cycles(self) -> None:
+        # When the .agentops/pr-loop/cycle-N layout exists on disk, the
+        # panel must surface the cycle numbers without spawning any
+        # process.
+        root = self.tmp / ".agentops" / "pr-loop"
+        (root / "cycle-1").mkdir(parents=True)
+        (root / "cycle-2").mkdir(parents=True)
+        (root / "not-a-cycle").mkdir()  # must be ignored
+        # Re-point the helper at the temporary root for this test.
+        with mock.patch.object(web, "_default_pr_loop_root", return_value=root):
+            panel = web.collect_admin_panel(self.store)
+        cycles = panel["pr_loop_cycles"]
+        self.assertTrue(cycles["exists"])
+        self.assertEqual(
+            [c["cycle"] for c in cycles["cycles"]], [1, 2]
+        )
+        self.assertEqual(cycles["next_cycle"], 3)
+
+    def test_admin_panel_surfaces_watchdog_failures(self) -> None:
+        # A fake operator-run directory with a needs_operator status is
+        # classified as a watchdog failure by the admin panel.
+        runs_root = self.tmp / "runs-root"
+        run_id = "20260617T000000Z-fake-aaaaaaaa"
+        run_dir = runs_root / ".operator-runs" / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "status.json").write_text(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "name": "demo",
+                    "status": "needs_operator",
+                    "exit_code": 0,
+                    "pid": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"AGENTOPS_OPERATOR_RUNS_ROOT": str(runs_root)},
+            clear=False,
+        ):
+            panel = web.collect_admin_panel(self.store)
+        self.assertEqual(panel["watchdog_failures"]["count"], 1)
+        self.assertEqual(panel["watchdog_failures"]["items"][0]["run_id"], run_id)
+        self.assertEqual(panel["operator_runs"]["summary"]["total"], 1)
+
+    def test_admin_panel_endpoint_returns_json(self) -> None:
+        port = _free_port()
+        server = web.make_server("127.0.0.1", port, state=self.store)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        try:
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                conn.request("GET", "/api/admin")
+                resp = conn.getresponse()
+                data = json.loads(resp.read().decode("utf-8"))
+            finally:
+                conn.close()
+            self.assertEqual(resp.status, 200)
+            for key in (
+                "roadmap_state",
+                "latest_events",
+                "operator_runs",
+                "pr_loop_cycles",
+                "watchdog_failures",
+                "recommended_commands",
+            ):
+                self.assertIn(key, data, key)
+        finally:
+            thread.join(timeout=5)
+
+    def test_admin_panel_does_not_spawn_subprocesses(self) -> None:
+        # The admin panel must be cheap to poll. The dashboard JavaScript
+        # calls /api/admin every 3 seconds, so any subprocess.Popen call
+        # would be a regression.
+        with mock.patch("subprocess.Popen") as popen:
+            panel = web.collect_admin_panel(self.store)
+        popen.assert_not_called()
+        self.assertIn("recommended_commands", panel)

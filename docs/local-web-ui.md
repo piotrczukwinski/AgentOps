@@ -66,6 +66,21 @@ python -m agentops serve --port 9000
 - Start `agentops run --roadmap <path> --no-codex` as a background
   subprocess and report the active `pid` and `argv`.
 - Show a task's recorded artifacts and recent events.
+- Render an **Admin / Operator panel** card that rolls up:
+  - per-roadmap task state (count + breakdown by state),
+  - the latest 10 events from the state database,
+  - a summary histogram of operator-run runtime statuses plus the
+    five most recent runs,
+  - the on-disk `cycle-N` directories under `.agentops/pr-loop/` and
+    the next available cycle number,
+  - operator runs classified as watchdog failures
+    (`needs_operator`, `transient_failed`, `stale_pid`,
+    `exited_or_stale`) so stalled runs are obvious at a glance,
+  - a short list of CLI hints pointing at `agentops operator-status`,
+    `agentops operator-tail`, `agentops task-tail`, and
+    `agentops pr-loop`.
+  Each sub-section renders a clear empty state when its data source
+  is missing, so a fresh checkout still loads the dashboard.
 - Auto-refresh every 3 seconds, with a manual refresh button.
 
 ## What the UI cannot do
@@ -90,6 +105,7 @@ python -m agentops serve --port 9000
 | GET    | `/api/runs`                | Active run subprocesses started from this UI. |
 | GET    | `/api/operator-runs`        | List operator runs visible from this UI (read-only). |
 | GET    | `/api/operator-runs/<run_id>/tail?lines=100` | Return the latest attempt's combined.log tail for `<run_id>`. |
+| GET    | `/api/admin`               | Aggregated payload for the Admin / Operator panel card (roadmap roll-up, latest events, operator-run summary, PR-loop cycles, watchdog failures, recommended commands). |
 | GET    | `/api/logs?task_id=...`    | Task row, artifacts, recent events. |
 | GET    | `/api/artifacts?task_id=...` | Artifact rows for a task. |
 | POST   | `/api/plan`                | `{"roadmap": "..."}` → runs `agentops plan` lint. |
@@ -122,6 +138,38 @@ the matching tail endpoint.
 
 See `docs/night-run-report.md` for the morning checklist
 that pairs with these endpoints.
+
+## Admin / Operator panel (read-only)
+
+The "Admin / Operator panel" card on the dashboard is a single
+read-only roll-up intended for an operator who wants one glance at
+the state of an overnight run. It is fed by `GET /api/admin`, which
+returns:
+
+* `roadmap_state` — per-roadmap task totals + a `{state: count}`
+  histogram, summed from the SQLite state database.
+* `latest_events` — the most recent 10 events from the state database.
+* `operator_runs` — a summary histogram of
+  `runtime_status` values plus the five most recent operator-run
+  projections (same shape as `/api/operator-runs`).
+* `pr_loop_cycles` — the existing `cycle-N` directories under
+  `.agentops/pr-loop/`, plus the next available cycle number. A
+  missing root is reported as `exists=false` rather than as an error.
+* `watchdog_failures` — operator runs whose `runtime_status` is one
+  of `needs_operator`, `transient_failed`, `stale_pid`, or
+  `exited_or_stale`. The list is capped at 5 entries.
+* `recommended_commands` — a static list of CLI hints the operator
+  can copy out of the page:
+  - `agentops operator-status`
+  - `agentops operator-tail`
+  - `agentops task-tail`
+  - `agentops pr-loop`
+
+The card is purely a view; it has no write endpoint. When any data
+source is missing, the affected sub-section renders an explicit
+empty-state row (for example, "No operator runs yet — start one
+with the CLI: `agentops operator-run …`") so the operator is not
+left wondering whether the page is broken.
 
 ## Recommended workflow
 
