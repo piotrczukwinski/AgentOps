@@ -65,12 +65,16 @@ Sensitive mode. AgentOps creates a worktree branch, mirrors it without `.git`, r
 
 ## Review modes
 
-`review.codex` can be:
+`review.codex` (or its `mode` alias) can be:
 
 - `never`: deterministic checks only.
 - `auto`: review if risk, diff size, sensitivity, or failures require it.
 - `required`: always build a Codex review packet.
 - `milestone_only`: reserve review for milestone tasks.
+
+A roadmap-level `review` block (with `codex` or `mode`) is inherited by
+any task that does not declare its own per-task `review` block, so a
+single roadmap-level policy applies to every task by default.
 
 ## Commit and push
 

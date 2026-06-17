@@ -7,6 +7,20 @@ from typing import Any
 from .models import MergePolicy, RepoConfig, ReviewConfig, RoadmapConfig, TaskConfig
 
 
+# Canonical default for the per-task total executor attempts (initial +
+# repair attempts driven by ``REQUEST_CHANGES`` / validation failures).
+# The roadmap-level ``max_repair_attempts`` / ``max_review_repairs`` /
+# ``max_attempts_per_task`` settings override this default; the task-level
+# ``max_attempts`` and the task-level ``max_repair_attempts`` are still
+# honored when the roadmap does not set the field.
+DEFAULT_MAX_REPAIR_ATTEMPTS = 3
+
+
+def default_max_repair_attempts() -> int:
+    """Return the canonical default for per-task total executor attempts."""
+    return DEFAULT_MAX_REPAIR_ATTEMPTS
+
+
 class ConfigError(ValueError):
     """Raised when a roadmap/config file is invalid."""
 
@@ -101,6 +115,13 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
         raise ConfigError("defaults must be an object")
 
     tasks: list[TaskConfig] = []
+    # Resolve the roadmap-level review once so tasks that do not
+    # declare a per-task review can inherit it. This lets roadmaps
+    # write a single ``review: {mode: required}`` block and have it
+    # apply to every task.
+    roadmap_review = _build_roadmap_review(
+        data.get("review", {}) or {}, defaults, base=roadmap_path.parent
+    )
     for raw in tasks_data:
         if not isinstance(raw, dict):
             raise ConfigError("each task must be an object")
@@ -115,8 +136,21 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
         if not prompt_path.is_absolute():
             prompt_path = (roadmap_path.parent / prompt_path).resolve()
 
-        review_data = item.get("review", {}) or {}
-        if isinstance(review_data, str):
+        # ``has_task_review`` distinguishes "task did not declare a
+        # review" (so we should inherit from the roadmap) from
+        # "task declared an empty review block" (so the task wants
+        # the legacy default of ``auto``).
+        has_task_review = "review" in item and item.get("review") not in (None, {}, "")
+        review_data = item.get("review")
+        if not has_task_review:
+            # Inherit from the roadmap-level review.
+            review = ReviewConfig(
+                codex=roadmap_review.codex,
+                risk_threshold=roadmap_review.risk_threshold,
+                schema_path=roadmap_review.schema_path,
+                fallback_heuristic=roadmap_review.fallback_heuristic,
+            )
+        elif isinstance(review_data, str):
             review = ReviewConfig(codex=review_data)
         elif isinstance(review_data, dict):
             schema_path = _resolve_schema_path(
@@ -124,9 +158,10 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 base=roadmap_path.parent,
             )
             review = ReviewConfig(
-                codex=str(review_data.get("codex", item.get("review_policy", "auto"))),
+                codex=_resolve_review_codex(review_data, item, defaults),
                 risk_threshold=int(review_data.get("risk_threshold", defaults.get("codex_risk_threshold", 4))),
                 schema_path=schema_path,
+                fallback_heuristic=bool(review_data.get("fallback_heuristic", defaults.get("review_fallback_heuristic", False))),
             )
         else:
             raise ConfigError(f"task {task_id}: review must be string or object")
@@ -146,7 +181,24 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 forbidden_globs=_as_tuple(item.get("forbidden_globs"), name=f"{task_id}.forbidden_globs"),
                 validations=_as_tuple(item.get("validations"), name=f"{task_id}.validations"),
                 depends_on=_as_tuple(item.get("depends_on"), name=f"{task_id}.depends_on"),
-                max_attempts=int(item.get("max_attempts", defaults.get("max_attempts", 2))),
+                max_attempts=int(
+                    item.get(
+                        "max_attempts",
+                        item.get(
+                            "max_repair_attempts",
+                            item.get(
+                                "max_review_repairs",
+                                defaults.get(
+                                    "max_repair_attempts",
+                                    defaults.get(
+                                        "max_review_repairs",
+                                        defaults.get("max_attempts", DEFAULT_MAX_REPAIR_ATTEMPTS),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                ),
                 timeout_seconds=int(item.get("timeout_seconds", defaults.get("timeout_seconds", 5400))),
                 commit_message=item.get("commit_message"),
                 auto_commit=bool(item.get("auto_commit", defaults.get("auto_commit", False))),
@@ -183,6 +235,15 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
         max_tasks=_optional_int(data.get("max_tasks", defaults.get("max_tasks"))),
         max_attempts_per_task=_optional_int(
             data.get("max_attempts_per_task", defaults.get("max_attempts_per_task"))
+        ),
+        max_repair_attempts=_optional_int(
+            data.get(
+                "max_repair_attempts",
+                data.get(
+                    "max_review_repairs",
+                    defaults.get("max_repair_attempts", defaults.get("max_review_repairs")),
+                ),
+            )
         ),
         review=_build_roadmap_review(data.get("review", {}) or {}, defaults, base=roadmap_path.parent),
         reviewer=str(data.get("reviewer", defaults.get("reviewer", "codex"))),
@@ -232,7 +293,7 @@ def _resolve_schema_path(schema_raw: Any, *, base: Path) -> str | None:
 def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -> ReviewConfig:
     if not isinstance(value, dict):
         raise ConfigError("review must be an object at roadmap level")
-    codex_raw = value.get("codex", value.get("default_mode", defaults.get("review_default_mode", "auto")))
+    codex_raw = _resolve_codex_value(value, defaults)
     codex = str(codex_raw).lower()
     if codex not in {"auto", "required", "never", "milestone_only"}:
         raise ConfigError(f"review.codex must be one of auto/required/never/milestone_only, got {codex_raw!r}")
@@ -245,3 +306,52 @@ def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -
         ),
         fallback_heuristic=bool(value.get("fallback_heuristic", defaults.get("review_fallback_heuristic", False))),
     )
+
+
+def _resolve_codex_value(source: dict[str, Any], defaults: dict[str, Any]) -> Any:
+    """Resolve the canonical codex policy from a review-style mapping.
+
+    Accepts the legacy ``codex`` / ``default_mode`` keys, the
+    ``review.codex`` alias ``mode``, and the roadmap-level
+    ``review_policy`` alias used in older roadmaps. Returns the raw value
+    so the caller can validate it. The lookup order is:
+
+    1. ``codex`` (the canonical key)
+    2. ``mode`` (the explicit alias for the canonical key)
+    3. ``default_mode`` (legacy roadmap-level alias)
+    4. ``defaults["review_default_mode"]`` (legacy default)
+
+    Both ``required`` and ``auto`` / ``never`` / ``milestone_only`` are
+    accepted verbatim. The alias is only honored when the canonical key
+    is absent, so explicit settings always win.
+    """
+    return (
+        source.get("codex")
+        or source.get("mode")
+        or source.get("default_mode")
+        or defaults.get("review_default_mode", "auto")
+    )
+
+
+def _resolve_review_codex(
+    review_data: dict[str, Any],
+    task_data: dict[str, Any],
+    defaults: dict[str, Any],
+) -> str:
+    """Resolve the per-task codex policy, honoring the ``mode`` alias."""
+    source: dict[str, Any] = {
+        "codex": review_data.get("codex"),
+        "mode": review_data.get("mode"),
+    }
+    if "codex" not in review_data and "mode" not in review_data:
+        # Fall back to the legacy ``review_policy`` task-level field.
+        if "review_policy" in task_data:
+            source["default_mode"] = task_data["review_policy"]
+    raw = _resolve_codex_value(source, defaults)
+    codex = str(raw).lower()
+    if codex not in {"auto", "required", "never", "milestone_only"}:
+        raise ConfigError(
+            f"task {task_data.get('id', '?')}: review.codex must be one of "
+            f"auto/required/never/milestone_only, got {raw!r}"
+        )
+    return codex
