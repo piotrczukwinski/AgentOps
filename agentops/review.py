@@ -37,6 +37,8 @@ def codex_command_for(
     schema_path: Path | None = None,
     output_path: Path | None = None,
     binary: str = "codex",
+    model: str | None = None,
+    model_reasoning_effort: str | None = None,
 ) -> list[str]:
     """Return the argv that would be used to invoke Codex for this review.
 
@@ -44,21 +46,28 @@ def codex_command_for(
 
         codex exec --sandbox read-only
                  [--output-schema <schema>] [-o <result>]
+                 [-m <model>] [-c model_reasoning_effort=<value>]
                  <prompt_path>
 
     The read-only sandbox is the safety contract. The older
     ``--ask-for-approval never`` flag is not accepted by current codex-cli
     builds (0.140.0+); the default approval policy on those builds is
-    ``never`` already, so the behaviour is equivalent. If the local Codex
-    CLI uses different flags the orchestrator can override the argv at
-    runner construction time; this function is the single source of truth
-    for the conceptual command and is also what the unit tests assert on.
+    ``never`` already, so the behaviour is equivalent. The
+    ``-m <model>`` and ``-c model_reasoning_effort=<value>`` flags are
+    only emitted when the orchestrator passes non-empty values; the
+    legacy MVP call shape is preserved when no model override is set.
+    If the local Codex CLI uses different flags the orchestrator can
+    override the argv at runner construction time; this function is
+    the single source of truth for the conceptual command and is also
+    what the unit tests assert on.
     """
     return build_codex_command(
         prompt_path,
         schema_path=schema_path,
         output_path=output_path,
         binary=binary,
+        model=model,
+        model_reasoning_effort=model_reasoning_effort,
     )
 
 
@@ -146,6 +155,8 @@ class Reviewer(Protocol):
         artifact_dir: Path,
         schema_path: Path | None,
         timeout_seconds: int,
+        model: str | None = ...,
+        model_reasoning_effort: str | None = ...,
     ) -> tuple[ReviewVerdict, Path]:
         ...
 
@@ -156,6 +167,10 @@ class HeuristicReviewer:
     Returns ACCEPT when the policy and validation results are clean and the
     diff is non-empty, REQUEST_CHANGES when the validation failed, and BLOCK
     when the policy result is not ok.
+
+    The ``model`` and ``model_reasoning_effort`` keyword arguments are
+    accepted for protocol compatibility with :class:`CodexReviewService`
+    but ignored: the heuristic reviewer does not invoke a subprocess.
     """
 
     name = "heuristic"
@@ -167,6 +182,8 @@ class HeuristicReviewer:
         artifact_dir: Path,
         schema_path: Path | None,
         timeout_seconds: int,
+        model: str | None = None,
+        model_reasoning_effort: str | None = None,
     ) -> tuple[ReviewVerdict, Path]:
         result_path = artifact_dir / "review.heuristic.json"
         payload: dict[str, Any] = {
@@ -202,6 +219,8 @@ class CodexReviewService:
         artifact_dir: Path,
         schema_path: Path | None,
         timeout_seconds: int,
+        model: str | None = None,
+        model_reasoning_effort: str | None = None,
     ) -> tuple[ReviewVerdict, Path]:
         output_path = artifact_dir / "review.result.json"
         result = self.runner.run_review(
@@ -212,6 +231,8 @@ class CodexReviewService:
             timeout_seconds=timeout_seconds,
             output_path=output_path,
             binary=self.binary,
+            model=model,
+            model_reasoning_effort=model_reasoning_effort,
         )
         if not result.ok:
             return (
