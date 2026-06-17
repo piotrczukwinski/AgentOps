@@ -178,6 +178,26 @@ not lose the logs, only the in-flight process. The harness uses
 `shell=False`, sanitized env, and `GIT_TERMINAL_PROMPT=0` so the
 safety contract from the gated-roadmap runner is preserved.
 
+For foreground runs that should also stream live output to the
+terminal, pass `--follow`. The follow stream is a side channel on
+top of the durable logs: the run still writes `stdout.log`,
+`stderr.log`, `combined.log`, `status.json`, `command.json`,
+`prompt.md`, and `result.json` exactly as before, and still honors
+`--retry-on-transient`, `--max-retries`, `--backoff`,
+`--startup-timeout`, and `--idle-timeout`. `--follow` is
+foreground-only; combining it with `--detach` is rejected with a
+clear message and the operator is pointed at
+`operator-tail` / `operator-status` for detached runs.
+
+```bash
+python -m agentops operator-run \
+  --name schema-path-hardening \
+  --prompt-file /tmp/prompt.md \
+  --dir /home/czuki/AgentOps \
+  --model minimax/MiniMax-M3 \
+  --follow
+```
+
 Transient network and API failures (timeout, 429, 502/503/504,
 connection reset, DNS, etc.) can be retried automatically or
 manually without losing the run:

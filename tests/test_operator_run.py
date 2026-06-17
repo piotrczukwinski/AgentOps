@@ -2582,5 +2582,186 @@ class NoOutputStartupWatchdogTests(unittest.TestCase):
             self.assertEqual(payload.get("suggested_action"), "operator-retry")
 
 
+# ---------------------------------------------------------------------------
+# operator-run --follow: live terminal streaming for foreground runs
+# ---------------------------------------------------------------------------
+
+
+class OperatorRunFollowTests(unittest.TestCase):
+    """``operator-run --follow`` streams the executor's live output.
+
+    The follow stream is a foreground-only feature. Detached runs are
+    meant to be observed via ``operator-tail``/``operator-status`` and
+    the CLI explicitly rejects the ``--follow --detach`` combination.
+    """
+
+    def _setup(self, tmp: str) -> tuple[Path, Path, Path, Path]:
+        bindir = Path(tmp) / "bin"
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        prompt = root / "prompt.md"
+        prompt.write_text("hi", encoding="utf-8")
+        log = Path(tmp) / "cmd.log"
+        log.write_text("", encoding="utf-8")
+        return bindir, root, prompt, log
+
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = cli.main(argv)
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+        return int(rc), out.getvalue(), err.getvalue()
+
+    def test_operator_run_follow_streams_output_and_writes_logs(self) -> None:
+        # Pass a StringIO as the follow stream and assert the live
+        # output lands there while the durable logs are still written
+        # to stdout.log / stderr.log / combined.log. This is the core
+        # of the follow-mode contract: nothing about logging is
+        # weakened by streaming, and the live view is a side channel
+        # on top of the on-disk durable logs.
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup(tmp)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(
+                    bindir,
+                    stdout="live-stdout-1\nlive-stdout-2\n",
+                    stderr="live-stderr-1\n",
+                    print_result_json={"status": "done", "summary": "followed"},
+                    exit_code=0,
+                )
+                spec, target, argv = start_run(
+                    root=root,
+                    name="follow-stream",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                follow_buf = io.StringIO()
+                payload = run_foreground(spec, target, argv, follow_stream=follow_buf)
+            # Status / exit / result extraction must be untouched.
+            self.assertEqual(payload.get("exit_code"), 0)
+            self.assertEqual(payload.get("status"), "exited")
+            # The durable logs are still written verbatim.
+            self.assertIn("live-stdout-1", (target / "stdout.log").read_text(encoding="utf-8"))
+            self.assertIn("live-stdout-2", (target / "stdout.log").read_text(encoding="utf-8"))
+            self.assertIn("live-stderr-1", (target / "stderr.log").read_text(encoding="utf-8"))
+            self.assertIn("live-stdout-1", (target / "combined.log").read_text(encoding="utf-8"))
+            self.assertIn("live-stderr-1", (target / "combined.log").read_text(encoding="utf-8"))
+            self.assertTrue((target / "result.json").exists())
+            # The follow stream captured the live output. We allow the
+            # stderr marker to be missing (the harness may or may not
+            # prefix it depending on the launch_run argument) but the
+            # raw bytes must be present in the buffer.
+            streamed = follow_buf.getvalue()
+            self.assertIn("live-stdout-1", streamed)
+            self.assertIn("live-stdout-2", streamed)
+            self.assertIn("live-stderr-1", streamed)
+
+    def test_operator_run_follow_rejects_detach(self) -> None:
+        # The CLI must refuse to combine --follow with --detach. We
+        # don't even get to start_run; the rejection happens at
+        # argument-validation time, so no fake binary is required.
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup(tmp)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-run",
+                        "--prompt-file",
+                        str(prompt),
+                        "--dir",
+                        str(root),
+                        "--follow",
+                        "--detach",
+                    ]
+                )
+            self.assertEqual(rc, 2, msg=err)
+            self.assertIn("--follow", err)
+            self.assertIn("--detach", err)
+            self.assertIn("cannot be combined", err)
+            # No run directory should have been created.
+            self.assertFalse((root / ".operator-runs").exists())
+
+    def test_operator_run_follow_preserves_result_extraction(self) -> None:
+        # A --follow run must still write stdout.log / stderr.log /
+        # combined.log / status.json / command.json / prompt.md and
+        # extract the AGENTOPS_RESULT_JSON block into result.json.
+        # This guards the contract that follow is a *side channel*
+        # on top of the durable logs, not a replacement for them.
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup(tmp)
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(
+                    bindir,
+                    stdout="noise\n",
+                    print_result_json={"status": "done", "summary": "kept"},
+                    exit_code=0,
+                )
+                rc, out, err = self._run_cli(
+                    [
+                        "operator-run",
+                        "--prompt-file",
+                        str(prompt),
+                        "--dir",
+                        str(root),
+                        "--follow",
+                    ]
+                )
+            self.assertEqual(rc, 0, msg=err)
+            self.assertIn("--follow enabled", out)
+            run_id = out.split("run_id=", 1)[1].split()[0]
+            run_dir = root / ".operator-runs" / run_id
+            for name in (
+                "prompt.md",
+                "command.json",
+                "status.json",
+                "stdout.log",
+                "stderr.log",
+                "combined.log",
+                "result.json",
+            ):
+                self.assertTrue((run_dir / name).exists(), f"missing {name}")
+            # The result.json reflects the AGENTOPS_RESULT_JSON block.
+            result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result.get("status"), "done")
+            self.assertEqual(result.get("summary"), "kept")
+
+    def test_operator_run_follow_passes_prompt_content_not_path(self) -> None:
+        # --follow must not change the prompt-handling contract: the
+        # executor still receives the prompt CONTENT as its last
+        # argument, never the file path. The fake binary records its
+        # argv to AGENTOPS_FAKE_CMD_LOG; we assert the last line of
+        # the log is the prompt text.
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, root, prompt, log = self._setup(tmp)
+            prompt.write_text("the live prompt content", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENTOPS_FAKE_CMD_LOG": str(log), "PATH": _make_path_with(bindir)}):
+                _write_fake_opencode(bindir, stdout="ok", exit_code=0)
+                spec, target, argv = start_run(
+                    root=root,
+                    name="follow-content",
+                    prompt_path=prompt,
+                    workdir=root,
+                    model="minimax/MiniMax-M3",
+                    runner="opencode",
+                    yolo=False,
+                    detach=False,
+                )
+                # argv itself is the same shape as the non-follow case.
+                self.assertEqual(argv[-1], "the live prompt content")
+                self.assertNotIn("prompt.md", str(argv[-1]))
+                # Actually run with the follow stream attached.
+                run_foreground(spec, target, argv, follow_stream=io.StringIO())
+                recorded = log.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(recorded, "fake binary did not record argv")
+                self.assertEqual(recorded[-1], "the live prompt content")
+                self.assertNotIn("prompt.md", recorded[-1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -137,6 +137,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     operator_run_cmd.set_defaults(detach=False)
     operator_run_cmd.add_argument(
+        "--follow",
+        action="store_true",
+        help=(
+            "Stream the executor's live output to the terminal while the "
+            "foreground run is in progress. Foreground/attached only; cannot "
+            "be combined with --detach (use operator-tail/operator-status for "
+            "detached runs). The run still writes stdout.log, stderr.log, "
+            "combined.log, status.json, command.json, prompt.md, and result.json "
+            "as usual, and still honors --retry-on-transient, --max-retries, "
+            "--backoff, --startup-timeout, and --idle-timeout."
+        ),
+    )
+    operator_run_cmd.add_argument(
         "--max-retries",
         type=int,
         default=3,
@@ -1232,6 +1245,19 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
         write_retry_config,
     )
 
+    follow = bool(getattr(args, "follow", False))
+    if follow and bool(getattr(args, "detach", False)):
+        # --follow is foreground-only by design: detached runs are meant
+        # to be observed via operator-tail/operator-status, never via
+        # a live terminal stream. Refuse the combination up front so
+        # the operator does not silently lose the live view.
+        print(
+            "--follow cannot be combined with --detach; "
+            "use operator-tail/operator-status for detached runs",
+            file=sys.stderr,
+        )
+        return 2
+
     root = _operator_run_root(args)
     if not root.exists() or not root.is_dir():
         print(f"Workdir does not exist or is not a directory: {root}", file=sys.stderr)
@@ -1303,6 +1329,10 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
         )
         return 0
 
+    follow_stream = sys.stdout if follow else None
+    if follow:
+        print("operator-run: --follow enabled; streaming executor output to terminal")
+
     if retry_on_transient:
         payload = run_foreground_with_retries(
             spec,
@@ -1313,12 +1343,14 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
             retry_on_transient=True,
             idle_timeout=idle_timeout,
             startup_timeout=startup_timeout,
+            follow_stream=follow_stream,
         )
     else:
         payload = run_foreground(
             spec, target, argv,
             idle_timeout=idle_timeout,
             startup_timeout=startup_timeout,
+            follow_stream=follow_stream,
         )
 
     # Always print the final result (or a clear "not found" note) so the
