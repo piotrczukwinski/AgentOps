@@ -21,6 +21,13 @@ Design constraints (see docs/local-web-ui.md):
 
 from __future__ import annotations
 
+try:
+    from urllib.parse import unquote as _urllib_unquote
+except ImportError:  # pragma: no cover - stdlib always has unquote
+    def _urllib_unquote(value: str) -> str:
+        return value
+
+
 import json
 import logging
 import os
@@ -220,6 +227,106 @@ def collect_logs(state: StateStore, task_id: str) -> dict[str, Any]:
     }
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# Operator-run monitor endpoints (read-only, loopback-only)
+# ---------------------------------------------------------------------------
+
+
+def _default_operator_runs_root() -> Path:
+    r"""Return the directory AgentOps should look at for ``.operator-runs``.
+
+    The default is the resolved AgentOps repo root. Tests can
+    override this with the ``AGENTOPS_OPERATOR_RUNS_ROOT``
+    environment variable to point at a fixture directory.
+    """
+    override = os.environ.get("AGENTOPS_OPERATOR_RUNS_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    roots = _resolve_allowed_roots()
+    return roots.repo_root
+
+
+def _project_operator_run_for_api(
+    run_dir_path: Path, payload: dict[str, Any]
+) -> dict[str, Any]:
+    r"""Project a status payload to the public ``/api/operator-runs`` schema.
+
+    The projection is the single source of truth for the
+    dashboard contract. Tests assert on this exact shape.
+    """
+    return {
+        "run_id": str(payload.get("run_id") or run_dir_path.name),
+        "name": payload.get("name"),
+        "canonical_status": payload.get("canonical_status"),
+        "runtime_status": payload.get("runtime_status"),
+        "pid": payload.get("pid"),
+        "pid_alive": bool(payload.get("pid_alive")),
+        "active_attempt": payload.get("active_attempt"),
+        "active_combined_log": payload.get("active_combined_log"),
+        "log_size_bytes": int(payload.get("log_size_bytes") or 0),
+        "idle_for_seconds": payload.get("idle_for_seconds"),
+        "result_json_present": bool(payload.get("result_json_present")),
+        "suggested_action": payload.get("suggested_action"),
+    }
+
+
+def collect_operator_runs() -> dict[str, Any]:
+    r"""List operator runs visible from the web UI.
+
+    Returns a dict with a single ``runs`` key whose value is a list
+    of the projected run dicts. When the ``.operator-runs/``
+    directory does not exist, returns ``{"runs": []}`` rather than
+    raising.
+    """
+    from .operator_run import list_status
+
+    root = _default_operator_runs_root()
+    try:
+        entries = list_status(root)
+    except FileNotFoundError:
+        return {"runs": []}
+    runs = [
+        _project_operator_run_for_api(path, payload)
+        for path, payload in entries
+    ]
+    return {"runs": runs}
+
+
+def collect_operator_run_tail(
+    run_id: str, *, lines: int = 100
+) -> dict[str, Any]:
+    r"""Return the latest combined.log tail for ``run_id``.
+
+    Raises :class:`FileNotFoundError` when the run directory does
+    not exist. Raises :class:`ValueError` when ``run_id`` contains
+    a path separator or a ``..`` component.
+    """
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("run_id is required")
+    if "/" in run_id or "\\" in run_id or ".." in Path(run_id).parts:
+        raise ValueError("run_id must be a single path component")
+    from .operator_run import (
+        latest_combined_log,
+        resolve_run,
+        tail_combined,
+    )
+
+    root = _default_operator_runs_root()
+    target = resolve_run(root, run_id)
+    log_path = latest_combined_log(target)
+    cap = max(1, min(int(lines), 5000))
+    tail_lines = tail_combined(target, lines=cap)
+    return {
+        "run_id": run_id,
+        "active_combined_log": str(log_path),
+        "lines": cap,
+        "text": "\n".join(tail_lines),
+    }
+
+
 def collect_artifacts(state: StateStore, task_id: str) -> dict[str, Any]:
     state.init()
     rows = state.artifacts_for_task(task_id)
@@ -338,6 +445,12 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/runs":
             self._send_json({"runs": self._server_state().active_runs()})
             return
+        if path == "/api/operator-runs":
+            self._send_json(collect_operator_runs())
+            return
+        if path.startswith("/api/operator-runs/") and path.endswith("/tail"):
+            self._handle_operator_run_tail(path, query)
+            return
         if path == "/api/health":
             self._send_json({"ok": True, "db_path": str(self._server_state().state.db_path)})
             return
@@ -384,6 +497,30 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"started": False, "ok": False, "error": f"plan failed: {exc}"}, status=500)
             return
         self._send_json({"started": False, "ok": report.ok, "report": report.to_dict()})
+
+    def _handle_operator_run_tail(self, path: str, query: dict) -> None:
+        # path is "/api/operator-runs/<id>/tail"; strip the prefix/suffix.
+        run_id = path[len("/api/operator-runs/"):-len("/tail")]
+        try:
+            run_id = _urllib_unquote(run_id)
+        except Exception:  # noqa: BLE001
+            self._send_json({"error": "invalid run_id"}, status=400)
+            return
+        raw_lines = (query.get("lines") or ["100"])[0]
+        try:
+            lines = int(raw_lines)
+        except (TypeError, ValueError):
+            self._send_json({"error": "lines must be an integer"}, status=400)
+            return
+        try:
+            payload = collect_operator_run_tail(run_id, lines=lines)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=404)
+            return
+        self._send_json(payload)
 
     def _handle_run(self, payload: dict[str, Any]) -> None:
         roadmap = payload.get("roadmap")
@@ -519,6 +656,22 @@ INDEX_TEMPLATE = """<!doctype html>
   </section>
 
   <section class="card">
+    <h2 style="margin-top:0;font-size:15px;">Operator runs (monitor)</h2>
+    <table>
+      <thead>
+        <tr><th>Run id</th><th>Name</th><th>Runtime</th><th>PID</th><th>Idle (s)</th><th>Log size</th><th>Result</th><th>Suggested</th><th>Action</th></tr>
+      </thead>
+      <tbody id="operator-runs-rows"><tr><td colspan="9" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <div class="row" style="margin-top:8px;">
+      <label for="operator-run-input" class="muted">Run id:</label>
+      <input id="operator-run-input" type="text" placeholder="20260617T004015Z-..." size="42" />
+      <button class="secondary" id="operator-tail-btn">Tail (200 lines)</button>
+    </div>
+    <pre id="operator-tail-output" class="muted">click Tail to load the latest attempt log for the selected run id.</pre>
+  </section>
+
+  <section class="card">
     <h2 style="margin-top:0;font-size:15px;">Task detail</h2>
     <div class="row">
       <label for="task-input" class="muted">Task id:</label>
@@ -539,6 +692,10 @@ INDEX_TEMPLATE = """<!doctype html>
   const eventRows = $("event-rows");
   const taskCount = $("task-count");
   const runsList = $("runs-list");
+  const operatorRunsRows = $("operator-runs-rows");
+  const operatorRunInput = $("operator-run-input");
+  const operatorTailOutput = $("operator-tail-output");
+  const operatorTailBtn = $("operator-tail-btn");
   const planOutput = $("plan-output");
   const detailOutput = $("detail-output");
   const roadmapSelect = $("roadmap-select");
@@ -644,9 +801,54 @@ INDEX_TEMPLATE = """<!doctype html>
     renderTasks(statusRes.data.tasks);
     renderEvents(statusRes.data.events);
 
-    const runsRes = await fetchJson("/api/runs");
-    if (runsRes.ok) renderRuns(runsRes.data.runs);
+
+  const runsRes = await fetchJson("/api/runs");
+  if (runsRes.ok) renderRuns(runsRes.data.runs);
+
+  const opRes = await fetchJson("/api/operator-runs");
+  if (opRes.ok) renderOperatorRuns(opRes.data.runs);
+}
+
+function renderOperatorRuns(runs) {
+  if (!runs || !runs.length) {
+    operatorRunsRows.innerHTML = '<tr><td colspan="9" class="muted">No operator runs yet</td></tr>';
+    return;
   }
+  operatorRunsRows.innerHTML = runs.map(function (r) {
+    const idle = r.idle_for_seconds == null ? "-" : Math.round(Number(r.idle_for_seconds));
+    const suggested = r.suggested_action || "none";
+    const result = r.result_json_present ? "present" : "absent";
+    return "<tr>"
+      + "<td>" + escapeHtml(r.run_id) + "</td>"
+      + "<td>" + escapeHtml(r.name || "-") + "</td>"
+      + "<td>" + escapeHtml(r.runtime_status || "-") + "</td>"
+      + "<td>" + escapeHtml(r.pid == null ? "-" : r.pid) + "</td>"
+      + "<td>" + escapeHtml(idle) + "</td>"
+      + "<td>" + escapeHtml(r.log_size_bytes) + "</td>"
+      + "<td>" + escapeHtml(result) + "</td>"
+      + "<td>" + escapeHtml(suggested) + "</td>"
+      + '<td><button class="secondary op-tail-btn" data-run-id="' + escapeHtml(r.run_id) + '">Tail</button></td>'
+      + "</tr>";
+  }).join("");
+  const buttons = operatorRunsRows.querySelectorAll(".op-tail-btn");
+  buttons.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      operatorRunInput.value = btn.getAttribute("data-run-id") || "";
+      tailOperatorRun();
+    });
+  });
+}
+
+async function tailOperatorRun() {
+  const runId = (operatorRunInput.value || "").trim();
+  if (!runId) {
+    operatorTailOutput.textContent = "enter or select a run id first";
+    return;
+  }
+  operatorTailOutput.textContent = "loading...";
+  const res = await fetchJson("/api/operator-runs/" + encodeURIComponent(runId) + "/tail?lines=200");
+  operatorTailOutput.textContent = JSON.stringify(res.data, null, 2);
+}
 
   async function postJson(path, body) {
     return fetchJson(path, {
@@ -657,6 +859,7 @@ INDEX_TEMPLATE = """<!doctype html>
   }
 
   $("refresh-btn").addEventListener("click", refresh);
+  if (operatorTailBtn) operatorTailBtn.addEventListener("click", tailOperatorRun);
   $("plan-btn").addEventListener("click", async function () {
     const roadmap = getRoadmap();
     if (!roadmap) { planOutput.textContent = "select or type a roadmap first"; return; }

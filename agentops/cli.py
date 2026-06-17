@@ -176,6 +176,21 @@ def build_parser() -> argparse.ArgumentParser:
             "reason 'idle_timeout'. Default: no idle timeout."
         ),
     )
+    operator_run_cmd.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Startup watchdog timeout in seconds. If the active combined.log is "
+            "still 0 bytes after this many seconds while the process is still "
+            "alive, terminate the process group and mark the run with status "
+            "'needs_operator', reason 'no_output_startup', and "
+            "failure_category 'no_output_startup'. Distinct from --idle-timeout "
+            "so the operator (and the morning checklist) can tell the difference "
+            "between 'stalled after writing something' and 'never wrote anything'. "
+            "Default: no startup timeout."
+        ),
+    )
 
     operator_status_cmd = sub.add_parser(
         "operator-status",
@@ -286,6 +301,29 @@ def build_parser() -> argparse.ArgumentParser:
             "Do not append the 'continue from current working tree' hint to the "
             "retry prompt, even if the working directory is a git repo with "
             "uncommitted changes. Default: append the hint."
+        ),
+    )
+    operator_retry_cmd.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Watchdog timeout in seconds for this retry. If the active combined.log "
+            "does not grow for this many seconds while the process is still alive, "
+            "terminate the process group and mark the run with status 'needs_operator' "
+            "and reason 'idle_timeout'. Default: no idle timeout."
+        ),
+    )
+    operator_retry_cmd.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Startup watchdog timeout in seconds for this retry. If the active "
+            "combined.log is still 0 bytes after this many seconds while the "
+            "process is still alive, terminate the process group and mark the run "
+            "with status 'needs_operator', reason 'no_output_startup', and "
+            "failure_category 'no_output_startup'. Default: no startup timeout."
         ),
     )
 
@@ -766,6 +804,50 @@ def export_summary(state: StateStore, roadmap_id: str | None = None) -> str:
     if not rows:
         lines.append("No tasks recorded.")
         return "\n".join(lines)
+
+    # Compute the run-level verdict. The summary must never report
+    # ``passed`` while any task is in merge_failed / blocked /
+    # awaiting_review, regardless of whether the review queue is
+    # empty.
+    counts: dict[str, int] = {}
+    merge_failed_count = 0
+    blocked_count = 0
+    awaiting_review_count = 0
+    for row in rows:
+        counts[row["state"]] = counts.get(row["state"], 0) + 1
+        if row["state"] == "merge_failed":
+            merge_failed_count += 1
+        elif row["state"] == "blocked":
+            blocked_count += 1
+        elif row["state"] == "awaiting_review":
+            awaiting_review_count += 1
+    passed_states = {"accepted", "pushed", "merged", "skipped"}
+    non_pass = (
+        merge_failed_count
+        + blocked_count
+        + awaiting_review_count
+        + counts.get("failed", 0)
+    )
+    if non_pass == 0 and all(row["state"] in passed_states for row in rows):
+        run_verdict = "passed"
+    elif merge_failed_count or counts.get("failed", 0):
+        run_verdict = "failed"
+    elif awaiting_review_count:
+        run_verdict = "awaiting_review"
+    elif blocked_count:
+        run_verdict = "blocked"
+    else:
+        run_verdict = "in_progress"
+
+    lines.append(f"**Run verdict:** `{run_verdict}`")
+    lines.append(
+        f"**Counts:** accepted={counts.get('accepted', 0)} "
+        f"merged={counts.get('merged', 0)} pushed={counts.get('pushed', 0)} "
+        f"skipped={counts.get('skipped', 0)} "
+        f"merge_failed={merge_failed_count} blocked={blocked_count} "
+        f"awaiting_review={awaiting_review_count} failed={counts.get('failed', 0)}"
+    )
+    lines.append("")
     lines.append("| Roadmap | Task | State | Attempt | Risk |")
     lines.append("|---|---|---:|---:|---:|")
     for row in rows:
@@ -782,7 +864,58 @@ def export_summary(state: StateStore, roadmap_id: str | None = None) -> str:
         lines.append(f"Integration branch: `{rm['integration_branch']}`")
         lines.append("")
 
+    if merge_failed_count:
+        lines.append("## Merge-failed tasks")
+        lines.append(
+            "The following tasks reached ACCEPT but the integration merge "
+            "or cherry-pick failed. The run must NOT be summarized as "
+            "passed; the integration branch is partial and may need a "
+            "manual salvage (see docs/night-run-report.md)."
+        )
+        for row in rows:
+            if row["state"] == "merge_failed":
+                lines.append(f"- task `{row['id']}` (roadmap `{row['roadmap_id']}`)")
+        lines.append("")
+
+    if blocked_count:
+        lines.append("## Blocked tasks")
+        for row in rows:
+            if row["state"] == "blocked":
+                lines.append(f"- task `{row['id']}` (roadmap `{row['roadmap_id']}`)")
+        lines.append("")
+
+    if awaiting_review_count:
+        lines.append("## Awaiting-review tasks")
+        lines.append(
+            "The following tasks are still waiting for a human or codex "
+            "verdict. The review queue being empty is NOT sufficient to "
+            "call the run passed; the morning checklist must apply a "
+            "verdict to each task via `agentops decide`."
+        )
+        for row in rows:
+            if row["state"] == "awaiting_review":
+                lines.append(f"- task `{row['id']}` (roadmap `{row['roadmap_id']}`)")
+        lines.append("")
+
     lines.append("## Latest events")
+    if rows:
+        first_roadmap = rows[0]["roadmap_id"]
+        with state.connect() as conn:
+            rm_row = conn.execute(
+                "SELECT config_json FROM roadmaps WHERE id=?", (first_roadmap,),
+            ).fetchone()
+        if rm_row is not None:
+            import json as _json
+            try:
+                cfg = _json.loads(rm_row["config_json"])
+            except _json.JSONDecodeError:
+                cfg = {}
+            budget_block = cfg.get("budget") or {}
+            if budget_block:
+                lines.append("## Budget snapshot")
+                for key, value in budget_block.items():
+                    lines.append(f"- `{key}`: {value}")
+                lines.append("")
     for row in state.latest_events(30):
         lines.append(f"- `{row['created_at']}` `{row['type']}` roadmap=`{row['roadmap_id']}` task=`{row['task_id']}`")
     return "\n".join(lines)
@@ -1089,6 +1222,7 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
         DEFAULT_MAX_RETRIES,
         DEFAULT_RETRY_BACKOFF,
         NEEDS_OPERATOR_STATUS,
+        NO_OUTPUT_STARTUP_REASON,
         TRANSIENT_FAILED_STATUS,
         parse_backoff,
         run_detached,
@@ -1157,6 +1291,9 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
     idle_timeout = getattr(args, "idle_timeout", None)
     if idle_timeout is not None:
         print(f"operator-run: idle_timeout={idle_timeout}s")
+    startup_timeout = getattr(args, "startup_timeout", None)
+    if startup_timeout is not None:
+        print(f"operator-run: startup_timeout={startup_timeout}s")
 
     if spec.detach:
         run_detached(spec, target, argv)
@@ -1175,10 +1312,13 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
             backoff=backoff,
             retry_on_transient=True,
             idle_timeout=idle_timeout,
+            startup_timeout=startup_timeout,
         )
     else:
         payload = run_foreground(
-            spec, target, argv, idle_timeout=idle_timeout
+            spec, target, argv,
+            idle_timeout=idle_timeout,
+            startup_timeout=startup_timeout,
         )
 
     # Always print the final result (or a clear "not found" note) so the
@@ -1198,6 +1338,18 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
                 f"Inspect the log with 'agentops operator-tail {spec.run_id}' and try "
                 f"'agentops operator-retry {spec.run_id}' once the upstream is healthy."
             )
+        elif (
+            payload.get("status") == NEEDS_OPERATOR_STATUS
+            and payload.get("error") == NO_OUTPUT_STARTUP_REASON
+        ):
+            print(
+                f"operator-run: status=needs_operator exit_code={payload.get('exit_code')} "
+                f"reason=no_output_startup startup_for_seconds={payload.get('startup_for_seconds')} "
+                f"startup_timeout={payload.get('startup_timeout')}s "
+                f"startup_log_size_bytes={payload.get('startup_log_size_bytes')}. "
+                f"Inspect the log with 'agentops operator-tail {spec.run_id}' and "
+                f"recover with 'agentops operator-retry {spec.run_id}' or re-run in the foreground."
+            )
         elif payload.get("status") == NEEDS_OPERATOR_STATUS and payload.get("error") == "idle_timeout":
             print(
                 f"operator-run: status=needs_operator exit_code={payload.get('exit_code')} "
@@ -1213,8 +1365,8 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
             )
     if payload.get("status") == TRANSIENT_FAILED_STATUS:
         return 75  # conventional "temp fail" exit code
-    if payload.get("status") == NEEDS_OPERATOR_STATUS and payload.get("error") == "idle_timeout":
-        # The idle watchdog is not a retryable failure: the operator
+    if payload.get("status") == NEEDS_OPERATOR_STATUS and payload.get("error") in {"idle_timeout", "no_output_startup"}:
+        # The watchdog is not a retryable failure: the operator
         # must inspect the log or rerun manually. Use 1 so the
         # exit-code convention stays simple.
         return 1
@@ -1524,6 +1676,8 @@ def _cmd_operator_retry(args: argparse.Namespace) -> int:
     # Run the attempt in the foreground. The retry loop, if enabled,
     # handles backoff and additional attempts; the per-attempt logs go to
     # ``attempts/<n>/`` and the top-level status.json is updated.
+    idle_timeout = getattr(args, "idle_timeout", None)
+    startup_timeout = getattr(args, "startup_timeout", None)
     if retry_on_transient:
         # The retry function counts ``max_retries`` as *additional*
         # attempts after ``start_attempt_no``. For operator-retry the
@@ -1540,6 +1694,8 @@ def _cmd_operator_retry(args: argparse.Namespace) -> int:
             retry_on_transient=True,
             start_log_dir=attempt_dir(target, attempt_no),
             start_attempt_no=attempt_no,
+            idle_timeout=idle_timeout,
+            startup_timeout=startup_timeout,
         )
     else:
         # Single attempt: use run_attempt_foreground with the per-attempt
@@ -1554,6 +1710,8 @@ def _cmd_operator_retry(args: argparse.Namespace) -> int:
             log_dir=attempt_dir(target, attempt_no),
             env=None,
             attempt_status="running",
+            idle_timeout=idle_timeout,
+            startup_timeout=startup_timeout,
         )
         payload = _finalize_attempts(
             spec,

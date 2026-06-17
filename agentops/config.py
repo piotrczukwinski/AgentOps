@@ -157,6 +157,7 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                     defaults.get("executor_options"),
                     item.get("executor_options"),
                 ),
+                require_executor_result=bool(item.get("require_executor_result", False)),
                 metadata={k: v for k, v in item.items() if k.startswith("x_")},
             )
         )
@@ -169,6 +170,7 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
         defaults=defaults,
         policies=data.get("policies", {}) or {},
         runtime_budget=data.get("runtime_budget", {}) or {},
+        budget=data.get("budget") or {},
         path=roadmap_path,
         integration_branch=str(
             data.get("integration_branch")
