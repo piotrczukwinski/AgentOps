@@ -123,8 +123,12 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 review_data.get("schema_path") or review_data.get("schema"),
                 base=roadmap_path.parent,
             )
+            codex_raw = review_data.get(
+                "codex",
+                review_data.get("mode", item.get("review_policy", "auto")),
+            )
             review = ReviewConfig(
-                codex=str(review_data.get("codex", item.get("review_policy", "auto"))),
+                codex=str(codex_raw),
                 risk_threshold=int(review_data.get("risk_threshold", defaults.get("codex_risk_threshold", 4))),
                 schema_path=schema_path,
             )
@@ -232,7 +236,10 @@ def _resolve_schema_path(schema_raw: Any, *, base: Path) -> str | None:
 def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -> ReviewConfig:
     if not isinstance(value, dict):
         raise ConfigError("review must be an object at roadmap level")
-    codex_raw = value.get("codex", value.get("default_mode", defaults.get("review_default_mode", "auto")))
+    codex_raw = value.get(
+        "codex",
+        value.get("mode", value.get("default_mode", defaults.get("review_default_mode", "auto"))),
+    )
     codex = str(codex_raw).lower()
     if codex not in {"auto", "required", "never", "milestone_only"}:
         raise ConfigError(f"review.codex must be one of auto/required/never/milestone_only, got {codex_raw!r}")

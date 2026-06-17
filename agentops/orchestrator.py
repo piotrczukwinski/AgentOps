@@ -24,6 +24,7 @@ from .budget import BudgetManager
 from .git_ops import (
     IntegrationBranchBlocked,
     branch_for_task,
+    branch_exists,
     collect_diff,
     commit,
     copy_allowed_files_back,
@@ -330,7 +331,8 @@ class Orchestrator:
     ) -> None:
         runtime = _TaskRuntime()
         self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.PREFLIGHT)
-        runtime.base_sha = rev_parse(roadmap.repo.path, roadmap.repo.base_branch)
+        task_base_ref = self._base_ref_for_task(roadmap)
+        runtime.base_sha = rev_parse(roadmap.repo.path, task_base_ref)
         runtime.branch = branch_for_task(task.branch_prefix, roadmap.roadmap_id, task.id)
 
         preflight = policy.preflight(task, runtime.branch)
@@ -348,7 +350,7 @@ class Orchestrator:
         artifact_root = self.options.artifacts_root or (roadmap.repo.path / ".agentops")
         artifact_store = ArtifactStore(artifact_root)
         target_worktree = create_worktree(
-            roadmap.repo.path, workspace_root, runtime.branch, roadmap.repo.base_branch
+            roadmap.repo.path, workspace_root, runtime.branch, task_base_ref
         )
         runtime.workspace = target_worktree
         execution_cwd = target_worktree
@@ -517,7 +519,7 @@ class Orchestrator:
                 copy_allowed_files_back(runtime.mirror, target_worktree, task.allowed_files)
 
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.DIFF_COLLECTED)
-            diff = collect_diff(target_worktree, roadmap.repo.base_branch)
+            diff = collect_diff(target_worktree, task_base_ref)
             diff_patch_path = artifact_store.write_text(attempt_dir, "diff.patch", diff.patch)
             diff_stat_path = artifact_store.write_text(attempt_dir, "diff.stat", diff.stat)
             changed_path = artifact_store.write_text(
@@ -704,8 +706,9 @@ class Orchestrator:
             if verdict.verdict == "REQUEST_CHANGES":
                 self._record_roadmap_event(roadmap, "task.request_changes", task.id)
                 if attempt_no < max_attempts:
-                    runtime.repair_prompt = verdict.repair_prompt or compiler.repair_prompt_from_validation(
-                        task, validation
+                    runtime.repair_prompt = (
+                        verdict.repair_prompt
+                        or compiler.repair_prompt_from_review(task, verdict)
                     )
                     repair_path = artifact_store.write_text(
                         attempt_dir, "repair.prompt.md", runtime.repair_prompt
@@ -766,6 +769,17 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Review execution
     # ------------------------------------------------------------------
+    def _base_ref_for_task(self, roadmap: RoadmapConfig) -> str:
+        integration_branch = roadmap.integration_branch
+        if (
+            integration_branch
+            and roadmap.merge_policy.auto_merge
+            and not is_protected_branch(integration_branch, roadmap.merge_policy.protected_branches)
+            and branch_exists(roadmap.repo.path, integration_branch)
+        ):
+            return integration_branch
+        return roadmap.repo.base_branch
+
     def _run_review(
         self,
         *,
