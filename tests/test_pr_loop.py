@@ -11,7 +11,9 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from agentops import pr_loop
 
@@ -404,6 +406,83 @@ class RequestChangesTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertTrue((pr_root / "13" / "cycle-2" / "executor.prompt.md").is_file())
             self.assertEqual(executor.call_count(), 1)
+
+    def test_request_changes_forwards_custom_timeouts_to_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            reviewer = FakeReviewer(tmp_path / "review")
+            reviewer.write(
+                verdict="REQUEST_CHANGES",
+                blocking_issues=[_blocking_issue()],
+                safe_to_push=True,
+                safe_to_merge=False,
+            )
+            executor = RecordingExecutor()
+            pr_root = tmp_path / "pr-loop"
+            argv = _common_args(reviewer.path, pr_root) + [
+                "--startup-timeout",
+                "12.5",
+                "--idle-timeout",
+                "34.5",
+            ]
+            result = _CliRunner().run(argv, executor=executor)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertEqual(executor.call_count(), 1)
+            self.assertEqual(executor.calls[0]["startup_timeout"], 12.5)
+            self.assertEqual(executor.calls[0]["idle_timeout"], 34.5)
+
+
+class DefaultExecutorBackendTests(unittest.TestCase):
+    def test_default_backend_starts_detached_operator_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pr_root = tmp_path / "pr-loop"
+            run_dir = tmp_path / ".operator-runs" / "real-run-001"
+            run_dir.mkdir(parents=True)
+            spec = SimpleNamespace(run_id="real-run-001")
+            argv = ["opencode", "run", "prompt"]
+            payload = pr_loop.parse_review_payload(
+                _valid_payload(
+                    verdict="REQUEST_CHANGES",
+                    blocking_issues=[_blocking_issue()],
+                    safe_to_push=True,
+                    safe_to_merge=False,
+                )
+            )
+
+            with (
+                mock.patch(
+                    "agentops.operator_run.start_run",
+                    return_value=(spec, run_dir, argv),
+                ) as start_run,
+                mock.patch(
+                    "agentops.operator_run.run_detached",
+                    return_value={"status": "running"},
+                ) as run_detached,
+            ):
+                decision = pr_loop.evaluate_cycle(
+                    payload=payload,
+                    pr_number=13,
+                    repo="example/repo",
+                    branch="feat/example",
+                    pr_root=pr_root,
+                    executor_model="minimax/MiniMax-M3",
+                    max_cycles=3,
+                    startup_timeout=12.5,
+                    idle_timeout=34.5,
+                    dry_run=False,
+                    executor=pr_loop._default_executor_backend(),
+                )
+
+            self.assertEqual(decision.status, "repair_scheduled")
+            self.assertEqual(decision.run_id, "real-run-001")
+            start_run.assert_called_once()
+            run_detached.assert_called_once_with(spec, run_dir, argv)
+            metadata = json.loads((run_dir / "pr_loop_argv.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["pr_number"], "13")
+            self.assertEqual(metadata["cycle"], "cycle-1")
+            self.assertEqual(metadata["startup_timeout"], 12.5)
+            self.assertEqual(metadata["idle_timeout"], 34.5)
 
 
 class MalformedJsonTests(unittest.TestCase):

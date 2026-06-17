@@ -467,6 +467,8 @@ def evaluate_cycle(
     pr_root: Path,
     executor_model: str,
     max_cycles: int,
+    startup_timeout: float,
+    idle_timeout: float,
     dry_run: bool,
     executor: ExecutorBackend | None,
 ) -> LoopDecision:
@@ -532,8 +534,8 @@ def evaluate_cycle(
         workdir=workdir,
         model=executor_model,
         runner="opencode",
-        startup_timeout=DEFAULT_STARTUP_TIMEOUT,
-        idle_timeout=DEFAULT_IDLE_TIMEOUT,
+        startup_timeout=startup_timeout,
+        idle_timeout=idle_timeout,
     )
     decision = dataclasses.replace(decision, run_id=run_id)
     return decision
@@ -551,7 +553,7 @@ def _default_executor_backend() -> ExecutorBackend:
             startup_timeout: float,
             idle_timeout: float,
         ) -> str:
-            from .operator_run import start_run
+            from .operator_run import run_detached, start_run
 
             spec, target, argv = start_run(
                 root=workdir,
@@ -564,6 +566,7 @@ def _default_executor_backend() -> ExecutorBackend:
                 detach=True,
                 argv=None,
             )
+            run_detached(spec, target, argv)
             (target / "pr_loop_argv.json").write_text(
                 json.dumps(
                     {
@@ -571,6 +574,9 @@ def _default_executor_backend() -> ExecutorBackend:
                         "cycle": prompt_path.parent.name,
                         "argv": argv,
                         "model": model,
+                        "runner": runner,
+                        "startup_timeout": startup_timeout,
+                        "idle_timeout": idle_timeout,
                     },
                     indent=2,
                     sort_keys=True,
@@ -659,6 +665,8 @@ def main(argv: list[str] | None = None, *, executor: ExecutorBackend | None = No
             pr_root=pr_root,
             executor_model=str(args.executor_model),
             max_cycles=int(args.max_cycles),
+            startup_timeout=float(args.startup_timeout),
+            idle_timeout=float(args.idle_timeout),
             dry_run=bool(args.dry_run),
             executor=backend,
         )
