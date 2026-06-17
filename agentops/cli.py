@@ -510,6 +510,93 @@ def build_parser() -> argparse.ArgumentParser:
     decide_cmd.add_argument("--safe-to-merge", dest="safe_to_merge", action="store_true", default=True)
     decide_cmd.add_argument("--no-safe-to-merge", dest="safe_to_merge", action="store_false")
 
+    # PR repair loop: turn a Codex-style review verdict JSON (matching
+    # schemas/review_verdict.schema.json) into a deterministic
+    # harness on the PR branch. The final merge is always
+    # operator-controlled. See docs/operator-run-harness.md and
+    # docs/gated-roadmap-runner.md for the full procedure.
+    pr_loop_cmd = sub.add_parser(
+        "pr-loop",
+        help="Run a single cycle of the AgentOps PR repair loop (review verdict -> repair prompt -> executor).",
+        description=(
+            "Load a review verdict JSON (matching schemas/review_verdict.schema.json) "
+            "and run one cycle of the AgentOps PR repair loop. ACCEPT and BLOCK verdicts "
+            "short-circuit; only REQUEST_CHANGES schedules the executor (via the existing "
+            "operator-run harness). The loop never pushes to main, never force-pushes, "
+            "never rebases, and never merges the PR; the final merge remains operator-controlled. "
+            "See docs/operator-run-harness.md and docs/gated-roadmap-runner.md for the full procedure."
+        ),
+    )
+    pr_loop_cmd.add_argument(
+        "pr_number",
+        type=int,
+        help="Pull request number the loop is acting on.",
+    )
+    pr_loop_cmd.add_argument(
+        "--repo",
+        required=True,
+        help="OWNER/REPO (recorded as metadata in the repair prompt).",
+    )
+    pr_loop_cmd.add_argument(
+        "--review-verdict-json",
+        required=True,
+        help="Path to a review verdict JSON file matching schemas/review_verdict.schema.json.",
+    )
+    pr_loop_cmd.add_argument(
+        "--executor-model",
+        default="minimax/MiniMax-M3",
+        help="Executor model id passed to the operator-run harness. Default: minimax/MiniMax-M3.",
+    )
+    pr_loop_cmd.add_argument(
+        "--max-cycles",
+        type=int,
+        default=3,
+        help="Maximum number of repair cycles (default: 3).",
+    )
+    pr_loop_cmd.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=180.0,
+        help="Per-cycle executor startup watchdog in seconds. Default: 180.",
+    )
+    pr_loop_cmd.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=900.0,
+        help="Per-cycle executor idle watchdog in seconds. Default: 900.",
+    )
+    pr_loop_cmd.add_argument(
+        "--branch",
+        default=None,
+        help=(
+            "PR branch name (optional metadata). The loop refuses 'main'/'master' so the "
+            "executor cannot push to a protected branch by accident."
+        ),
+    )
+    pr_loop_cmd.add_argument(
+        "--pr-loop-root",
+        default=".agentops/pr-loop",
+        help=(
+            "Directory under which cycle artifacts are written. "
+            "Default: .agentops/pr-loop."
+        ),
+    )
+    pr_loop_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Write the repair prompt and print the decision, but do not invoke the "
+            "operator-run harness. Use this to preview a REQUEST_CHANGES cycle before "
+            "the executor actually runs."
+        ),
+    )
+    pr_loop_cmd.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format. 'text' (default) prints a one-line summary; 'json' prints the loop decision fields.",
+    )
+
     return parser
 
 
@@ -582,6 +669,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "decide":
             return _cmd_decide(state, args)
+
+        if args.command == "pr-loop":
+            return _cmd_pr_loop(args)
 
         if args.command == "operator-run":
             return _cmd_operator_run(args)
@@ -2156,6 +2246,48 @@ def _cmd_operator_stop(args: argparse.Namespace) -> int:
     if getattr(args, "format", "text") == "json":
         print(json.dumps(format_status_json(payload), indent=2, sort_keys=True))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# PR repair loop
+# ---------------------------------------------------------------------------
+
+
+def _cmd_pr_loop(args: argparse.Namespace) -> int:
+    """Dispatch the new ``agentops pr-loop`` subcommand.
+
+    The actual logic lives in :mod:`agentops.pr_loop`; the CLI side
+    just maps argparse into the module's :func:`main` entry point and
+    lets it run. The module owns the verdict parser, the repair-prompt
+    builder, the cycle guard, and the operator-run dispatch; the CLI
+    only owns the argparse plumbing.
+    """
+    from .pr_loop import main as pr_loop_main
+
+    argv = [
+        str(int(args.pr_number)),
+        "--repo",
+        str(args.repo),
+        "--review-verdict-json",
+        str(args.review_verdict_json),
+        "--executor-model",
+        str(args.executor_model),
+        "--max-cycles",
+        str(int(args.max_cycles)),
+        "--startup-timeout",
+        str(float(args.startup_timeout)),
+        "--idle-timeout",
+        str(float(args.idle_timeout)),
+        "--pr-loop-root",
+        str(args.pr_loop_root),
+        "--format",
+        str(args.format),
+    ]
+    if args.branch:
+        argv.extend(["--branch", str(args.branch)])
+    if args.dry_run:
+        argv.append("--dry-run")
+    return pr_loop_main(argv)
 
 
 if __name__ == "__main__":

@@ -90,7 +90,7 @@ Implemented in this repository:
   reviewer `safe_to_merge` enforcement and protected-branch refusal.
 - CLI commands: `init`, `run`, `status`, `logs`, `artifacts`, `attempts`,
   `review-queue`, `export-summary`, `plan`, `doctor`, `review`, `decide`,
-  `serve`, `operator-run`, `operator-status`, `operator-tail`,
+  `serve`, `pr-loop`, `operator-run`, `operator-status`, `operator-tail`,
   `operator-result`, `operator-retry`, `task-tail`.
 - Offline `plan` command for preflight linting of roadmaps.
 - Local browser UI over the same CLI/state (`agentops serve`, default `127.0.0.1:8765`).
@@ -270,6 +270,70 @@ including the JSON schema and the playbook for terminal disconnects,
 transient failures, stale pids, idle timeouts, and the admin web
 panel integration.
 
+## PR repair loop (`agentops pr-loop`)
+
+`agentops operator-run` covers the *outer* operator prompt. The
+`agentops pr-loop` subcommand covers the *cross-tool* PR repair
+loop: take a Codex-style review JSON, turn it into a deterministic
+repair prompt, and (for `request_changes` verdicts) schedule the
+existing operator-run harness on the PR branch. The final merge is
+always operator-controlled; the loop never pushes to `main`, never
+force-pushes, never rebases, and never merges the PR.
+
+```bash
+python -m agentops pr-loop 13 \
+  --repo example/repo \
+  --review-json /tmp/codex.review.json \
+  --branch feat/example \
+  --pr-loop-root .agentops/pr-loop \
+  --dry-run
+```
+
+The command is deliberately narrow:
+
+* **`approve` verdict** — short-circuits, executor not invoked,
+  prints `status=approved`. `recommended_merge` is surfaced on
+  stderr so the operator can decide whether to merge; the loop
+  never auto-merges.
+* **`comment` verdict** — short-circuits, executor not invoked,
+  prints `status=comment`. Non-blocking issues are recorded but no
+  cycle directory is created.
+* **`request_changes` verdict** — writes a deterministic repair
+  prompt under `.agentops/pr-loop/<pr-number>/cycle-<n>/executor.prompt.md`
+  and (without `--dry-run`) schedules the operator-run harness on
+  the PR branch. The prompt includes the blocking issues verbatim
+  and the input verdict JSON is persisted as `review.verdict.json`
+  next to the prompt so the operator can audit which JSON drove
+  each cycle.
+
+The `--dry-run` flag writes the prompt and prints the decision
+(`status=dry_run`) without invoking the executor. Without
+`--dry-run` the loop delegates to the operator-run harness; it
+never calls `opencode` / `codex` directly. The executor is scheduled
+in detached mode so the loop can be observed with the existing
+`operator-status` / `operator-tail` / `operator-result` commands.
+
+The generated prompt contains anti-hallucination postconditions
+(non-empty diff, validations pass, commit exists, push succeeds) the
+executor must verify before printing `AGENTOPS_RESULT_JSON` with
+`status="done"`. The prompt also forbids: pushing to `main` or any
+protected branch, force-pushing, rebasing, weakening or removing
+existing tests or gates, modifying `BusinessAgent` (unless the
+blocking issue is explicitly about BusinessAgent), and merging the
+PR. The `--max-cycles` guard (default 3) stops the loop from
+spinning forever; once it fires the operator decides the next
+move. The final merge is always operator-controlled.
+
+The MVP accepts the Codex-style lowercase verdict enum
+(`approve` / `request_changes` / `comment`) and the legacy
+uppercase forms (`ACCEPT` / `REQUEST_CHANGES` / `BLOCK`) from
+`schemas/review_verdict.schema.json` for backward compatibility.
+Any other shape (missing field, wrong type, unknown verdict) fails
+closed with a `VerdictParseError` and a non-zero exit code.
+
+See `docs/gated-roadmap-runner.md` for the verdict contract and the
+anti-hallucination checklist, and `docs/operator-run-harness.md`
+for the per-cycle operator-run contract.
 
 For overnight monitoring, see `docs/night-run-report.md` for
 the recommended `agentops operator-run` command and the
@@ -405,8 +469,10 @@ agentops/
   config.py          JSON/YAML roadmap loading
   git_ops.py         git worktree, diff, commit, push, integration merge
   models.py          dataclasses and enums
+  operator_run.py    Operator Run Harness (long operator prompts)
   orchestrator.py    durable task loop
   policy.py          file and branch policy checks
+  pr_loop.py         PR repair loop (review JSON -> repair prompt -> executor)
   prompting.py       executor/review/repair prompt compiler
   review.py          review routing and Codex adapter
   runners.py         shell, OpenCode, and Codex subprocess runners
@@ -422,6 +488,7 @@ docs/
   operator-runbook.md
   usability-mvp.md
   gated-roadmap-runner.md
+  operator-run-harness.md
   local-web-ui.md
 
 examples/

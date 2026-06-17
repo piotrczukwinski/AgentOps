@@ -869,3 +869,128 @@ python -m agentops operator-run \
   --idle-timeout 600
 ```
 
+## PR repair loop (`agentops pr-loop`)
+
+`operator-run` covers the *outer* operator prompt. `agentops pr-loop`
+covers the *cross-tool* PR repair loop: take a Codex-style review JSON,
+turn it into a deterministic repair prompt, and (for `request_changes`
+verdicts) schedule the executor under the harness described above. The
+final merge is always operator-controlled; the loop never pushes to
+`main`, never force-pushes, never rebases, and never merges the PR.
+
+```bash
+python -m agentops pr-loop 13 \
+  --repo example/repo \
+  --review-json /tmp/codex.review.json \
+  --branch feat/example \
+  --pr-loop-root .agentops/pr-loop \
+  --dry-run
+```
+
+### Verdict contract
+
+The loop accepts the Codex-style lowercase enum from the pr-loop MVP
+spec:
+
+| field | type | notes |
+|---|---|---|
+| `verdict` | enum: `approve` \| `request_changes` \| `comment` | uppercase forms (`ACCEPT` / `REQUEST_CHANGES` / `BLOCK`) are also accepted for backward compatibility with the existing `schemas/review_verdict.schema.json` |
+| `summary` | string | reviewer-supplied one-paragraph summary |
+| `blocking_issues` | list of strings or `{file, severity, issue, suggested_fix}` objects | each entry is rendered into the prompt verbatim; plain strings are the Codex MVP form, objects are the legacy form |
+| `non_blocking_issues` | list of strings | rendered into the prompt as guidance only; never block the cycle |
+| `recommended_merge` | bool | surfaced so the operator can decide whether to merge; the loop never merges itself |
+
+Any other shape (missing field, wrong type, unknown verdict) fails
+closed with a `VerdictParseError` and a non-zero exit code. The loop
+never invents a verdict and never silently downgrades a
+`request_changes` to a `comment`.
+
+### Loop semantics
+
+The command is deliberately narrow:
+
+* **`approve` verdict** — short-circuits, executor not invoked, prints
+  `status=approved`. `recommended_merge` is surfaced on stderr so the
+  operator can decide whether to merge; the loop never auto-merges.
+* **`comment` verdict** — short-circuits, executor not invoked, prints
+  `status=comment`. The non-blocking issues are recorded in the
+  output but no cycle directory is created.
+* **`request_changes` verdict** — writes a deterministic repair prompt
+  under `.agentops/pr-loop/<pr-number>/cycle-<n>/executor.prompt.md`
+  and (without `--dry-run`) schedules the existing operator-run harness
+  on the PR branch. The prompt includes the blocking issues verbatim
+  plus the PR metadata, and the input verdict JSON is persisted as
+  `review.verdict.json` next to the prompt so the operator can audit
+  which JSON drove each cycle.
+
+The `--dry-run` flag writes the prompt and prints the decision
+(`status=dry_run`) without invoking the executor. Without `--dry-run`
+the loop delegates to the operator-run harness; it never calls
+`opencode` / `codex` directly. The executor is scheduled in detached
+mode so the loop can be observed with the existing
+`operator-status` / `operator-tail` / `operator-result` commands.
+
+### Anti-hallucination postconditions
+
+The generated prompt contains an explicit "do not claim done unless"
+checklist. The executor is required to print
+`AGENTOPS_RESULT_JSON` with `status="done"` only after verifying:
+
+1. a non-empty diff for this cycle (`git diff --stat`),
+2. all required validation commands exit zero,
+3. a commit exists on the PR branch (`git rev-parse HEAD` +
+   `git log -1 --oneline`),
+4. the commit has been pushed to the remote (`git push` exit 0).
+
+The prompt also forbids: pushing to `main` or any protected branch,
+force-pushing, rebasing, weakening or removing existing tests or
+gates, modifying `BusinessAgent` (unless the blocking issue is
+explicitly about BusinessAgent), and merging the PR. The
+`--max-cycles` guard (default 3) stops the loop from spinning
+forever; once it fires the operator decides the next move.
+
+### Cycle layout
+
+```
+.agentops/pr-loop/
+  <pr-number>/
+    cycle-1/
+      executor.prompt.md      # the rendered prompt
+      review.verdict.json     # a copy of the input verdict JSON
+    cycle-2/                  # next request_changes cycle
+      ...
+    cycle-<N>/                # the loop stops here
+```
+
+Each cycle increments the counter automatically. Once a cycle is
+written, the operator can inspect the prompt with `cat` and (if the
+verdict was wrong) delete the cycle directory before the next run.
+
+### Safety contract
+
+* The loop never touches `main` or `master`. A `--branch main` or
+  `--branch master` argument is refused before the executor is
+  scheduled.
+* The loop never force-pushes, never rebases, never merges the PR,
+  and never weakens existing tests or gates.
+* The loop never modifies `BusinessAgent` (the prompt forbids it
+  unless the blocking issue is explicitly about BusinessAgent).
+* The final merge is always operator-controlled. The loop's `approve`
+  path prints `recommended_merge=false` to stderr and the operator
+  decides whether to merge the PR.
+
+### Limits and follow-ups
+
+* The MVP does not fetch the PR diff or call Codex itself. The
+  operator (or a future wrapper) is expected to:
+  - fetch the PR diff,
+  - call the Codex reviewer,
+  - write the resulting JSON to `--review-json`,
+  - invoke `agentops pr-loop <pr-number> ...`.
+* A direct Codex integration is the next obvious follow-up. It
+  should live in a separate PR so the current MVP stays narrow and
+  testable.
+* An optional auto-merge after repeated `approve` verdicts is
+  intentionally out of scope for this PR. The merge remains
+  operator-controlled.
+
