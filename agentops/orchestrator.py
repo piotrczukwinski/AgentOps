@@ -730,7 +730,26 @@ class Orchestrator:
             # The canonical category is recorded on the BLOCKED
             # transition so the runbook (AO-CONTRACT-004) can grep
             # for it.
-            if task.require_executor_result and result.ok and result.stdout_path is not None:
+            #
+            # AO-AUDIT-003 (B5): the guard is now ON BY DEFAULT for
+            # ``kind == "implementation"`` tasks whose executor is an
+            # agent (``opencode``/``minimax``/``minimax-m3``) so a
+            # silent exit 0 with no AGENTOPS_RESULT_JSON marker is
+            # never accepted as a real completion. Shell executors
+            # are exempt because their result is the exit code, not
+            # a marker — shell tasks are validated by their
+            # ``validations`` block alone. Tasks of other kinds
+            # (docs / review / test / audit) keep the opt-in behaviour.
+            # An implementation task that genuinely wants to opt out
+            # can set ``require_executor_result: false`` explicitly.
+            _result_guard_enabled = bool(task.require_executor_result)
+            if (
+                task.require_executor_result is None
+                and task.kind == "implementation"
+                and task.executor in {"opencode", "minimax", "minimax-m3"}
+            ):
+                _result_guard_enabled = True
+            if _result_guard_enabled and result.ok and result.stdout_path is not None:
                 try:
                     _stdout_text = result.stdout_path.read_text(encoding="utf-8", errors="replace")
                 except OSError:

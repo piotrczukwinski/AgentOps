@@ -190,6 +190,13 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
         else:
             raise ConfigError(f"task {task_id}: review must be string or object")
 
+        # AO-AUDIT-003 (B5): require_executor_result is tri-state.
+        # None = use the kind-based default (implementation tasks are
+        # guarded by default, others are not). An explicit True/False
+        # from the roadmap/task config wins over the default.
+        _req_result_raw = item.get("require_executor_result", None)
+        _require_executor_result = bool(_req_result_raw) if _req_result_raw is not None else None
+
         tasks.append(
             TaskConfig(
                 id=task_id,
@@ -233,7 +240,11 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                     defaults.get("executor_options"),
                     item.get("executor_options"),
                 ),
-                require_executor_result=bool(item.get("require_executor_result", False)),
+                # AO-AUDIT-003 (B5): require_executor_result is tri-state.
+                # None = use the kind-based default (implementation tasks
+                # are guarded by default, others are not). An explicit
+                # True/False from the roadmap/task config wins.
+                require_executor_result=_require_executor_result,
                 metadata={k: v for k, v in item.items() if k.startswith("x_")},
             )
         )

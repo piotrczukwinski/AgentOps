@@ -33,7 +33,15 @@ from tests.test_gated_roadmap import (
 
 
 def _write_two_task_roadmap(root: Path, repo: Path) -> Path:
-    """Write a 2-task roadmap with shell executors that create out1/out2."""
+    """Write a 2-task roadmap with shell executors that create out1/out2.
+
+    The roadmap explicitly sets ``require_executor_result: false`` so the
+    B5 default-on guard for implementation tasks does not block the
+    shell executors (which do not print ``AGENTOPS_RESULT_JSON``). This
+    is the correct escape hatch for roadmaps whose executor is a plain
+    shell command rather than an opencode/codex agent that emits the
+    marker.
+    """
     prompt = root / "prompt.md"
     prompt.write_text("create the output file", encoding="utf-8")
     roadmap_path = root / "r.json"
@@ -55,6 +63,7 @@ def _write_two_task_roadmap(root: Path, repo: Path) -> Path:
                         ),
                         "prompt": str(prompt),
                         "allowed_files": ["out1.txt"],
+                        "require_executor_result": False,
                         "validations": [
                             "python3 -c \"from pathlib import Path; assert Path('out1.txt').read_text(encoding='utf-8') == 'one\\n'\"",
                         ],
@@ -69,6 +78,7 @@ def _write_two_task_roadmap(root: Path, repo: Path) -> Path:
                         ),
                         "prompt": str(prompt),
                         "allowed_files": ["out2.txt"],
+                        "require_executor_result": False,
                         "validations": [
                             "python3 -c \"from pathlib import Path; assert Path('out2.txt').read_text(encoding='utf-8') == 'two\\n'\"",
                         ],

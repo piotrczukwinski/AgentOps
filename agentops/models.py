@@ -127,7 +127,7 @@ class TaskConfig:
     review: ReviewConfig = field(default_factory=ReviewConfig)
     executor_command: str | None = None
     executor_options: dict[str, Any] = field(default_factory=dict)
-    require_executor_result: bool = False
+    require_executor_result: bool | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
