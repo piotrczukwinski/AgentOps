@@ -20,7 +20,10 @@ You must not:
 - change dependencies, env files, secrets, DB/status/runtime data, migrations, evidence, exports, or production data unless explicitly allowed,
 - reduce data collection, source coverage, antidetect behavior, evidence retention, enrichment, NIP resolution, or HTTP evidence finalization.
 
-The final status must be valid JSON with this shape:
+# Final result marker (REQUIRED, read carefully)
+
+When the work is done, print exactly one final result block in this
+preferred form:
 
 AGENTOPS_RESULT_JSON:
 {
@@ -32,7 +35,49 @@ AGENTOPS_RESULT_JSON:
   "needs_review": true
 }
 
-AgentOps will independently verify the diff, files, branch, and validation results. Your JSON is a self-report, not the source of truth.
+Rules for the final marker:
+
+- The marker MUST be the literal token `AGENTOPS_RESULT_JSON` on its
+  own line (or on the same line as the opening brace of the JSON
+  object), followed by a colon (`:`) and then the JSON object.
+- The marker line MUST start with the marker token (after optional
+  leading whitespace). The parser does NOT accept shell-prompted
+  lines (`$ AGENTOPS_RESULT_JSON: ...`, `bash$ AGENTOPS_RESULT_JSON: ...`,
+  `> AGENTOPS_RESULT_JSON: ...`), echoed lines (`echo
+  AGENTOPS_RESULT_JSON=...`), or markers that appear inside a heredoc
+  transcript (`cat <<EOF` ... `AGENTOPS_RESULT_JSON: ...` ... `EOF`).
+  The marker and the JSON must land on stdout directly.
+- The preferred form is the colon form above
+  (`AGENTOPS_RESULT_JSON:` followed by the JSON object). The equals
+  form (`AGENTOPS_RESULT_JSON=...`) is tolerated by AgentOps as a
+  legacy / common variant ONLY when the line starts directly with
+  the marker token; the colon form is required for new output.
+  Do NOT use the equals sign on a line that also has any other
+  text before the marker (e.g. shell prompts or `echo`).
+- Do NOT wrap the final JSON in markdown backticks. No ```` ```json
+  ... ``` ```` fences, no ```` ``` ... ``` ```` plain fences, no
+  inline backticks around the JSON object.
+- Do NOT print the result through a `cat <<EOF` / heredoc / file
+  indirection. The marker and the JSON must land in the executor
+  stdout directly.
+- Do NOT use any of these rejected forms (they are all parsed as
+  "no result produced" and block the task):
+  - ````` $ AGENTOPS_RESULT_JSON: {...} ````` (shell prompt prefix)
+  - ````` bash$ AGENTOPS_RESULT_JSON: {...} ````` (shell prompt prefix)
+  - ````` > AGENTOPS_RESULT_JSON: {...} ````` (REPL / shell continuation prefix)
+  - ````` echo AGENTOPS_RESULT_JSON={...} ````` (echoed as a single line)
+  - ````` cat <<EOF\nAGENTOPS_RESULT_JSON: {...}\nEOF ````` (heredoc)
+  - ```` ```json\nAGENTOPS_RESULT_JSON: {...}\n``` ```` (fenced)
+
+Return the marker and the JSON object directly on stdout. The
+JSON is the only structured channel AgentOps uses to read the
+result; a missing marker, a fenced marker, a wrapped marker
+(shell prompt, echo, heredoc), or a marker with malformed JSON
+is treated as "no result produced" and blocks the task.
+
+AgentOps will independently verify the diff, files, branch, and
+validation results. Your JSON is a self-report, not the source of
+truth.
 """
 
 
@@ -234,7 +279,29 @@ class PromptCompiler:
                 "2. Run the validation commands below; every one must exit 0.",
                 "3. Commit on the task branch (a commit SHA is required).",
                 "4. Do not push to main / master / audit/** / release/**.",
-                "5. Print `AGENTOPS_RESULT_JSON` with `status: done` only after 1-3 hold.",
+                "5. Print the final result block in the preferred colon form:",
+                "   ```",
+                "   AGENTOPS_RESULT_JSON:",
+                "   {",
+                "     \"status\": \"done\",",
+                "     \"summary\": \"...\",",
+                "     \"changed_files\": [...], ",
+                "     \"validation_commands_run\": [...], ",
+                "     \"known_risks\": [...], ",
+                "     \"needs_review\": true",
+                "   }",
+                "   ```",
+                "   The marker MUST be `AGENTOPS_RESULT_JSON:` with a colon "
+                "(do not use the equals sign `=`).",
+                "   Do NOT wrap the final JSON in markdown backticks / "
+                "code fences (`` ``` `` or `` ```json ``).",
+                "   Do NOT print the marker through `cat <<EOF` or a heredoc.",
+                "   Do NOT prefix the marker with a shell prompt "
+                "(`$`, `#`, `bash$`, `>`, etc.).",
+                "   Return the marker and the JSON object directly on "
+                "stdout. A missing marker, an equals-only marker, a "
+                "fenced marker, or a marker with malformed JSON is "
+                "treated as \"no result produced\" and blocks the task.",
             ]
         )
         validations = list(task.validations) or ["(no validation commands declared)"]

@@ -301,11 +301,54 @@ Parses the *latest* attempt's `combined.log` for the last
 `combined.log` for runs that never retried, writes the parsed object
 to `result.json`, and prints the JSON to stdout.
 
-The parser tolerates:
+The parser tolerates the following marker forms (the executor prompt
+prefers the colon form, but the parser still accepts the equals form
+as a legacy / common variant):
 
-* text before the marker,
-* the marker as part of a banner (`### AGENTOPS_RESULT_JSON ###`,
-  `AGENTOPS_RESULT_JSON:`),
+* **Preferred** (colon form, on its own line):
+
+  ```text
+  AGENTOPS_RESULT_JSON:
+  {"status": "done", ...}
+  ```
+
+* **Preferred** (colon form, JSON on the same line as the marker):
+
+  ```text
+  AGENTOPS_RESULT_JSON: {"status": "done", ...}
+  ```
+
+* **Tolerated** (legacy / common equals form, line starts with the marker):
+
+  ```text
+  AGENTOPS_RESULT_JSON={"status": "done", ...}
+  AGENTOPS_RESULT_JSON= {"status": "done", ...}
+  ```
+
+* **Tolerated** (multi-line banner, bare marker on its own line):
+
+  ```text
+  AGENTOPS_RESULT_JSON
+  {"status": "done", ...}
+  ```
+
+* **Tolerated** (pure banner with surrounding hashes, no trailing content):
+
+  ```text
+  ### AGENTOPS_RESULT_JSON ###
+  {"status": "done", ...}
+  ```
+
+A valid marker line must START (after optional whitespace) with the
+bare marker, optionally followed by `:` or `=` and the JSON body,
+or it must be a pure banner line `### AGENTOPS_RESULT_JSON ###` with
+the JSON on the next line. The marker may also have optional leading
+whitespace.
+
+The parser also tolerates:
+
+* text before the marker line (the strict matching is per line, not
+  per text),
 * pretty-printed JSON that spans multiple lines,
 * trailing text after the JSON (cleanup output, banner lines, etc.).
 
@@ -313,17 +356,42 @@ It uses `json.JSONDecoder.raw_decode` so it does not over- or
 under-consume: it stops at the end of the first complete JSON value
 that follows the marker.
 
-If the marker is missing or no parseable block follows it, the command
-exits non-zero and prints a hint explaining what the executor is
-supposed to print. If the parsed result looks like a
-*template/placeholder* (for example a quoted string
-`"done|blocked"` or `"passed|awaiting_review|failed|blocked"`, or a
-dict whose `status` field matches a known placeholder), the command
-also exits non-zero and tells the operator that the executor printed
-a stub before producing a real result. The list of recognised
-placeholders lives in `_TEMPLATE_PLACEHOLDER_STRINGS` in
-`agentops/operator_run.py` and is intentionally narrow so the
-harness never mistakes a real result for a stub.
+### Marker contract (read carefully)
+
+The executor prompt **demands the colon form** (`AGENTOPS_RESULT_JSON:`
+followed by a JSON object, on its own line or the same line as the
+opening brace) and explicitly forbids the following common
+anti-patterns:
+
+| Anti-pattern | Why it is forbidden | Parser behaviour |
+|---|---|---|
+| `AGENTOPS_RESULT_JSON=...` (equals sign on its own line) | Tolerated as legacy / common output, but the colon form is required for new output. | Accepted (legacy tolerance). |
+| ```` ```json ... ``` ```` / ```` ``` ... ``` ```` (markdown code fence around the JSON) | Fences hide the JSON inside a code block and signal a contract violation. | **Rejected** (`CodeFenceResultRejected`). |
+| `cat <<EOF\nAGENTOPS_RESULT_JSON: ...\nEOF` (heredoc transcript) | Heredocs wrap the marker in shell syntax. The parser scans backwards for `<<` and rejects markers that appear between the heredoc start and the matching closer. | **Rejected** (classified as `missing`; `ResultNotFound`). |
+| `$ AGENTOPS_RESULT_JSON: ...` / `bash$ AGENTOPS_RESULT_JSON: ...` (shell prompt prefix) | The marker must land on stdout directly; a leading `$`, `bash$`, `#`, `>` or other shell prompt is not allowed. | **Rejected** (strict regex refuses to match; classified as `missing`; `ResultNotFound`). |
+| `echo AGENTOPS_RESULT_JSON=...` (echoed as a single line) | The `echo` prefix means the marker is being printed as part of a shell command, not as a direct executor result. | **Rejected** (strict regex refuses to match; classified as `missing`; `ResultNotFound`). |
+| `> AGENTOPS_RESULT_JSON: ...` (REPL / shell continuation prefix) | The marker must land on stdout directly; a leading `>` is not allowed. | **Rejected** (strict regex refuses to match; classified as `missing`; `ResultNotFound`). |
+| Marker absent, marker on its own line followed by nothing, or marker followed by malformed JSON | These are not valid `AGENTOPS_RESULT_JSON` blocks. | **Rejected** (`ResultNotFound` / `missing`). |
+| Template placeholder result (e.g. `"done|blocked"`, `"..."`, or a dict whose `status` is a placeholder) | A placeholder is not a real result. | **Rejected** (`TemplateResultRejected` / `template`). |
+
+The parser never silently accepts a missing marker, a malformed
+JSON body, a template placeholder, a fenced result, or a wrapped
+marker (shell prompt, echo, heredoc). The orchestrator's result
+guard (`require_executor_result: true`) honours all of the above
+and refuses to validate / accept a task whose executor output does
+not match the contract.
+
+> **Why is `AGENTOPS_RESULT_JSON=` still accepted?** Some executor
+> runtimes print the marker via a single `print` statement with an
+> `=` separator (e.g. `print("AGENTOPS_RESULT_JSON=" + json.dumps(...))`).
+> Refusing this form would block otherwise valid task output. The
+> parser still accepts the bare-equals form (line starts with the
+> marker, then `=`, then the JSON), but the prompt explicitly asks
+> for the colon form and lists the equals form in the "do not"
+> section. The equals form is only accepted when the line starts
+> directly with `AGENTOPS_RESULT_JSON=`; an echoed or heredoc
+> equals form (`echo AGENTOPS_RESULT_JSON=...`,
+> `cat <<EOF\nAGENTOPS_RESULT_JSON=...\nEOF`) is rejected.
 
 ## Idle watchdog
 
@@ -951,6 +1019,52 @@ gates, modifying `BusinessAgent` (unless the blocking issue is
 explicitly about BusinessAgent), and merging the PR. The
 `--max-cycles` guard (default 3) stops the loop from spinning
 forever; once it fires the operator decides the next move.
+
+### `AGENTOPS_RESULT_JSON` marker contract
+
+The generated prompt and the executor prompt both demand the
+**preferred colon form** for the final result block:
+
+```text
+AGENTOPS_RESULT_JSON:
+{
+  "status": "done",
+  ...
+}
+```
+
+The executor is told to:
+
+* use the colon form (`AGENTOPS_RESULT_JSON:`) — the preferred
+  form for new output;
+* never use the equals sign (`AGENTOPS_RESULT_JSON=`) — tolerated
+  by AgentOps as a legacy / common variant but explicitly listed
+  in the "do not" section of the prompt;
+* never wrap the final JSON in markdown backticks / code fences
+  (` ```json ... ``` ` or ` ``` ... ``` `);
+* never print the marker through `cat <<EOF` / heredoc / file
+  indirection;
+* never prefix the marker with a shell prompt (`$`, `#`, `bash$`,
+  `>`, etc.);
+* return the marker and the JSON object directly on stdout.
+
+AgentOps's parser (see `extract_result` and `classify_result_marker`
+in `agentops/operator_run.py`) tolerates the equals form, the colon
+form on its own line, the colon form with the JSON on the same line,
+and multi-line banner forms, but **rejects**:
+
+* a missing marker;
+* a marker followed by a non-parseable body (malformed JSON);
+* a marker followed by an empty / whitespace-only body;
+* a marker followed by a template / placeholder value (e.g.
+  `"done|blocked"`, `"..."`);
+* a marker whose line or body contains a markdown code fence
+  (` ``` `).
+
+A missing or malformed result blocks the task with the canonical
+`failure_category: missing_result` or `template_result` on the
+`BLOCKED` transition, so a fence-only / equals-only / malformed
+output never silently slips through.
 
 ### Cycle layout
 

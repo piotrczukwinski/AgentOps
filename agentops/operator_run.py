@@ -125,9 +125,11 @@ def classify_result_marker(text: str) -> str:
     * ``"template"`` - marker present, body parses to one of the
       known template placeholders (``"..."``, ``"done|blocked"``,
       ``"passed|awaiting_review|failed|blocked"``, etc.).
-    * ``"missing"`` - marker present, but no parseable JSON body
-      followed it (e.g. the executor printed the header and then
-      was killed before it could write the body).
+    * ``"missing"`` - marker text is present in the text, but no
+      valid marker line was found (e.g. the marker is wrapped in
+      shell syntax like ``$ AGENTOPS_RESULT_JSON: {...}`` or
+      ``echo AGENTOPS_RESULT_JSON={...}``, or appears inside a
+      heredoc transcript), or the body is not parseable JSON.
     * ``"absent"`` - the marker is not in the text at all.
 
     The function is a pure function of its input. It is exposed at
@@ -139,8 +141,19 @@ def classify_result_marker(text: str) -> str:
         return "absent"
     matches = list(_RESULT_HEADER.finditer(text))
     if not matches:
-        return "absent"
+        # Marker text is present in the text but no valid marker line
+        # was found. This covers wrapped forms like
+        # ``$ AGENTOPS_RESULT_JSON: {...}`` or
+        # ``echo AGENTOPS_RESULT_JSON={...}``: the marker token is in
+        # the text but the marker line is preceded by non-whitespace
+        # (a shell prompt, an ``echo``, etc.) and is therefore not a
+        # direct executor result marker.
+        return "missing"
     for header in reversed(matches):
+        if _header_in_heredoc(text, header):
+            continue
+        if _header_in_code_fence(text, header):
+            continue
         body = _slice_json_body(text, header.end(), header_match=header)
         if body is None:
             continue
@@ -2280,7 +2293,15 @@ def tail_combined(run_dir_path: Path, *, lines: int) -> list[str]:
 
 
 class ResultNotFound(RuntimeError):
-    """Raised when no AGENTOPS_RESULT_JSON block can be located in a log."""
+    """Raised when no AGENTOPS_RESULT_JSON block can be located in a log.
+
+    Covers both the "marker absent" case (the executor never printed the
+    header at all) and the "marker present but no body" case (the header
+    is on its own line or followed by whitespace / a comment, with no
+    parseable JSON value). Callers that need to distinguish the two
+    cases can use :func:`classify_result_marker`, which returns
+    ``"absent"`` and ``"missing"`` respectively.
+    """
 
 
 class TemplateResultRejected(RuntimeError):
@@ -2294,33 +2315,111 @@ class TemplateResultRejected(RuntimeError):
     """
 
 
-# Match a line that *starts* a JSON value, possibly preceded by whitespace.
-# The executor may print the marker on its own line, in a banner like
-# ``AGENTOPS_RESULT_JSON: { ... }`` (single line) or
-# ``AGENTOPS_RESULT_JSON:\n{ ... }`` (multi-line).
+class CodeFenceResultRejected(TemplateResultRejected):
+    r"""Raised when the executor wrapped ``AGENTOPS_RESULT_JSON`` in a markdown fence.
+
+    The prompt contract requires the executor to print the marker and the
+    raw JSON object directly (no triple-backtick ``\`\`\`json`` /
+    ``\`\`\`` wrapping, no ``cat <<EOF`` heredoc, no shell prompt
+    prefix). When the executor wraps the result in a fenced code block
+    the JSON itself is still parseable, but accepting it would silently
+    forgive a contract violation, so :func:`extract_result` rejects it
+    instead. Subclassing :class:`TemplateResultRejected` preserves the
+    existing orchestrator behaviour that already treats template
+    placeholders as a non-zero exit / blocked task.
+    """
+
+
+# Marker variants AgentOps accepts. The preferred form is the colon
+# marker (``AGENTOPS_RESULT_JSON:``). The equals form
+# (``AGENTOPS_RESULT_JSON=``) is a tolerated legacy / common variant
+# that the parser still accepts; the executor prompt warns against it
+# and asks for the colon form. A bare marker on its own line is also
+# accepted because the JSON body can sit on the next line.
+#
+# - Preferred: ``AGENTOPS_RESULT_JSON:\n{...}`` or ``AGENTOPS_RESULT_JSON: {...}``
+# - Legacy / common: ``AGENTOPS_RESULT_JSON={...}`` or ``AGENTOPS_RESULT_JSON= {...}``
+# - Multi-line banner: ``AGENTOPS_RESULT_JSON\n{...}`` or ``### AGENTOPS_RESULT_JSON ###``
+#
+# The pattern is strict on purpose: a valid marker line MUST start
+# (after optional whitespace) with the bare marker token, optionally
+# followed by ``:`` or ``=`` and the JSON body, OR it MUST be the
+# pure banner form ``### AGENTOPS_RESULT_JSON ###`` with the JSON on
+# the next line. Lines where the marker is preceded by shell prompt
+# text (``$``, ``bash$``, ``>``), command text (``echo``,
+# ``cat``), or any other non-whitespace prefix are REJECTED because
+# the prompt contract requires the marker to land on stdout directly.
+#
+# The body is sliced out by :func:`_slice_json_body`, which looks for
+# the first ``{``, ``[``, or ``"`` after the marker text on the same
+# line, then falls through to the next line if the body is
+# pretty-printed.
 _RESULT_HEADER = re.compile(
-    r"(?m)^[^\n]*\b" + re.escape(RESULT_MARKER) + r"\b[^\n]*$"
+    r"(?m)^[ \t]*"
+    r"(?:"
+    + re.escape(RESULT_MARKER) + r"[ \t]*[:=]?[^\n]*$"
+    r"|"
+    r"###[ \t]+" + re.escape(RESULT_MARKER) + r"[ \t]+###[ \t]*$"
+    r")"
 )
+
+# Heredoc start pattern: ``<<`` followed by an optional quote and a
+# word (the terminator). Used by :func:`_header_in_heredoc` to detect
+# markers that appear inside a heredoc transcript.
+_HEREDOC_START_RE = re.compile(r"<<[ \t]*[\'\"]?(\w+)[\'\"]?")
+
+# A code-fence open (``\`\`\`json``, ``\`\`\``, ``\`\`\`text``) or close
+# (``\`\`\``) on the marker line. We treat any line that contains a
+# triple-backtick sequence (with optional language tag) as a fenced
+# markdown block and reject it, because the prompt contract forbids
+# markdown backticks around the final JSON.
+_CODE_FENCE_LINE = re.compile(r"```")
 
 
 def extract_result(run_dir_path: Path) -> dict[str, Any]:
-    """Parse the last ``AGENTOPS_RESULT_JSON`` block from ``combined.log``.
+    r"""Parse the last ``AGENTOPS_RESULT_JSON`` block from ``combined.log``.
 
-    The function tolerates:
+    The function tolerates the following marker forms (the executor
+    prompt prefers the colon form, but the parser still accepts the
+    equals form as a legacy / common variant):
 
-    * any text before the marker line,
-    * a marker that is part of a longer banner like
-      ``AGENTOPS_RESULT_JSON:`` or ``### AGENTOPS_RESULT_JSON ###``,
-    * pretty-printed JSON that spans multiple lines,
-    * trailing text after the JSON, *if* that trailing text does not contain
-      a closing brace that would unbalance the parsed object. (We simply
-      consume as much as ``json.loads`` will accept.)
+    * Preferred colon form: ``AGENTOPS_RESULT_JSON:\n{...}`` or
+      ``AGENTOPS_RESULT_JSON: {...}`` (single line, JSON on the same
+      line as the marker).
+    * Legacy / common equals form: ``AGENTOPS_RESULT_JSON={...}`` or
+      ``AGENTOPS_RESULT_JSON= {...}``.
+    * Multi-line banner: ``AGENTOPS_RESULT_JSON\n{...}`` or
+      ``### AGENTOPS_RESULT_JSON ###``.
 
-    The function refuses to return a "template" placeholder result (see
-    :func:`is_template_placeholder_result`). A run that prints
-    ``AGENTOPS_RESULT_JSON: "done|blocked"`` is treated as if no result
-    was produced at all and the caller is expected to surface a clear
-    "template result rejected" error to the operator.
+    A valid marker line MUST start (after optional whitespace) with
+    the bare marker token, optionally followed by ``:`` or ``=`` and
+    the JSON body. The banner form must be a pure banner line with
+    no trailing content. Lines where the marker is preceded by a
+    shell prompt (``$``, ``bash$``, ``>``), a command prefix
+    (``echo``, ``cat``), or any other non-whitespace prefix are
+    rejected; the marker must land on stdout directly.
+
+    The function refuses to return a "template" placeholder result
+    (see :func:`is_template_placeholder_result`). A run that prints
+    ``AGENTOPS_RESULT_JSON: "done|blocked"`` is treated as if no
+    result was produced at all and the caller is expected to surface
+    a clear "template result rejected" error to the operator.
+
+    The function also refuses to extract a result that is wrapped in a
+    markdown code fence (triple-backtick ``\`\`\`json ... \`\`\``).
+    The prompt contract forbids fenced blocks; accepting them would
+    silently forgive a contract violation, so we raise
+    :class:`CodeFenceResultRejected` instead. This is the stricter of
+    the two behaviours the contract allows for fenced output.
+
+    The function rejects wrapped forms (shell prompt prefix,
+    ``echo``, heredoc transcript) by raising
+    :class:`ResultNotFound`. The strict regex refuses to match
+    shell-prefixed and echoed lines, and :func:`_header_in_heredoc`
+    refuses to match markers that appear inside a heredoc
+    transcript (e.g. ``cat <<EOF\nAGENTOPS_RESULT_JSON: {...}\nEOF``).
+    Either way the result is treated as missing so the orchestrator's
+    ``require_executor_result`` guard fires.
     """
     log = run_dir_path / "combined.log"
     if not log.exists():
@@ -2333,14 +2432,36 @@ def extract_result(run_dir_path: Path) -> dict[str, Any]:
     # executor printed multiple results, the most recent one wins.
     matches = list(_RESULT_HEADER.finditer(text))
     if not matches:
-        raise ResultNotFound(f"Could not locate a {RESULT_MARKER} header line in {log}")
+        # The marker text is somewhere in the log but no valid marker
+        # line was found. The common cause is a wrapped form: the
+        # executor printed the marker as part of a shell command
+        # (``$ AGENTOPS_RESULT_JSON: {...}``, ``echo
+        # AGENTOPS_RESULT_JSON={...}``) and the strict regex
+        # correctly refused to match it. Treat this as a missing
+        # result so the orchestrator's guard fires.
+        raise ResultNotFound(
+            f"Could not locate a direct {RESULT_MARKER} header line in "
+            f"{log}; the marker text is present but appears to be "
+            f"wrapped in shell syntax (e.g. shell prompt, echo, or "
+            f"command prefix). The executor must print the marker "
+            f"and the JSON object directly on stdout."
+        )
 
     # Try each header from last to first; the most recent one is preferred,
     # but if its body is not parseable we still report the last good result
     # by falling through to earlier matches. We also try to skip template
     # placeholder results and report a clearer error in that case.
     last_template: str | None = None
+    last_code_fence_line: str | None = None
     for header in reversed(matches):
+        if _header_in_heredoc(text, header):
+            # Marker is inside a heredoc transcript (e.g.
+            # ``cat <<EOF\nAGENTOPS_RESULT_JSON: {...}\nEOF``).
+            # Treat it as a contract violation and skip the match.
+            continue
+        if _header_in_code_fence(text, header):
+            last_code_fence_line = _line_text(text, header)
+            continue
         body = _slice_json_body(text, header.end(), header_match=header)
         if body is None:
             continue
@@ -2358,6 +2479,13 @@ def extract_result(run_dir_path: Path) -> dict[str, Any]:
         # uniformly. The wrap records the original JSON type for
         # diagnostics.
         return {"value": payload, "_wrapped": True}
+    if last_code_fence_line is not None:
+        raise CodeFenceResultRejected(
+            f"AGENTOPS_RESULT_JSON in {log} is wrapped in a markdown "
+            f"code fence ({last_code_fence_line.strip()!r}); the executor "
+            "must print the marker and the JSON object directly, "
+            "without triple-backtick fences."
+        )
     if last_template is not None:
         raise TemplateResultRejected(
             f"AGENTOPS_RESULT_JSON in {log} is a template placeholder "
@@ -2481,6 +2609,113 @@ def _slice_json_body(
     except json.JSONDecodeError:
         return None
     return text[i:end]
+
+
+def _line_text(text: str, header_match: re.Match[str]) -> str:
+    """Return the full line that contains ``header_match`` (no trailing newline)."""
+    line_start = text.rfind("\n", 0, header_match.start()) + 1
+    line_end = text.find("\n", header_match.start())
+    if line_end == -1:
+        line_end = len(text)
+    return text[line_start:line_end]
+
+
+def _header_in_code_fence(text: str, header_match: re.Match[str]) -> bool:
+    r"""Return ``True`` if the marker line or its body is inside a markdown fence.
+
+    A fenced code block is any line with a triple-backtick sequence
+    (``\`\`\`json``, ``\`\`\`text``, ``\`\`\``). The executor is
+    required to print the marker and the JSON object directly without
+    any markdown backticks; a fenced result is treated as a contract
+    violation and rejected by :func:`extract_result` (see
+    :class:`CodeFenceResultRejected`).
+
+    The check covers two cases:
+
+    * the marker line itself contains a fence (e.g. the executor
+      printed ``AGENTOPS_RESULT_JSON: \`\`\`json {...} \`\`\`` on a
+      single line);
+    * the marker is on its own line and the body that follows starts
+      with an opening fence (e.g. ``AGENTOPS_RESULT_JSON:\n\`\`\`json
+      {...}\n\`\`\``).
+
+    Prose containing inline backticks *before* the marker does not
+    trigger the rejection.
+    """
+    if _CODE_FENCE_LINE.search(_line_text(text, header_match)):
+        return True
+    # Look at the text after the marker line, up to the next marker
+    # (or end of text). A fence anywhere in the body is a contract
+    # violation: the JSON inside the fence would still be parseable
+    # but accepting it would silently forgive the wrapping.
+    line_end = text.find("\n", header_match.start())
+    if line_end == -1:
+        return False
+    body_start = line_end + 1
+    next_marker_idx = text.find(RESULT_MARKER, body_start)
+    body_end = next_marker_idx if next_marker_idx != -1 else len(text)
+    return bool(_CODE_FENCE_LINE.search(text[body_start:body_end]))
+
+
+def _header_in_heredoc(text: str, header_match: re.Match[str]) -> bool:
+    r"""Return ``True`` if the marker line is inside a heredoc transcript.
+
+    A heredoc is opened by a line that contains a ``<<`` redirect
+    (``cat <<EOF``, ``python <<'PY'``, ``bash <<-DELIM`` with
+    optional indentation, etc.) and closed by a line that contains
+    only the matching delimiter. The executor is required to print
+    the marker and the JSON object directly on stdout, not inside a
+    heredoc. The prompt contract forbids ``cat <<EOF`` / heredoc /
+    file indirection, so a marker that appears inside the heredoc
+    body is treated as a contract violation and rejected by
+    :func:`extract_result` (classified as ``missing``).
+
+    The check scans backwards from the marker line, stopping at the
+    first blank line or the start of the text. If a line with
+    ``<<`` is found, the delimiter is extracted and we look for the
+    matching closer on a line by itself after the marker. Only when
+    both halves are present do we conclude that the marker is
+    inside a live heredoc transcript.
+
+    A regular multi-line block (e.g. ``cat <<EOF`` on one line, the
+    marker on the next line, and ``EOF`` on the line after that)
+    matches and is rejected. A block with intermediate lines
+    between the heredoc start and the marker also matches and is
+    rejected, because the scan does not stop at non-blank lines
+    until it finds ``<<`` or hits a blank line / start of text.
+    """
+    # Find the start and end of the line containing the marker.
+    marker_line_start = text.rfind("\n", 0, header_match.start()) + 1
+    marker_line_end = text.find("\n", header_match.start())
+    if marker_line_end == -1:
+        marker_line_end = len(text)
+    after_marker = text[marker_line_end + 1:]
+
+    # Scan backwards from the line before the marker, stopping at the
+    # first blank line or the start of the text.
+    scan_pos = marker_line_start
+    while scan_pos > 0:
+        prev_end = scan_pos - 1
+        if prev_end <= 0:
+            return False
+        prev_start = text.rfind("\n", 0, prev_end - 1) + 1
+        prev_line = text[prev_start:prev_end]
+        # A blank line breaks the logical block; anything before it
+        # is unrelated prose.
+        if not prev_line.strip():
+            return False
+        # Look for a heredoc start on the previous line.
+        match = _HEREDOC_START_RE.search(prev_line)
+        if match:
+            terminator = match.group(1)
+            # Confirm the heredoc is still open by checking for the
+            # matching closer on its own line after the marker.
+            terminator_line_re = re.compile(
+                r"^" + re.escape(terminator) + r"[ \t]*$", re.MULTILINE
+            )
+            return bool(terminator_line_re.search(after_marker))
+        scan_pos = prev_start
+    return False
 
 
 def write_result(run_dir_path: Path, payload: dict[str, Any]) -> Path:
@@ -3030,6 +3265,7 @@ __all__ = [
     "RETRYING_STATUS",
     "IDLE_TIMEOUT_REASON",
     "STOP_REASON",
+    "CodeFenceResultRejected",
     "TemplateResultRejected",
     "RETRY_CONFIG_FILENAME",
     "ATTEMPTS_DIRNAME",

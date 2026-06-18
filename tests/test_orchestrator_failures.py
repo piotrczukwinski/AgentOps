@@ -247,6 +247,169 @@ class OrchestratorResultGuardTests(unittest.TestCase):
             )
             self.assertIn(row["state"], {"accepted", "merged"})
 
+    def test_equals_marker_real_result_accepted_when_required(self) -> None:
+        """A real result emitted via the legacy ``AGENTOPS_RESULT_JSON=`` form
+        must NOT be blocked when ``require_executor_result`` is on."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            body = (
+                f"{RESULT_MARKER}="
+                + json.dumps({"status": "done", "summary": "x"})
+                + "\n"
+            )
+            row = self._run(
+                tmp,
+                executor_body=body,
+                require_executor_result=True,
+            )
+            self.assertIn(row["state"], {"accepted", "merged"})
+
+    def test_colon_marker_same_line_real_result_accepted_when_required(self) -> None:
+        """A real result on the same line as the colon marker must be accepted."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            body = (
+                f"{RESULT_MARKER}: "
+                + json.dumps({"status": "done", "summary": "x"})
+                + "\n"
+            )
+            row = self._run(
+                tmp,
+                executor_body=body,
+                require_executor_result=True,
+            )
+            self.assertIn(row["state"], {"accepted", "merged"})
+
+    def test_dollar_prompt_marker_blocks_when_required(self) -> None:
+        """``$ AGENTOPS_RESULT_JSON: {...}`` must be blocked when result guard is on."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            body = (
+                f"$ {RESULT_MARKER}: "
+                + json.dumps({"status": "done", "summary": "x"})
+                + "\n"
+            )
+            row = self._run(
+                tmp,
+                executor_body=body,
+                require_executor_result=True,
+            )
+            self.assertEqual(row["state"], "blocked")
+
+    def test_echoed_marker_blocks_when_required(self) -> None:
+        """``echo AGENTOPS_RESULT_JSON={...}`` must be blocked when result guard is on."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            body = (
+                f"echo {RESULT_MARKER}="
+                + json.dumps({"status": "done", "summary": "x"})
+                + "\n"
+            )
+            row = self._run(
+                tmp,
+                executor_body=body,
+                require_executor_result=True,
+            )
+            self.assertEqual(row["state"], "blocked")
+
+    def test_heredoc_marker_blocks_when_required(self) -> None:
+        """A marker inside a ``cat <<EOF`` heredoc must be blocked when result guard is on."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            body = (
+                "cat <<EOF\n"
+                f"{RESULT_MARKER}: "
+                + json.dumps({"status": "done", "summary": "x"})
+                + "\nEOF\n"
+            )
+            row = self._run(
+                tmp,
+                executor_body=body,
+                require_executor_result=True,
+            )
+            self.assertEqual(row["state"], "blocked")
+
+
+class ExecutorPromptMarkerContractTests(unittest.TestCase):
+    """The generated executor prompt must demand the preferred colon marker and
+    forbid the common anti-patterns (equals sign, code fences, heredoc, shell
+    prompt). These tests protect the AO-AUDIT-003 contract from drift."""
+
+    def test_executor_prompt_requires_colon_marker(self) -> None:
+        from agentops.prompting import EXECUTOR_CONTRACT
+
+        self.assertIn("AGENTOPS_RESULT_JSON:", EXECUTOR_CONTRACT)
+
+    def test_executor_prompt_forbids_equals_marker(self) -> None:
+        from agentops.prompting import EXECUTOR_CONTRACT
+
+        # The contract must tell the executor not to use the equals form.
+        # The equals form is mentioned in the contract as a legacy / common
+        # variant; we assert on the explicit "do not use" / "do not" wording
+        # and the equals sign string.
+        self.assertIn("equals sign", EXECUTOR_CONTRACT)
+        self.assertIn("AGENTOPS_RESULT_JSON=", EXECUTOR_CONTRACT)
+
+    def test_executor_prompt_forbids_code_fence(self) -> None:
+        from agentops.prompting import EXECUTOR_CONTRACT
+
+        self.assertIn("markdown backticks", EXECUTOR_CONTRACT.lower())
+
+    def test_executor_prompt_forbids_heredoc(self) -> None:
+        from agentops.prompting import EXECUTOR_CONTRACT
+
+        self.assertIn("cat <<eof", EXECUTOR_CONTRACT.lower())
+
+    def test_executor_prompt_forbids_shell_prompt(self) -> None:
+        from agentops.prompting import EXECUTOR_CONTRACT
+
+        # The contract must tell the executor not to prefix the marker with
+        # a shell prompt (e.g. ``$``, ``#``, ``bash$``).
+        self.assertIn("shell prompt", EXECUTOR_CONTRACT.lower())
+
+    def test_repair_prompt_contains_preferred_marker(self) -> None:
+        """The repair-prompt checklist must demand the preferred colon marker."""
+        from agentops.config import RepoConfig, RoadmapConfig
+        from agentops.models import TaskConfig
+        from agentops.policy import PolicyEngine
+        from agentops.prompting import PromptCompiler
+        from agentops.review import ReviewVerdict
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "task.md"
+            prompt.write_text("x", encoding="utf-8")
+            task = TaskConfig(
+                id="T1",
+                kind="implementation",
+                prompt_path=prompt,
+                allowed_files=("out.txt",),
+                validations=("true",),
+            )
+            roadmap = RoadmapConfig(
+                version=1,
+                roadmap_id="r",
+                repo=RepoConfig(id="repo", path=root),
+                tasks=(task,),
+            )
+            compiler = PromptCompiler(PolicyEngine(roadmap))
+            verdict = ReviewVerdict(
+                verdict="REQUEST_CHANGES",
+                confidence="high",
+                summary="needs review",
+                blocking_issues=(),
+                repair_prompt="",
+            )
+            text = compiler.repair_prompt_from_review(task, verdict)
+            # Preferred marker is present in the "do not claim done" checklist.
+            self.assertIn("AGENTOPS_RESULT_JSON:", text)
+            # Repair prompt also forbids the common anti-patterns.
+            lowered = text.lower()
+            self.assertIn("do not use", lowered)
+            self.assertIn("markdown backticks", lowered)
+            self.assertIn("cat <<eof", lowered)
+            self.assertIn("shell prompt", lowered)
+
 
 if __name__ == "__main__":
     unittest.main()
