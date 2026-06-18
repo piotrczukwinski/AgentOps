@@ -77,10 +77,15 @@ Seven recommendations from the four reports are **duplicates or
 near-duplicates** and are merged in the per-priority sections. The
 smallest next implementation batch (B1–B5, see
 [Proposed next implementation batch](#proposed-next-implementation-batch))
-closes **5 of the 19 P0 items** in roughly **10 hours of work** and
+closes **11 of the 19 P0 items** in roughly **10 hours of work** and
 is sized to ship as a single PR. Two subsequent batches (B6–B7 for
 001's operator-run fixes and B8–B10 for 003's codex/review-repair
-fixes) close the remaining 6 P0 items in roughly **14 more hours**.
+fixes) close **6 more P0 items** in roughly **14 more hours**, for
+a cumulative **17 of 19 P0 items** closed across B1–B10. The
+remaining two P0 items (**P0-08** and **P0-12**) are dashboard
+and multi-roadmap CLI follow-on work that depends on the data
+joins shipped in B4/B5 and are deferred to a future
+consolidation.
 
 ## What worked well
 
@@ -827,7 +832,7 @@ preserved as written in the per-priority sections above.
 
 ## Proposed next implementation batch
 
-The smallest batch that closes **5 of the 19 P0 items** in
+The smallest batch that closes **11 of the 19 P0 items** in
 roughly **10 hours** of work, sized to ship as a single PR. Every
 item is a P0 because the operator can hit the defect on the very
 next large overnight run; deferring any of them means the
@@ -841,12 +846,14 @@ operator will hit the bug before the next sprint.
 | **B4** | Web: per-roadmap summary card + `roadmap_id` filter on Tasks card | P0-04 (dashboard consequence), P0-07 | `agentops/web.py`, `agentops/state.py`, `tests/test_web.py` | 2 h |
 | **B5** | Web: `GET /api/task-tail` endpoint + "Tail executor" button on Tasks card | P0-06, P0-13 (shares the event-join in `collect_status`) | `agentops/web.py`, `agentops/cli.py:961-1067` (extract `latest_attempt_dir` helper), `tests/test_web.py` | 2 h |
 
-**Total estimated effort: ~10 h.** B1–B3 close all five
-roadmap-input / CLI / `run`-vs-`plan` parity P0 items. B4 closes
-the dashboard consequence of P0-04 and the roadmap-visibility gap
-from 004 G1/D5. B5 closes the most-asked-for dashboard action
-("what is the executor doing right now?") and folds the watchdog
-badge in for free because the same data join powers it.
+**Total estimated effort: ~10 h.** B1–B3 close all eight
+roadmap-input / CLI / `run`-vs-`plan` parity P0 items
+(P0-01, P0-02, P0-03, P0-04, P0-05, P0-09, P0-10, P0-11). B4
+closes the dashboard consequence of P0-04 and the
+roadmap-visibility gap from 004 G1/D5 (P0-07). B5 closes the
+most-asked-for dashboard action ("what is the executor doing
+right now?") and folds the watchdog badge in for free because
+the same data join powers it (P0-06, P0-13).
 
 **Intentionally deferred to subsequent batches** (still P0 but
 slightly less leverage, ship as B6–B10 in follow-up PRs):
@@ -896,12 +903,12 @@ slightly less leverage, ship as B6–B10 in follow-up PRs):
    links back to
    `docs/audits/agentops-reliability/003-review-repair-codex.md`.
 
-**Cumulative footprint across PR-1, PR-2, PR-3:** **11 of the 19
-P0 items closed in ~24 h** of work. The remaining 8 P0 items
-break down as: 5 are follow-on dashboard work that depends on
-B4/B5's data joins (P0-08, P0-12, P0-13 are already closed by
-B5; P0-04 dashboard consequence is closed by B4; P0-13 is also
-closed by B5), and the rest are deferred to a future
+**Cumulative footprint across PR-1, PR-2, PR-3:** **17 of the 19
+P0 items closed in ~24 h** of work. The remaining 2 P0 items
+are **P0-08** (web "Copy CLI" button for `suggested_action`) and
+**P0-12** (disambiguate `agentops logs` / `artifacts` /
+`attempts` / `task-tail` on multi-roadmap DBs); both depend on
+the data joins shipped in B4/B5 and are deferred to a future
 consolidation. The 23 P1 and 21 P2 items are out of scope for
 the next batch and are tracked in the per-priority sections
 above.
