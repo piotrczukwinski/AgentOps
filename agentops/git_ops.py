@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import shutil
 import subprocess
 from datetime import UTC, datetime
@@ -53,8 +54,63 @@ def create_worktree(repo: Path, workspaces_root: Path, branch: str, base_ref: st
     workspace = workspaces_root / safe_name(branch)
     if workspace.exists():
         shutil.rmtree(workspace)
+    # Prune stale worktree metadata before adding. A previous run that
+    # crashed (or was killed) may have left the workspace directory
+    # removed by ``rmtree`` above but the git worktree metadata still
+    # recorded in ``.git/worktrees/``. ``git worktree prune`` cleans
+    # those up so ``git worktree add -B`` does not fail with
+    # "is already used by worktree at <stale path>". This is the
+    # AO-AUDIT-008 fix: a resumed run must not inherit stale worktree
+    # state from a crashed prior attempt.
+    run_git(repo, ["worktree", "prune"], check=False)
     run_git(repo, ["worktree", "add", "-B", branch, str(workspace), base_ref])
     return workspace
+
+
+def worktree_is_clean(worktree: Path) -> bool:
+    """Return True when the worktree has no uncommitted changes.
+
+    Used by the orchestrator's ``_assert_worktree_clean`` guard
+    (AO-AUDIT-008) to refuse starting a fresh attempt on a worktree
+    that was left dirty by a prior interrupted run. A clean worktree
+    is a prerequisite for a reproducible attempt.
+    """
+    result = run_git(worktree, ["status", "--porcelain"], check=False)
+    if result.returncode != 0:
+        return False
+    return result.stdout.strip() == ""
+
+
+def prune_worktrees(repo: Path, *, workspaces_root: Path | None = None) -> int:
+    """Prune stale git worktree metadata and remove orphaned workspace dirs.
+
+    Returns the number of stale worktrees pruned. Safe to call at any
+    time; does not touch live worktrees. This is the maintenance
+    primitive behind ``agentops prune`` and the ``run --resume``
+    reconciliation path (AO-AUDIT-008).
+    """
+    # First ask git to prune its own metadata for worktrees whose
+    # directories no longer exist.
+    run_git(repo, ["worktree", "prune"], check=False)
+    # Then walk the workspaces root and remove any directories that
+    # are not registered as live worktrees.
+    if workspaces_root is None:
+        return 0
+    if not workspaces_root.exists():
+        return 0
+    live = set()
+    result = run_git(repo, ["worktree", "list", "--porcelain"], check=False)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith("worktree "):
+                live.add(line[len("worktree ") :])
+    pruned = 0
+    for entry in workspaces_root.iterdir():
+        if entry.is_dir() and str(entry) not in live:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(entry)
+                pruned += 1
+    return pruned
 
 
 def create_gitless_mirror(source_worktree: Path, mirror_root: Path) -> Path:

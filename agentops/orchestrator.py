@@ -33,8 +33,10 @@ from .git_ops import (
     is_git_repo,
     is_protected_branch,
     merge_integration,
+    prune_worktrees,
     push,
     rev_parse,
+    worktree_is_clean,
 )
 from .models import (
     EXECUTOR_IDLE_TIMEOUT,
@@ -44,6 +46,7 @@ from .models import (
     RoadmapConfig,
     TaskConfig,
     TaskState,
+    TERMINAL_STATES,
 )
 from .policy import PolicyEngine
 from .prompting import PromptCompiler
@@ -63,6 +66,49 @@ ACCEPTED_OUTCOMES = {
     TaskState.ACCEPTED.value,
     TaskState.PUSHED.value,
     TaskState.MERGED.value,
+}
+
+# States that are terminal and should NOT be re-run by a resumed run.
+# A resumed run skips these and reports them as already-finished. The
+# set intentionally includes ``MERGE_FAILED`` / ``BLOCKED`` /
+# ``AWAITING_REVIEW`` / ``AWAITING_HUMAN``: those need an operator
+# decision (``agentops decide``) before they can advance, so the resume
+# path does not silently re-run them. An operator who wants to retry a
+# blocked task should use ``agentops decide <task> --verdict ACCEPT``
+# (or remove the task from the state DB) before resuming.
+RESUME_SKIP_STATES = {
+    TaskState.ACCEPTED.value,
+    TaskState.PUSHED.value,
+    TaskState.MERGED.value,
+    TaskState.SKIPPED.value,
+    TaskState.MERGE_FAILED.value,
+    TaskState.BLOCKED.value,
+    TaskState.AWAITING_REVIEW.value,
+    TaskState.AWAITING_HUMAN.value,
+    TaskState.FAILED.value,
+}
+
+# States that are "in-flight" when a crash interrupts a run. A resumed
+# run resets any task found in one of these states to ``READY`` so the
+# task re-runs from the top. The previous attempt's worktree is pruned
+# by the ``_assert_worktree_clean`` step (AO-AUDIT-008) before the new
+# attempt starts, so no stale changes leak into the resumed attempt.
+RESUME_INFLIGHT_STATES = {
+    TaskState.PREFLIGHT.value,
+    TaskState.WORKSPACE_READY.value,
+    TaskState.EXECUTOR_PROMPT_READY.value,
+    TaskState.EXECUTOR_RUNNING.value,
+    TaskState.EXECUTOR_FINISHED.value,
+    TaskState.DIFF_COLLECTED.value,
+    TaskState.POLICY_CHECKING.value,
+    TaskState.POLICY_FAILED.value,
+    TaskState.VALIDATING.value,
+    TaskState.VALIDATION_FAILED.value,
+    TaskState.REVIEW_PACKET_READY.value,
+    TaskState.CODEX_REVIEWING.value,
+    TaskState.REVIEW_COMPLETED.value,
+    TaskState.REPAIR_PROMPT_READY.value,
+    TaskState.REPAIR_RUNNING.value,
 }
 
 # Default review verdict schema. The orchestrator falls back to this when
@@ -211,12 +257,53 @@ class Orchestrator:
         # automatically. See ``agentops/repo_lock.py`` and
         # ``docs/operator-reliability-audit.md`` (AO-AUDIT-002).
         with acquire_run_lock(roadmap.repo.path, roadmap_id=roadmap.roadmap_id):
-            return self._run_roadmap_locked(roadmap)
+            return self._run_roadmap_locked(roadmap, resume=False)
 
-    def _run_roadmap_locked(self, roadmap: RoadmapConfig) -> int:
-        """Roadmap execution body. Called with the repo lock already held."""
+    def resume_roadmap(self, roadmap: RoadmapConfig) -> int:
+        """Resume a previously-interrupted run from the persisted task state.
+
+        This is the crash-recovery path for the gated runner. A run
+        interrupted by a reboot, a SIGKILL, or a terminal disconnect
+        leaves its tasks in non-terminal states
+        (``executor_running`` / ``preflight`` / ``validating`` /
+        ``codex_reviewing`` / ...). ``resume_roadmap`` re-imports the
+        roadmap (which preserves terminal task states via the
+        ``ON CONFLICT`` clause in :meth:`StateStore.import_roadmap`),
+        reconciles any in-flight task back to ``READY`` with a
+        ``task.recovered_for_resume`` event, and then re-runs the loop.
+        Tasks that already reached an accepted / terminal state are
+        skipped so the resumed run only does the remaining work.
+
+        The repo lock is acquired exactly as for ``run_roadmap`` so a
+        resumed run and a fresh run cannot race on the same repo.
+        """
+        if not roadmap.repo.path.exists():
+            raise FileNotFoundError(
+                f"Repo path does not exist: {roadmap.repo.path}. "
+                f"Run 'agentops plan --roadmap <path>' to validate the roadmap first."
+            )
+        if not is_git_repo(roadmap.repo.path):
+            raise RuntimeError(
+                f"Repo path is not a git repository: {roadmap.repo.path}. "
+                f"Initialize it with 'git init' and commit at least once before running AgentOps."
+            )
+        with acquire_run_lock(roadmap.repo.path, roadmap_id=roadmap.roadmap_id):
+            return self._run_roadmap_locked(roadmap, resume=True)
+
+    def _run_roadmap_locked(self, roadmap: RoadmapConfig, *, resume: bool = False) -> int:
+        """Roadmap execution body. Called with the repo lock already held.
+
+        When ``resume`` is True the loop skips tasks already in a
+        terminal/accepted state (so a resumed run does not redo work
+        that already landed on the integration branch) and any task
+        left in an in-flight state by the previous run is reset to
+        ``READY`` with a ``task.recovered_for_resume`` event before the
+        loop starts.
+        """
         self.state.init()
         self.state.import_roadmap(roadmap)
+        if resume:
+            self._reconcile_inflight_for_resume(roadmap)
         policy = PolicyEngine(roadmap)
         compiler = PromptCompiler(policy)
 
@@ -244,7 +331,18 @@ class Orchestrator:
 
         max_tasks = self.options.max_tasks if self.options.max_tasks is not None else roadmap.max_tasks
         completed = 0
+        task_states = {row["id"]: row["state"] for row in self.state.task_rows(roadmap.roadmap_id)}
         for task in sorted(roadmap.tasks, key=lambda item: (item.priority, item.id)):
+            # Resume path: skip tasks that already reached a terminal
+            # state. This is the core of crash recovery — a task that
+            # already merged must not be re-run, and a task blocked by
+            # the reviewer or awaiting a human decision must not be
+            # silently re-tried. ``RESUME_SKIP_STATES`` is intentionally
+            # the union of accepted outcomes and the operator-decision
+            # states.
+            if resume and task_states.get(task.id) in RESUME_SKIP_STATES:
+                completed += 1
+                continue
             task_budget = budget.can_start_task()
             if not task_budget.allowed:
                 self.state.transition_task(
@@ -390,6 +488,29 @@ class Orchestrator:
             roadmap.repo.path, workspace_root, runtime.branch, base_ref_for_worktree
         )
         runtime.workspace = target_worktree
+
+        # AO-AUDIT-008: refuse to start a fresh attempt on a dirty
+        # worktree. ``create_worktree`` always prunes stale metadata and
+        # creates a fresh checkout, so a dirty worktree here means either
+        # a bug in the pruning logic or a race we should surface rather
+        # than silently commit. The check is a belt-and-suspenders
+        # guard: on a clean ``create_worktree`` the porcelain output is
+        # always empty, but if git reused an existing worktree (e.g. the
+        # directory existed but was not a valid worktree) the check
+        # catches the contamination before the executor sees it.
+        if not worktree_is_clean(target_worktree):
+            self.state.transition_task(
+                roadmap.roadmap_id,
+                task.id,
+                TaskState.BLOCKED,
+                {
+                    "reason": "stale_worktree",
+                    "failure_category": "stale_worktree",
+                    "workspace": str(target_worktree),
+                },
+            )
+            self._record_roadmap_event(roadmap, "task.stale_worktree", task.id)
+            return
         execution_cwd = target_worktree
         if task.execution_mode == "gitless_mirror":
             mirror_path = artifact_root / "mirrors" / runtime.branch.replace("/", "-")
@@ -1401,6 +1522,42 @@ class Orchestrator:
         if extra:
             payload.update(extra)
         self.state.event(roadmap.roadmap_id, task_id, None, event_type, payload)
+
+    def _reconcile_inflight_for_resume(self, roadmap: RoadmapConfig) -> None:
+        """Reset in-flight tasks to ``READY`` before a resumed run.
+
+        A crash can leave a task in any of the
+        :data:`RESUME_INFLIGHT_STATES` (``executor_running`` /
+        ``preflight`` / ``validating`` / ``codex_reviewing`` / ...).
+        Those states are not safe to resume from mid-flight because the
+        worktree may be dirty, the executor subprocess is gone, and the
+        recorded attempt has no matching result. We transition each such
+        task back to ``READY`` and emit a ``task.recovered_for_resume``
+        event so the morning checklist can see exactly which tasks were
+        salvaged.
+
+        Tasks already in ``RESUME_SKIP_STATES`` (accepted / blocked /
+        awaiting_review / ...) are left untouched — the resume loop
+        will skip them in the next pass.
+        """
+        rows = self.state.task_rows(roadmap.roadmap_id)
+        for row in rows:
+            task_id = row["id"]
+            current = row["state"]
+            if current in RESUME_INFLIGHT_STATES:
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task_id,
+                    TaskState.READY,
+                    {"recovered_from": current, "reason": "resume_reconcile"},
+                )
+                self.state.event(
+                    roadmap.roadmap_id,
+                    task_id,
+                    None,
+                    "task.recovered_for_resume",
+                    {"recovered_from": current},
+                )
 
     def _record_roadmap_finished(self, roadmap: RoadmapConfig) -> None:
         rows = self.state.task_rows(roadmap.roadmap_id)

@@ -101,6 +101,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Default: no idle timeout."
         ),
     )
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume a previously-interrupted run from the persisted task state. "
+            "Tasks that already reached an accepted / terminal state (accepted, "
+            "pushed, merged, skipped, blocked, merge_failed, awaiting_review, "
+            "awaiting_human, failed) are skipped; tasks left in an in-flight "
+            "state by a crash (executor_running, preflight, validating, "
+            "codex_reviewing, ...) are reset to ready and re-run. Use this after "
+            "a reboot or a SIGKILL to pick up the roadmap where it left off."
+        ),
+    )
 
     status = sub.add_parser("status", help="Show task states.")
     status.add_argument("--roadmap-id", default=None, help="Filter by roadmap id.")
@@ -185,6 +198,18 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     sub.add_parser("doctor", help="Check local dependencies.")
+
+    prune = sub.add_parser(
+        "prune",
+        help="Prune stale git worktrees and orphaned workspace directories.",
+        description=(
+            "Run ``git worktree prune`` on the repo and remove orphaned workspace "
+            "directories under .agentops/workspaces/. Use this after a crash, a "
+            "reboot, or an interrupted run to clean up before resuming. Safe to run "
+            "at any time; live worktrees are never touched."
+        ),
+    )
+    prune.add_argument("--repo", default=".", help="Repository path. Default: current directory.")
 
     # Operator Run Harness: durable, recoverable execution of long operator
     # prompts (e.g. ``opencode run`` with a long prompt). See
@@ -630,8 +655,13 @@ def main(argv: list[str] | None = None) -> int:
                 executor_startup_timeout=args.executor_startup_timeout,
                 executor_idle_timeout=args.executor_idle_timeout,
             )
-            count = Orchestrator(state, options).run_roadmap(roadmap)
-            print(f"Processed {count} task(s) from roadmap {roadmap.roadmap_id}")
+            orch = Orchestrator(state, options)
+            if args.resume:
+                count = orch.resume_roadmap(roadmap)
+                print(f"Resumed {count} task(s) from roadmap {roadmap.roadmap_id}")
+            else:
+                count = orch.run_roadmap(roadmap)
+                print(f"Processed {count} task(s) from roadmap {roadmap.roadmap_id}")
             return 0
 
         if args.command == "status":
@@ -662,6 +692,18 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "doctor":
             return _cmd_doctor()
+
+        if args.command == "prune":
+            from .git_ops import prune_worktrees as _prune
+
+            repo = Path(args.repo).expanduser().resolve()
+            if not repo.exists():
+                print(f"Repo path does not exist: {repo}", file=sys.stderr)
+                return 2
+            ws_root = repo / ".agentops" / "workspaces"
+            n = _prune(repo, workspaces_root=ws_root)
+            print(f"Pruned {n} stale worktree(s).")
+            return 0
 
         if args.command == "serve":
             from . import web as _web  # local import; CLI stays light when not serving
