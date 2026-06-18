@@ -102,6 +102,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--codex-idle-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Codex review call idle watchdog (seconds). When set, the codex "
+            "runner streams review.stdout.jsonl in real time and terminates the "
+            "codex process group if the file has not grown for this many "
+            "seconds. Prevents a wedged codex call from blocking the whole "
+            "roadmap. Default: no codex idle timeout (only --timeout applies)."
+        ),
+    )
+    run.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -666,6 +678,7 @@ def main(argv: list[str] | None = None) -> int:
                 artifacts_root=Path(args.artifacts_root).expanduser().resolve() if args.artifacts_root else None,
                 executor_startup_timeout=args.executor_startup_timeout,
                 executor_idle_timeout=args.executor_idle_timeout,
+                codex_idle_timeout=getattr(args, "codex_idle_timeout", None),
             )
             orch = Orchestrator(state, options)
             if args.resume:

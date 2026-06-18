@@ -87,7 +87,10 @@ class FakeCodexService:
     def is_available(self) -> bool:
         return self.available
 
-    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
+    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None, **kwargs):
+        # Accept and ignore idle_timeout (AO-AUDIT B6) so the fake codex
+        # service stays compatible with the updated orchestrator call
+        # site. Real CodexReviewService forwards it to CodexRunner.
         argv = build_codex_command(
             prompt_path,
             schema_path=schema_path,
@@ -156,7 +159,7 @@ class RecordingHeuristicReviewer(HeuristicReviewer):
         super().__init__()
         self.calls: list[dict[str, Any]] = []
 
-    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
+    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None, **kwargs):
         self.calls.append(
             {
                 "prompt": str(prompt_path) if prompt_path is not None else None,
@@ -1192,7 +1195,7 @@ class ReviewSchemaPathTests(unittest.TestCase):
             captured_schemas: list[Path | None] = []
 
             class _CapturingCodex(FakeCodexService):
-                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
+                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None, **kwargs):
                     captured_schemas.append(schema_path)
                     return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
 
@@ -1269,7 +1272,7 @@ class ReviewSchemaPathTests(unittest.TestCase):
             captured: list[Path | None] = []
 
             class _Cap(FakeCodexService):
-                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
+                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None, **kwargs):
                     captured.append(schema_path)
                     return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
 
@@ -1335,7 +1338,7 @@ class ReviewSchemaPathTests(unittest.TestCase):
             captured: list[Path | None] = []
 
             class _Cap(FakeCodexService):
-                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
+                def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None, **kwargs):
                     captured.append(schema_path)
                     return super().review(prompt_path, cwd, artifact_dir, schema_path, timeout_seconds)
 

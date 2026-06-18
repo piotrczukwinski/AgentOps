@@ -221,6 +221,7 @@ class CodexReviewService:
         timeout_seconds: int,
         model: str | None = None,
         model_reasoning_effort: str | None = None,
+        idle_timeout: float | None = None,
     ) -> tuple[ReviewVerdict, Path]:
         output_path = artifact_dir / "review.result.json"
         result = self.runner.run_review(
@@ -233,6 +234,7 @@ class CodexReviewService:
             binary=self.binary,
             model=model,
             model_reasoning_effort=model_reasoning_effort,
+            idle_timeout=idle_timeout,
         )
         if not result.ok:
             return (

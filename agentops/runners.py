@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import threading
@@ -186,7 +187,19 @@ class CodexRunner:
         binary: str | None = None,
         model: str | None = None,
         model_reasoning_effort: str | None = None,
+        idle_timeout: float | None = None,
     ) -> RunnerResult:
+        """Run the codex review command.
+
+        When ``idle_timeout`` is set, the runner streams stdout to
+        ``review.stdout.jsonl`` in real time and runs an idle watchdog:
+        if the file has not grown for ``idle_timeout`` seconds while
+        the process is alive, the process group is terminated and the
+        result is reported as ``timed_out=True`` with
+        ``failure_category="codex_idle_timeout"`` (AO-AUDIT B6). When
+        ``idle_timeout`` is None the runner keeps the legacy
+        ``subprocess.run`` path (capture_output, no live file growth).
+        """
         command = build_codex_command(
             prompt_path,
             schema_path=schema_path,
@@ -198,6 +211,17 @@ class CodexRunner:
         stdout_path = artifact_dir / "review.stdout.jsonl"
         stderr_path = artifact_dir / "review.stderr.log"
         started = utc_now()
+        if idle_timeout is not None and idle_timeout > 0:
+            return self._run_review_streaming(
+                command,
+                prompt_path=prompt_path,
+                cwd=cwd,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                started=started,
+                timeout_seconds=timeout_seconds,
+                idle_timeout=idle_timeout,
+            )
         try:
             with prompt_path.open("r", encoding="utf-8") as stdin:
                 proc = subprocess.run(
@@ -217,6 +241,124 @@ class CodexRunner:
             stdout_path.write_text(exc.stdout or "", encoding="utf-8", errors="replace")
             stderr_path.write_text((exc.stderr or "") + f"\nTIMEOUT after {timeout_seconds}s\n", encoding="utf-8", errors="replace")
             return RunnerResult(124, stdout_path, stderr_path, started, utc_now(), timed_out=True)
+
+    def _run_review_streaming(
+        self,
+        command: list[str],
+        *,
+        prompt_path: Path,
+        cwd: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+        started: str,
+        timeout_seconds: int,
+        idle_timeout: float,
+    ) -> RunnerResult:
+        """Streaming codex review with an idle watchdog (AO-AUDIT B6).
+
+        Pumps stdout/stderr to disk on background threads so the
+        ``review.stdout.jsonl`` file grows in real time. An idle
+        watchdog terminates the process group when the file has not
+        grown for ``idle_timeout`` seconds; the result is reported as
+        ``timed_out=True`` with ``failure_category="codex_idle_timeout"``.
+        """
+        import threading as _threading
+
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_fh = stdout_path.open("ab", buffering=0)
+        stderr_fh = stderr_path.open("ab", buffering=0)
+
+        def _pump(source, fh) -> None:
+            try:
+                while True:
+                    chunk = source.read(4096)
+                    if not chunk:
+                        break
+                    with contextlib.suppress(Exception):
+                        fh.write(chunk)
+            except Exception:
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    source.close()
+
+        with prompt_path.open("r", encoding="utf-8") as stdin:
+            proc = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                stdin=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=reviewer_env(),
+                text=False,
+            )
+            stdout_thread = _threading.Thread(target=_pump, args=(proc.stdout, stdout_fh), daemon=True)
+            stderr_thread = _threading.Thread(target=_pump, args=(proc.stderr, stderr_fh), daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+
+            # Idle watchdog: poll the stdout file size.
+            import time as _time
+
+            last_size = 0
+            last_growth = _time.time()
+            idle_triggered = False
+            deadline = _time.time() + float(timeout_seconds)
+            while True:
+                if proc.poll() is not None:
+                    break
+                now = _time.time()
+                if now >= deadline:
+                    # Wall-clock timeout.
+                    with contextlib.suppress(Exception):
+                        proc.terminate()
+                    break
+                try:
+                    current = stdout_path.stat().st_size
+                except OSError:
+                    current = last_size
+                if current != last_size:
+                    last_size = current
+                    last_growth = now
+                elif (now - last_growth) >= idle_timeout:
+                    # Idle: terminate the process group.
+                    with contextlib.suppress(Exception):
+                        proc.terminate()
+                    idle_triggered = True
+                    break
+                _time.sleep(min(0.5, idle_timeout / 4))
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                proc.wait(timeout=5)
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            stdout_fh.close()
+            stderr_fh.close()
+
+        exit_code = proc.returncode if proc.returncode is not None else 1
+        if idle_triggered:
+            stderr_path.open("a", encoding="utf-8").write(
+                f"\nIDLE TIMEOUT after {idle_timeout}s without stdout growth\n"
+            )
+            return RunnerResult(
+                exit_code,
+                stdout_path,
+                stderr_path,
+                started,
+                utc_now(),
+                timed_out=True,
+                failure_category="codex_idle_timeout",
+            )
+        if exit_code == 124:
+            stderr_path.open("a", encoding="utf-8").write(
+                f"\nTIMEOUT after {timeout_seconds}s\n"
+            )
+            return RunnerResult(124, stdout_path, stderr_path, started, utc_now(), timed_out=True)
+        return RunnerResult(exit_code, stdout_path, stderr_path, started, utc_now())
 
 
 def build_codex_command(

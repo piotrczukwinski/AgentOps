@@ -321,6 +321,16 @@ class IntegrationBranchBlocked(RuntimeError):
     """Raised when an integration branch is in the protected set."""
 
 
+class CherryPickConflict(GitError):
+    """Raised when a cherry-pick into the integration branch hits a conflict.
+
+    A distinct exception type so the orchestrator's merge handler
+    (AO-AUDIT-010) can catch *only* real merge failures and re-raise
+    unrelated ``RuntimeError`` instances instead of swallowing them as
+    ``merge_failed``.
+    """
+
+
 def is_protected_branch(name: str, protected: tuple[str, ...] = DEFAULT_PROTECTED_BRANCHES) -> bool:
     import fnmatch
 
@@ -381,22 +391,24 @@ def fast_forward_merge(repo: Path, integration_branch: str, task_branch: str) ->
 def cherry_pick_into(repo: Path, integration_branch: str, sha: str) -> str:
     """Cherry-pick ``sha`` into ``integration_branch``.
 
-    Returns the new commit SHA on the integration branch. Raises on
-    conflict so the orchestrator can mark the task ``merge_failed``.
+    Returns the new commit SHA on the integration branch. Raises
+    :class:`CherryPickConflict` on conflict (AO-AUDIT-010: a distinct
+    exception so the orchestrator does not swallow unrelated
+    ``RuntimeError`` instances as merge failures).
     """
     if is_protected_branch(integration_branch):
         raise IntegrationBranchBlocked(
             f"integration_branch {integration_branch!r} is in the protected set"
         )
     if not sha:
-        raise RuntimeError("cherry_pick_into requires a non-empty commit SHA")
+        raise ValueError("cherry_pick_into requires a non-empty commit SHA")
     previous = current_branch(repo) or run_git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False).stdout.strip().removeprefix("refs/heads/")
     run_git(repo, ["checkout", "--quiet", integration_branch])
     try:
         result = run_git(repo, ["cherry-pick", "--no-edit", sha], check=False)
         if result.returncode != 0:
             run_git(repo, ["cherry-pick", "--abort"], check=False)
-            raise RuntimeError(
+            raise CherryPickConflict(
                 f"cherry-pick of {sha!r} into {integration_branch!r} failed (likely conflict)"
             )
         new_sha = rev_parse(repo, "HEAD")

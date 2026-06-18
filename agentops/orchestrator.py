@@ -23,6 +23,7 @@ from .artifacts import ArtifactStore
 from .budget import BudgetManager
 from .git_ops import (
     IntegrationBranchBlocked,
+    CherryPickConflict,
     branch_exists,
     branch_for_task,
     collect_diff,
@@ -148,13 +149,24 @@ def _is_codex_failure_verdict(verdict: ReviewVerdict) -> bool:
     ``review_unavailable`` failure category so the run summary does
     not pretend the change was approved.
 
-    The detection is intentionally narrow so that a real reviewer's
-    BLOCK verdict (with a meaningful summary) is never misclassified.
+    AO-AUDIT-009 (B8): the primary signal is the explicit
+    ``raw["codex_failure"] == True`` flag the CodexReviewService sets
+    on its synthesized verdicts. The summary-string match is retained
+    only as a fallback for older verdict payloads that do not carry
+    the flag. This prevents a real reviewer BLOCK whose summary
+    happens to contain "codex review failed" from being misclassified.
     """
     if verdict is None:
         return False
     if (verdict.verdict or "").upper() != "BLOCK":
         return False
+    # Primary signal: the explicit flag set by CodexReviewService.
+    raw = verdict.raw or {}
+    if isinstance(raw, dict) and raw.get("codex_failure") is True:
+        return True
+    # Fallback: summary-string match. This is intentionally narrow
+    # (exact marker substrings, not free-text heuristics) and only
+    # fires when the raw flag is absent.
     summary = (verdict.summary or "").lower()
     failure_markers = (
         "codex review command failed",
@@ -162,12 +174,7 @@ def _is_codex_failure_verdict(verdict: ReviewVerdict) -> bool:
         "reviewer did not return a parseable final message",
         "reviewer final message was not valid json",
     )
-    if any(marker in summary for marker in failure_markers):
-        return True
-    # Also catch the marker the CodexReviewService sets in the raw
-    # payload when it cannot find a valid verdict.
-    raw = verdict.raw or {}
-    return isinstance(raw, dict) and raw.get("codex_failure") is True
+    return any(marker in summary for marker in failure_markers)
 
 
 def _failure_category_for_verdict(verdict: ReviewVerdict) -> str:
@@ -176,7 +183,16 @@ def _failure_category_for_verdict(verdict: ReviewVerdict) -> str:
     Used together with :func:`_is_codex_failure_verdict` so a
     required-codex task that the codex process could not complete
     lands in ``awaiting_review`` with the right greppable category.
+
+    Prefers the explicit ``raw["codex_failure"]`` flag when present
+    (AO-AUDIT-009): a codex binary/process failure is
+    ``codex_unavailable``, while a generic parse failure is
+    ``review_unavailable``. Falls back to the summary-string match
+    for older payloads without the flag.
     """
+    raw = verdict.raw or {}
+    if isinstance(raw, dict) and raw.get("codex_failure") is True:
+        return "codex_unavailable"
     summary = (verdict.summary or "").lower()
     if "codex review command failed" in summary or "codex review failed" in summary:
         return "codex_unavailable"
@@ -200,6 +216,13 @@ class RunOptions:
     # empty / stalled for that many seconds.
     executor_startup_timeout: float | None = None
     executor_idle_timeout: float | None = None
+    # Codex review call idle watchdog (AO-AUDIT B6). When set, the
+    # CodexRunner streams ``review.stdout.jsonl`` in real time and
+    # terminates the codex process group if the file has not grown
+    # for this many seconds. The task is reported as
+    # ``timed_out=True`` with ``failure_category="codex_idle_timeout"``
+    # so a wedged codex call does not block the whole roadmap.
+    codex_idle_timeout: float | None = None
 
 
 @dataclass
@@ -1213,6 +1236,7 @@ class Orchestrator:
             timeout_seconds=task.timeout_seconds,
             model=task.review.codex_model,
             model_reasoning_effort=task.review.model_reasoning_effort,
+            idle_timeout=self.options.codex_idle_timeout,
         )
         self.state.record_artifact(
             roadmap.roadmap_id, task.id, attempt_id, "review_result", result_path
@@ -1423,7 +1447,12 @@ class Orchestrator:
                 branch,
                 strategy=merge_policy.strategy,
             )
-        except (IntegrationBranchBlocked, RuntimeError) as exc:
+        except (IntegrationBranchBlocked, CherryPickConflict) as exc:
+            # AO-AUDIT-010: narrow the handler to the specific merge
+            # failure types. An unrelated ``RuntimeError`` (e.g. a git
+            # binary missing, a filesystem error, a bug in our own
+            # helper) is re-raised so it is not silently swallowed as
+            # a merge_failed.
             self.state.transition_task(
                 roadmap.roadmap_id,
                 task.id,
