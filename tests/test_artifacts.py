@@ -43,13 +43,16 @@ class TestSafeName(unittest.TestCase):
     def test_emoji_and_symbols_become_dashes(self) -> None:
         self.assertEqual(safe_name("emoji 🚀 done"), "emoji---done")
 
-    def test_only_special_chars_returns_empty(self) -> None:
-        # No alnum characters -> all collapse to dashes -> stripped to "".
-        self.assertEqual(safe_name("!!!"), "")
-        self.assertEqual(safe_name("---"), "")
+    def test_only_special_chars_returns_dash(self) -> None:
+        # No alnum characters -> all collapse to dashes -> stripped to
+        # "" then the fix replaces the empty result with "-" so the
+        # segment never collapses (which would let distinct all-symbol
+        # ids collide into one directory).
+        self.assertEqual(safe_name("!!!"), "-")
+        self.assertEqual(safe_name("---"), "-")
 
-    def test_empty_string_returns_empty(self) -> None:
-        self.assertEqual(safe_name(""), "")
+    def test_empty_string_returns_dash(self) -> None:
+        self.assertEqual(safe_name(""), "-")
 
     def test_no_leading_or_trailing_dashes(self) -> None:
         self.assertEqual(safe_name("-abc-"), "abc")
@@ -83,19 +86,56 @@ class TestSafeName(unittest.TestCase):
                     msg=f"char {ch!r} from {value!r}",
                 )
 
-    @unittest.expectedFailure
     def test_safe_name_never_contains_dotdot(self) -> None:
         # CRITICAL invariant: ``safe_name`` feeds every artifact path
-        # component, so its output must never contain ".." (path traversal).
-        #
-        # This test currently FAILS: ``safe_name`` keeps "." (it is in the
-        # allowed set "._-"), so inputs containing adjacent dots survive as a
-        # traversal token. e.g. ``safe_name("..") == ".."`` which, used as a
-        # roadmap_id, makes ``attempt_dir`` build ``root/runs/../task/0``
-        # i.e. writes OUTSIDE the runs directory. Reported as a D13 finding;
-        # the source is intentionally not patched here.
+        # component, so its output must never contain ".." (path
+        # traversal). This was a security bug discovered by D13; the
+        # fix in artifacts.py collapses any ``..`` run to ``-`` so a
+        # hostile roadmap_id='..' cannot escape the .agentops/runs/
+        # sandbox.
         for value in ["..", "...", "a..b", "../..", "a/../b", "..\\.."]:
             self.assertNotIn("..", safe_name(value), msg=value)
+
+    def test_safe_name_dotdot_collapses_to_dash(self) -> None:
+        # Pin the exact post-fix behaviour so a future regression is
+        # loud, not just "not ..".
+        self.assertEqual(safe_name(".."), "-")
+        self.assertEqual(safe_name("."), "-")
+        self.assertEqual(safe_name("..."), "-")
+        self.assertEqual(safe_name("a..b"), "a-b")
+        self.assertEqual(safe_name("../.."), "-")
+
+    def test_attempt_dir_refuses_to_escape_sandbox(self) -> None:
+        # Defence in depth: even if safe_name ever regressed, the
+        # ArtifactStore.attempt_dir guard must raise rather than write
+        # outside the root. Simulate a regression by monkey-patching
+        # safe_name to pass ".." through unchanged.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agentops"
+            store = ArtifactStore(root)
+            import agentops.artifacts as _art
+
+            original = _art.safe_name
+            _art.safe_name = lambda v: v  # pass-through (simulated regression)
+            try:
+                with self.assertRaises(ValueError):
+                    store.attempt_dir("..", "..", 0)
+            finally:
+                _art.safe_name = original
+
+    def test_attempt_dir_stays_inside_sandbox_for_normal_inputs(self) -> None:
+        # Invariant: for any normal roadmap_id / task_id the resolved
+        # attempt_dir is always inside store.root. This is the positive
+        # counterpart to the escape guard test.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agentops"
+            store = ArtifactStore(root)
+            for rm, task in [("rm-1", "T1"), ("rm-2", "T2"), ("with..dots", "x..y")]:
+                path = store.attempt_dir(rm, task, 0)
+                self.assertTrue(
+                    str(path.resolve()).startswith(str(store.root)),
+                    msg=f"{path} escaped {store.root}",
+                )
 
 
 class TestArtifactStore(unittest.TestCase):
