@@ -292,6 +292,7 @@ class CodexRunner:
                 stderr=subprocess.PIPE,
                 env=reviewer_env(),
                 text=False,
+                start_new_session=True,
             )
             stdout_thread = _threading.Thread(target=_pump, args=(proc.stdout, stdout_fh), daemon=True)
             stderr_thread = _threading.Thread(target=_pump, args=(proc.stderr, stderr_fh), daemon=True)
@@ -311,8 +312,7 @@ class CodexRunner:
                 now = _time.time()
                 if now >= deadline:
                     # Wall-clock timeout.
-                    with contextlib.suppress(Exception):
-                        proc.terminate()
+                    _terminate_process_tree(proc.pid)
                     break
                 try:
                     current = stdout_path.stat().st_size
@@ -323,16 +323,14 @@ class CodexRunner:
                     last_growth = now
                 elif (now - last_growth) >= idle_timeout:
                     # Idle: terminate the process group.
-                    with contextlib.suppress(Exception):
-                        proc.terminate()
+                    _terminate_process_tree(proc.pid)
                     idle_triggered = True
                     break
                 _time.sleep(min(0.5, idle_timeout / 4))
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                with contextlib.suppress(Exception):
-                    proc.kill()
+                _terminate_process_tree(proc.pid)
                 proc.wait(timeout=5)
             stdout_thread.join(timeout=2)
             stderr_thread.join(timeout=2)

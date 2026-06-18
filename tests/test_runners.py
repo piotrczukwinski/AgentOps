@@ -16,6 +16,7 @@ from agentops.models import (
     TaskConfig,
 )
 from agentops.runners import (
+    CodexRunner,
     OpenCodeRunner,
     ShellRunner,
     _IdleWatchdog,
@@ -132,6 +133,34 @@ class _FakeStream:
 
 def _stream_proc(*, stdout: bytes = b"", stderr: bytes = b"", exit_code: int = 0, argv=None) -> _FakeProc:
     return _FakeProc(argv=argv, stdout_bytes=stdout, stderr_bytes=stderr, exit_code=exit_code)
+
+
+class CodexRunnerStreamingTests(unittest.TestCase):
+    def test_idle_watchdog_process_starts_in_new_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            artifact_dir = Path(tmp) / "artifacts"
+            artifact_dir.mkdir()
+            prompt_path = artifact_dir / "review.prompt.md"
+            prompt_path.write_text("review", encoding="utf-8")
+            captured: dict[str, object] = {}
+
+            def fake_popen(args, **kwargs):  # type: ignore[no-untyped-def]
+                captured["start_new_session"] = kwargs.get("start_new_session")
+                return _FakeProc(argv=args, stdout_bytes=b"{}", returncode=0)
+
+            with mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen):
+                result = CodexRunner().run_review(
+                    prompt_path,
+                    cwd=workspace,
+                    artifact_dir=artifact_dir,
+                    binary="codex",
+                    idle_timeout=1.0,
+                )
+
+            self.assertTrue(result.ok)
+            self.assertIs(captured["start_new_session"], True)
 
 
 class _BlockingFakeProc(_FakeProc):
