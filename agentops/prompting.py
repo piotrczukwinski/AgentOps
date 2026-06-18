@@ -40,30 +40,40 @@ Rules for the final marker:
 - The marker MUST be the literal token `AGENTOPS_RESULT_JSON` on its
   own line (or on the same line as the opening brace of the JSON
   object), followed by a colon (`:`) and then the JSON object.
+- The marker line MUST start with the marker token (after optional
+  leading whitespace). The parser does NOT accept shell-prompted
+  lines (`$ AGENTOPS_RESULT_JSON: ...`, `bash$ AGENTOPS_RESULT_JSON: ...`,
+  `> AGENTOPS_RESULT_JSON: ...`), echoed lines (`echo
+  AGENTOPS_RESULT_JSON=...`), or markers that appear inside a heredoc
+  transcript (`cat <<EOF` ... `AGENTOPS_RESULT_JSON: ...` ... `EOF`).
+  The marker and the JSON must land on stdout directly.
 - The preferred form is the colon form above
-  (`AGENTOPS_RESULT_JSON:` followed by the JSON object). Do NOT use
-  the equals sign (`AGENTOPS_RESULT_JSON=`); the equals form is
-  tolerated by AgentOps as a legacy / common variant but the colon
-  form is required for new output.
+  (`AGENTOPS_RESULT_JSON:` followed by the JSON object). The equals
+  form (`AGENTOPS_RESULT_JSON=...`) is tolerated by AgentOps as a
+  legacy / common variant ONLY when the line starts directly with
+  the marker token; the colon form is required for new output.
+  Do NOT use the equals sign on a line that also has any other
+  text before the marker (e.g. shell prompts or `echo`).
 - Do NOT wrap the final JSON in markdown backticks. No ```` ```json
   ... ``` ```` fences, no ```` ``` ... ``` ```` plain fences, no
   inline backticks around the JSON object.
 - Do NOT print the result through a `cat <<EOF` / heredoc / file
   indirection. The marker and the JSON must land in the executor
   stdout directly.
-- Do NOT prefix the marker with a shell prompt (`$`, `#`, `>`,
-  `bash$`, etc.). Print the marker and the JSON object directly.
-- Do NOT use any of these rejected forms:
-  - `AGENTOPS_RESULT_JSON="..."` (equals sign)
-  - `` ```json\nAGENTOPS_RESULT_JSON: {...}\n``` `` (fenced)
-  - `echo AGENTOPS_RESULT_JSON=...` (echoed as a single line with `=`)
-  - `cat <<EOF\nAGENTOPS_RESULT_JSON: ...\nEOF` (heredoc)
+- Do NOT use any of these rejected forms (they are all parsed as
+  "no result produced" and block the task):
+  - ````` $ AGENTOPS_RESULT_JSON: {...} ````` (shell prompt prefix)
+  - ````` bash$ AGENTOPS_RESULT_JSON: {...} ````` (shell prompt prefix)
+  - ````` > AGENTOPS_RESULT_JSON: {...} ````` (REPL / shell continuation prefix)
+  - ````` echo AGENTOPS_RESULT_JSON={...} ````` (echoed as a single line)
+  - ````` cat <<EOF\nAGENTOPS_RESULT_JSON: {...}\nEOF ````` (heredoc)
+  - ```` ```json\nAGENTOPS_RESULT_JSON: {...}\n``` ```` (fenced)
 
 Return the marker and the JSON object directly on stdout. The
 JSON is the only structured channel AgentOps uses to read the
-result; a missing marker, a fenced marker, an equals-only marker,
-or a marker with malformed JSON is treated as "no result produced"
-and blocks the task.
+result; a missing marker, a fenced marker, a wrapped marker
+(shell prompt, echo, heredoc), or a marker with malformed JSON
+is treated as "no result produced" and blocks the task.
 
 AgentOps will independently verify the diff, files, branch, and
 validation results. Your JSON is a self-report, not the source of

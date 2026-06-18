@@ -26,6 +26,7 @@ from unittest import mock
 
 from agentops import cli
 from agentops.operator_run import (
+    MISSING_RESULT_CATEGORY,
     TRANSIENT_FAILED_STATUS,
     CodeFenceResultRejected,
     ResultNotFound,
@@ -744,6 +745,176 @@ class OperatorResultTests(unittest.TestCase):
             path = write_result(target, {"status": "done"})
             self.assertTrue(path.exists())
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "done")
+
+    # ------------------------------------------------------------------
+    # Result JSON contract hardening - wrapped form rejection
+    # (Codex REQUEST_CHANGES on PR #22)
+    # ------------------------------------------------------------------
+
+    def test_extracts_banner_marker(self) -> None:
+        """Pure banner form ``### AGENTOPS_RESULT_JSON ###`` is accepted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "### AGENTOPS_RESULT_JSON ###\n"
+                "{\"status\": \"done\", \"summary\": \"banner\"}\n",
+                encoding="utf-8",
+            )
+            payload = extract_result(target)
+            self.assertEqual(payload["status"], "done")
+            self.assertEqual(payload["summary"], "banner")
+
+    def test_extracts_leading_whitespace_marker(self) -> None:
+        """Optional leading whitespace before the marker is accepted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "   AGENTOPS_RESULT_JSON: {\"status\": \"done\", \"summary\": \"indent\"}\n",
+                encoding="utf-8",
+            )
+            payload = extract_result(target)
+            self.assertEqual(payload["status"], "done")
+            self.assertEqual(payload["summary"], "indent")
+
+    def test_raises_for_dollar_prompt_prefix(self) -> None:
+        """``$ AGENTOPS_RESULT_JSON: {...}`` is rejected (shell prompt prefix)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "$ AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_raises_for_bash_dollar_prompt_prefix(self) -> None:
+        """``bash$ AGENTOPS_RESULT_JSON: {...}`` is rejected (shell prompt prefix)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "bash$ AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_raises_for_gt_prompt_prefix(self) -> None:
+        """``> AGENTOPS_RESULT_JSON: {...}`` is rejected (shell prompt prefix)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "> AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_raises_for_echoed_marker(self) -> None:
+        """``echo AGENTOPS_RESULT_JSON={...}`` is rejected (echoed as a single line)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "echo AGENTOPS_RESULT_JSON={\"status\": \"done\"}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_raises_for_heredoc_marker(self) -> None:
+        """Marker inside a ``cat <<EOF`` heredoc transcript is rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "cat <<EOF\n"
+                "AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_classify_marker_rejects_dollar_prompt(self) -> None:
+        """``$ AGENTOPS_RESULT_JSON: {...}`` must NOT classify as real."""
+        text = "$ AGENTOPS_RESULT_JSON: {\"status\": \"done\"}"
+        self.assertNotEqual(classify_result_marker(text), "real")
+        self.assertEqual(
+            failure_category_for_result_marker(text),
+            MISSING_RESULT_CATEGORY,
+        )
+
+    def test_classify_marker_rejects_bash_dollar_prompt(self) -> None:
+        """``bash$ AGENTOPS_RESULT_JSON: {...}`` must NOT classify as real."""
+        text = "bash$ AGENTOPS_RESULT_JSON: {\"status\": \"done\"}"
+        self.assertNotEqual(classify_result_marker(text), "real")
+        self.assertEqual(
+            failure_category_for_result_marker(text),
+            MISSING_RESULT_CATEGORY,
+        )
+
+    def test_classify_marker_rejects_gt_prompt(self) -> None:
+        """``> AGENTOPS_RESULT_JSON: {...}`` must NOT classify as real."""
+        text = "> AGENTOPS_RESULT_JSON: {\"status\": \"done\"}"
+        self.assertNotEqual(classify_result_marker(text), "real")
+        self.assertEqual(
+            failure_category_for_result_marker(text),
+            MISSING_RESULT_CATEGORY,
+        )
+
+    def test_classify_marker_rejects_echoed_marker(self) -> None:
+        """``echo AGENTOPS_RESULT_JSON={...}`` must NOT classify as real."""
+        text = "echo AGENTOPS_RESULT_JSON={\"status\": \"done\"}"
+        self.assertNotEqual(classify_result_marker(text), "real")
+        self.assertEqual(
+            failure_category_for_result_marker(text),
+            MISSING_RESULT_CATEGORY,
+        )
+
+    def test_classify_marker_rejects_heredoc_marker(self) -> None:
+        """Marker inside a ``cat <<EOF`` heredoc must NOT classify as real."""
+        text = (
+            "cat <<EOF\n"
+            "AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n"
+            "EOF\n"
+        )
+        self.assertNotEqual(classify_result_marker(text), "real")
+        self.assertEqual(
+            failure_category_for_result_marker(text),
+            MISSING_RESULT_CATEGORY,
+        )
+
+    def test_classify_aligns_with_extract_for_wrapped_forms(self) -> None:
+        """``classify_result_marker`` and ``extract_result`` must agree on wrapped forms."""
+        wrapped_cases = [
+            "$ AGENTOPS_RESULT_JSON: {\"status\": \"done\"}",
+            "bash$ AGENTOPS_RESULT_JSON: {\"status\": \"done\"}",
+            "> AGENTOPS_RESULT_JSON: {\"status\": \"done\"}",
+            "echo AGENTOPS_RESULT_JSON={\"status\": \"done\"}",
+            "cat <<EOF\nAGENTOPS_RESULT_JSON: {\"status\": \"done\"}\nEOF\n",
+        ]
+        for text in wrapped_cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "run"
+                target.mkdir()
+                (target / "combined.log").write_text(text, encoding="utf-8")
+                with self.assertRaises(ResultNotFound):
+                    extract_result(target)
+                classification = classify_result_marker(text)
+                self.assertNotEqual(
+                    classification,
+                    "real",
+                    f"classify_result_marker wrongly classified wrapped form as 'real': {text!r}",
+                )
+                self.assertEqual(
+                    failure_category_for_result_marker(text),
+                    MISSING_RESULT_CATEGORY,
+                )
 
 
 class OperatorStatusTests(unittest.TestCase):

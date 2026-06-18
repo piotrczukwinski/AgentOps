@@ -793,12 +793,27 @@ and multi-line banner forms, but **rejects**:
 * a marker followed by a template / placeholder value (e.g.
   `"done|blocked"`, `"..."`);
 * a marker whose line or body contains a markdown code fence
-  (` ``` `).
+  (` ``` `);
+* a marker wrapped in shell syntax: a line that starts with a shell
+  prompt (`$`, `bash$`, `#`, `>`), an `echo` prefix, or any other
+  non-whitespace prefix;
+* a marker that appears inside a heredoc transcript (e.g.
+  `cat <<EOF\nAGENTOPS_RESULT_JSON: ...\nEOF`); the parser scans
+  backwards for the heredoc start and rejects markers that appear
+  between `<<` and the matching closer.
+
+The parser is strict on purpose: a valid marker line must START
+(after optional whitespace) with the bare marker, optionally
+followed by `:` or `=` and the JSON body, or it must be a pure
+banner line `### AGENTOPS_RESULT_JSON ###` with the JSON on the
+next line. Wrapped forms (shell prompt, echo, heredoc) are
+classified as `missing` so the orchestrator's
+`require_executor_result` guard fires.
 
 A missing or malformed result blocks the task with the canonical
 `failure_category: missing_result` or `template_result` on the
-`BLOCKED` transition, so a fence-only / equals-only / malformed
-output never silently slips through.
+`BLOCKED` transition, so a fence-only / equals-only / wrapped /
+malformed output never silently slips through.
 
 ### Cycle layout
 

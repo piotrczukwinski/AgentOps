@@ -318,30 +318,37 @@ as a legacy / common variant):
   AGENTOPS_RESULT_JSON: {"status": "done", ...}
   ```
 
-* **Tolerated** (legacy / common equals form):
+* **Tolerated** (legacy / common equals form, line starts with the marker):
 
   ```text
   AGENTOPS_RESULT_JSON={"status": "done", ...}
   AGENTOPS_RESULT_JSON= {"status": "done", ...}
   ```
 
-* **Tolerated** (multi-line banner):
+* **Tolerated** (multi-line banner, bare marker on its own line):
 
   ```text
   AGENTOPS_RESULT_JSON
   {"status": "done", ...}
   ```
 
-* **Tolerated** (banner with surrounding hashes):
+* **Tolerated** (pure banner with surrounding hashes, no trailing content):
 
   ```text
   ### AGENTOPS_RESULT_JSON ###
   {"status": "done", ...}
   ```
 
+A valid marker line must START (after optional whitespace) with the
+bare marker, optionally followed by `:` or `=` and the JSON body,
+or it must be a pure banner line `### AGENTOPS_RESULT_JSON ###` with
+the JSON on the next line. The marker may also have optional leading
+whitespace.
+
 The parser also tolerates:
 
-* text before the marker,
+* text before the marker line (the strict matching is per line, not
+  per text),
 * pretty-printed JSON that spans multiple lines,
 * trailing text after the JSON (cleanup output, banner lines, etc.).
 
@@ -358,25 +365,33 @@ anti-patterns:
 
 | Anti-pattern | Why it is forbidden | Parser behaviour |
 |---|---|---|
-| `AGENTOPS_RESULT_JSON=...` (equals sign) | Tolerated as legacy / common output, but the colon form is required for new output. | Accepted (legacy tolerance). |
+| `AGENTOPS_RESULT_JSON=...` (equals sign on its own line) | Tolerated as legacy / common output, but the colon form is required for new output. | Accepted (legacy tolerance). |
 | ```` ```json ... ``` ```` / ```` ``` ... ``` ```` (markdown code fence around the JSON) | Fences hide the JSON inside a code block and signal a contract violation. | **Rejected** (`CodeFenceResultRejected`). |
-| `cat <<EOF\nAGENTOPS_RESULT_JSON: ...\nEOF` (heredoc) | Heredocs wrap the marker in shell syntax. | Rejected (JSON parsing fails; classified as `missing`). |
-| `$ AGENTOPS_RESULT_JSON: ...` / `bash$ AGENTOPS_RESULT_JSON: ...` (shell prompt prefix) | The marker must land on stdout directly. | Rejected (JSON parsing fails; classified as `missing`). |
+| `cat <<EOF\nAGENTOPS_RESULT_JSON: ...\nEOF` (heredoc transcript) | Heredocs wrap the marker in shell syntax. The parser scans backwards for `<<` and rejects markers that appear between the heredoc start and the matching closer. | **Rejected** (classified as `missing`; `ResultNotFound`). |
+| `$ AGENTOPS_RESULT_JSON: ...` / `bash$ AGENTOPS_RESULT_JSON: ...` (shell prompt prefix) | The marker must land on stdout directly; a leading `$`, `bash$`, `#`, `>` or other shell prompt is not allowed. | **Rejected** (strict regex refuses to match; classified as `missing`; `ResultNotFound`). |
+| `echo AGENTOPS_RESULT_JSON=...` (echoed as a single line) | The `echo` prefix means the marker is being printed as part of a shell command, not as a direct executor result. | **Rejected** (strict regex refuses to match; classified as `missing`; `ResultNotFound`). |
+| `> AGENTOPS_RESULT_JSON: ...` (REPL / shell continuation prefix) | The marker must land on stdout directly; a leading `>` is not allowed. | **Rejected** (strict regex refuses to match; classified as `missing`; `ResultNotFound`). |
 | Marker absent, marker on its own line followed by nothing, or marker followed by malformed JSON | These are not valid `AGENTOPS_RESULT_JSON` blocks. | **Rejected** (`ResultNotFound` / `missing`). |
 | Template placeholder result (e.g. `"done|blocked"`, `"..."`, or a dict whose `status` is a placeholder) | A placeholder is not a real result. | **Rejected** (`TemplateResultRejected` / `template`). |
 
 The parser never silently accepts a missing marker, a malformed
-JSON body, a template placeholder, or a fenced result. The
-orchestrator's result guard (`require_executor_result: true`) honours
-all of the above and refuses to validate / accept a task whose
-executor output does not match the contract.
+JSON body, a template placeholder, a fenced result, or a wrapped
+marker (shell prompt, echo, heredoc). The orchestrator's result
+guard (`require_executor_result: true`) honours all of the above
+and refuses to validate / accept a task whose executor output does
+not match the contract.
 
 > **Why is `AGENTOPS_RESULT_JSON=` still accepted?** Some executor
 > runtimes print the marker via a single `print` statement with an
 > `=` separator (e.g. `print("AGENTOPS_RESULT_JSON=" + json.dumps(...))`).
 > Refusing this form would block otherwise valid task output. The
-> parser still accepts it, but the prompt explicitly asks for the
-> colon form and lists the equals form in the "do not" section.
+> parser still accepts the bare-equals form (line starts with the
+> marker, then `=`, then the JSON), but the prompt explicitly asks
+> for the colon form and lists the equals form in the "do not"
+> section. The equals form is only accepted when the line starts
+> directly with `AGENTOPS_RESULT_JSON=`; an echoed or heredoc
+> equals form (`echo AGENTOPS_RESULT_JSON=...`,
+> `cat <<EOF\nAGENTOPS_RESULT_JSON=...\nEOF`) is rejected.
 
 ## Idle watchdog
 

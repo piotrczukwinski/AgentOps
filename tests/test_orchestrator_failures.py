@@ -280,6 +280,55 @@ class OrchestratorResultGuardTests(unittest.TestCase):
             )
             self.assertIn(row["state"], {"accepted", "merged"})
 
+    def test_dollar_prompt_marker_blocks_when_required(self) -> None:
+        """``$ AGENTOPS_RESULT_JSON: {...}`` must be blocked when result guard is on."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            body = (
+                f"$ {RESULT_MARKER}: "
+                + json.dumps({"status": "done", "summary": "x"})
+                + "\n"
+            )
+            row = self._run(
+                tmp,
+                executor_body=body,
+                require_executor_result=True,
+            )
+            self.assertEqual(row["state"], "blocked")
+
+    def test_echoed_marker_blocks_when_required(self) -> None:
+        """``echo AGENTOPS_RESULT_JSON={...}`` must be blocked when result guard is on."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            body = (
+                f"echo {RESULT_MARKER}="
+                + json.dumps({"status": "done", "summary": "x"})
+                + "\n"
+            )
+            row = self._run(
+                tmp,
+                executor_body=body,
+                require_executor_result=True,
+            )
+            self.assertEqual(row["state"], "blocked")
+
+    def test_heredoc_marker_blocks_when_required(self) -> None:
+        """A marker inside a ``cat <<EOF`` heredoc must be blocked when result guard is on."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            body = (
+                "cat <<EOF\n"
+                f"{RESULT_MARKER}: "
+                + json.dumps({"status": "done", "summary": "x"})
+                + "\nEOF\n"
+            )
+            row = self._run(
+                tmp,
+                executor_body=body,
+                require_executor_result=True,
+            )
+            self.assertEqual(row["state"], "blocked")
+
 
 class ExecutorPromptMarkerContractTests(unittest.TestCase):
     """The generated executor prompt must demand the preferred colon marker and
