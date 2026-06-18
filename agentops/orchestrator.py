@@ -47,6 +47,7 @@ from .models import (
 )
 from .policy import PolicyEngine
 from .prompting import PromptCompiler
+from .repo_lock import RunAlreadyLockedError, acquire_run_lock
 from .review import (
     CodexReviewService,
     HeuristicReviewer,
@@ -202,6 +203,18 @@ class Orchestrator:
                 f"Repo path is not a git repository: {roadmap.repo.path}. "
                 f"Initialize it with 'git init' and commit at least once before running AgentOps."
             )
+        # Acquire the repo-level run lock for the whole roadmap. Two
+        # simultaneous ``agentops run`` invocations on the same repo
+        # race on the integration branch and on worktree creation; the
+        # lock turns the race into a clear error. A stale lock file (the
+        # recorded pid is gone, e.g. after a hard reboot) is reclaimed
+        # automatically. See ``agentops/repo_lock.py`` and
+        # ``docs/operator-reliability-audit.md`` (AO-AUDIT-002).
+        with acquire_run_lock(roadmap.repo.path, roadmap_id=roadmap.roadmap_id):
+            return self._run_roadmap_locked(roadmap)
+
+    def _run_roadmap_locked(self, roadmap: RoadmapConfig) -> int:
+        """Roadmap execution body. Called with the repo lock already held."""
         self.state.init()
         self.state.import_roadmap(roadmap)
         policy = PolicyEngine(roadmap)
