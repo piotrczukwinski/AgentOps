@@ -2280,7 +2280,15 @@ def tail_combined(run_dir_path: Path, *, lines: int) -> list[str]:
 
 
 class ResultNotFound(RuntimeError):
-    """Raised when no AGENTOPS_RESULT_JSON block can be located in a log."""
+    """Raised when no AGENTOPS_RESULT_JSON block can be located in a log.
+
+    Covers both the "marker absent" case (the executor never printed the
+    header at all) and the "marker present but no body" case (the header
+    is on its own line or followed by whitespace / a comment, with no
+    parseable JSON value). Callers that need to distinguish the two
+    cases can use :func:`classify_result_marker`, which returns
+    ``"absent"`` and ``"missing"`` respectively.
+    """
 
 
 class TemplateResultRejected(RuntimeError):
@@ -2294,33 +2302,76 @@ class TemplateResultRejected(RuntimeError):
     """
 
 
-# Match a line that *starts* a JSON value, possibly preceded by whitespace.
-# The executor may print the marker on its own line, in a banner like
-# ``AGENTOPS_RESULT_JSON: { ... }`` (single line) or
-# ``AGENTOPS_RESULT_JSON:\n{ ... }`` (multi-line).
+class CodeFenceResultRejected(TemplateResultRejected):
+    r"""Raised when the executor wrapped ``AGENTOPS_RESULT_JSON`` in a markdown fence.
+
+    The prompt contract requires the executor to print the marker and the
+    raw JSON object directly (no triple-backtick ``\`\`\`json`` /
+    ``\`\`\`` wrapping, no ``cat <<EOF`` heredoc, no shell prompt
+    prefix). When the executor wraps the result in a fenced code block
+    the JSON itself is still parseable, but accepting it would silently
+    forgive a contract violation, so :func:`extract_result` rejects it
+    instead. Subclassing :class:`TemplateResultRejected` preserves the
+    existing orchestrator behaviour that already treats template
+    placeholders as a non-zero exit / blocked task.
+    """
+
+
+# Marker variants AgentOps accepts. The preferred form is the colon
+# marker (``AGENTOPS_RESULT_JSON:``). The equals form
+# (``AGENTOPS_RESULT_JSON=``) is a tolerated legacy / common variant
+# that the parser still accepts; the executor prompt warns against it
+# and asks for the colon form. A bare marker on its own line is also
+# accepted because the JSON body can sit on the next line.
+#
+# - Preferred: ``AGENTOPS_RESULT_JSON:\n{...}`` or ``AGENTOPS_RESULT_JSON: {...}``
+# - Legacy / common: ``AGENTOPS_RESULT_JSON={...}`` or ``AGENTOPS_RESULT_JSON= {...}``
+# - Multi-line banner: ``AGENTOPS_RESULT_JSON\n{...}`` or ``### AGENTOPS_RESULT_JSON ###``
+#
+# The pattern matches any line that contains the marker token, with an
+# optional word boundary. The body is sliced out by
+# :func:`_slice_json_body`, which looks for the first ``{``, ``[``, or
+# ``"`` after the marker text on the same line, then falls through to
+# the next line if the body is pretty-printed.
 _RESULT_HEADER = re.compile(
     r"(?m)^[^\n]*\b" + re.escape(RESULT_MARKER) + r"\b[^\n]*$"
 )
 
+# A code-fence open (``\`\`\`json``, ``\`\`\``, ``\`\`\`text``) or close
+# (``\`\`\``) on the marker line. We treat any line that contains a
+# triple-backtick sequence (with optional language tag) as a fenced
+# markdown block and reject it, because the prompt contract forbids
+# markdown backticks around the final JSON.
+_CODE_FENCE_LINE = re.compile(r"```")
+
 
 def extract_result(run_dir_path: Path) -> dict[str, Any]:
-    """Parse the last ``AGENTOPS_RESULT_JSON`` block from ``combined.log``.
+    r"""Parse the last ``AGENTOPS_RESULT_JSON`` block from ``combined.log``.
 
-    The function tolerates:
+    The function tolerates the following marker forms (the executor
+    prompt prefers the colon form, but the parser still accepts the
+    equals form as a legacy / common variant):
 
-    * any text before the marker line,
-    * a marker that is part of a longer banner like
-      ``AGENTOPS_RESULT_JSON:`` or ``### AGENTOPS_RESULT_JSON ###``,
-    * pretty-printed JSON that spans multiple lines,
-    * trailing text after the JSON, *if* that trailing text does not contain
-      a closing brace that would unbalance the parsed object. (We simply
-      consume as much as ``json.loads`` will accept.)
+    * Preferred colon form: ``AGENTOPS_RESULT_JSON:\n{...}`` or
+      ``AGENTOPS_RESULT_JSON: {...}`` (single line, JSON on the same
+      line as the marker).
+    * Legacy / common equals form: ``AGENTOPS_RESULT_JSON={...}`` or
+      ``AGENTOPS_RESULT_JSON= {...}``.
+    * Multi-line banner: ``AGENTOPS_RESULT_JSON\n{...}`` or
+      ``### AGENTOPS_RESULT_JSON ###``.
 
-    The function refuses to return a "template" placeholder result (see
-    :func:`is_template_placeholder_result`). A run that prints
-    ``AGENTOPS_RESULT_JSON: "done|blocked"`` is treated as if no result
-    was produced at all and the caller is expected to surface a clear
-    "template result rejected" error to the operator.
+    The function refuses to return a "template" placeholder result
+    (see :func:`is_template_placeholder_result`). A run that prints
+    ``AGENTOPS_RESULT_JSON: "done|blocked"`` is treated as if no
+    result was produced at all and the caller is expected to surface
+    a clear "template result rejected" error to the operator.
+
+    The function also refuses to extract a result that is wrapped in a
+    markdown code fence (triple-backtick ``\`\`\`json ... \`\`\``).
+    The prompt contract forbids fenced blocks; accepting them would
+    silently forgive a contract violation, so we raise
+    :class:`CodeFenceResultRejected` instead. This is the stricter of
+    the two behaviours the contract allows for fenced output.
     """
     log = run_dir_path / "combined.log"
     if not log.exists():
@@ -2340,7 +2391,11 @@ def extract_result(run_dir_path: Path) -> dict[str, Any]:
     # by falling through to earlier matches. We also try to skip template
     # placeholder results and report a clearer error in that case.
     last_template: str | None = None
+    last_code_fence_line: str | None = None
     for header in reversed(matches):
+        if _header_in_code_fence(text, header):
+            last_code_fence_line = _line_text(text, header)
+            continue
         body = _slice_json_body(text, header.end(), header_match=header)
         if body is None:
             continue
@@ -2358,6 +2413,13 @@ def extract_result(run_dir_path: Path) -> dict[str, Any]:
         # uniformly. The wrap records the original JSON type for
         # diagnostics.
         return {"value": payload, "_wrapped": True}
+    if last_code_fence_line is not None:
+        raise CodeFenceResultRejected(
+            f"AGENTOPS_RESULT_JSON in {log} is wrapped in a markdown "
+            f"code fence ({last_code_fence_line.strip()!r}); the executor "
+            "must print the marker and the JSON object directly, "
+            "without triple-backtick fences."
+        )
     if last_template is not None:
         raise TemplateResultRejected(
             f"AGENTOPS_RESULT_JSON in {log} is a template placeholder "
@@ -2481,6 +2543,52 @@ def _slice_json_body(
     except json.JSONDecodeError:
         return None
     return text[i:end]
+
+
+def _line_text(text: str, header_match: re.Match[str]) -> str:
+    """Return the full line that contains ``header_match`` (no trailing newline)."""
+    line_start = text.rfind("\n", 0, header_match.start()) + 1
+    line_end = text.find("\n", header_match.start())
+    if line_end == -1:
+        line_end = len(text)
+    return text[line_start:line_end]
+
+
+def _header_in_code_fence(text: str, header_match: re.Match[str]) -> bool:
+    r"""Return ``True`` if the marker line or its body is inside a markdown fence.
+
+    A fenced code block is any line with a triple-backtick sequence
+    (``\`\`\`json``, ``\`\`\`text``, ``\`\`\``). The executor is
+    required to print the marker and the JSON object directly without
+    any markdown backticks; a fenced result is treated as a contract
+    violation and rejected by :func:`extract_result` (see
+    :class:`CodeFenceResultRejected`).
+
+    The check covers two cases:
+
+    * the marker line itself contains a fence (e.g. the executor
+      printed ``AGENTOPS_RESULT_JSON: \`\`\`json {...} \`\`\`` on a
+      single line);
+    * the marker is on its own line and the body that follows starts
+      with an opening fence (e.g. ``AGENTOPS_RESULT_JSON:\n\`\`\`json
+      {...}\n\`\`\``).
+
+    Prose containing inline backticks *before* the marker does not
+    trigger the rejection.
+    """
+    if _CODE_FENCE_LINE.search(_line_text(text, header_match)):
+        return True
+    # Look at the text after the marker line, up to the next marker
+    # (or end of text). A fence anywhere in the body is a contract
+    # violation: the JSON inside the fence would still be parseable
+    # but accepting it would silently forgive the wrapping.
+    line_end = text.find("\n", header_match.start())
+    if line_end == -1:
+        return False
+    body_start = line_end + 1
+    next_marker_idx = text.find(RESULT_MARKER, body_start)
+    body_end = next_marker_idx if next_marker_idx != -1 else len(text)
+    return bool(_CODE_FENCE_LINE.search(text[body_start:body_end]))
 
 
 def write_result(run_dir_path: Path, payload: dict[str, Any]) -> Path:
@@ -3030,6 +3138,7 @@ __all__ = [
     "RETRYING_STATUS",
     "IDLE_TIMEOUT_REASON",
     "STOP_REASON",
+    "CodeFenceResultRejected",
     "TemplateResultRejected",
     "RETRY_CONFIG_FILENAME",
     "ATTEMPTS_DIRNAME",
