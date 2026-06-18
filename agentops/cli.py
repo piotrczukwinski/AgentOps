@@ -332,6 +332,18 @@ def build_parser() -> argparse.ArgumentParser:
         "'json' prints a JSON object with the fields the web/admin panel can "
         "consume. With --format json and no --run-id, the output is a JSON array.",
     )
+    operator_status_cmd.add_argument(
+        "--reconcile",
+        action="store_true",
+        help=(
+            "Reconcile stale-pid entries on disk before reporting. When a "
+            "status.json says 'running'/'retry_waiting' but the recorded pid is "
+            "gone, the persisted status is rewritten to 'needs_operator' with "
+            "failure_category 'stale_pid' so direct readers (cron jobs, the web "
+            "panel, future agents) see the same answer as the runtime overlay. "
+            "Idempotent: a run that is already consistent is never demoted."
+        ),
+    )
 
     operator_tail_cmd = sub.add_parser(
         "operator-tail",
@@ -1855,7 +1867,7 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_operator_status(args: argparse.Namespace) -> int:
-    from .operator_run import format_status_json, format_status_line, list_status
+    from .operator_run import format_status_json, format_status_line, list_status, reconcile_status_file
 
     root = _operator_run_root(args)
     if not root.exists():
@@ -1867,6 +1879,18 @@ def _cmd_operator_status(args: argparse.Namespace) -> int:
     except FileNotFoundError as exc:
         print(f"operator-status: {exc}", file=sys.stderr)
         return 2
+
+    # Reconcile stale-pid entries on disk before reporting. The
+    # ``--reconcile`` flag is idempotent: runs that are already
+    # consistent (persisted == canonical, pid alive) are left
+    # untouched. Only runs whose persisted status claims a live process
+    # while the pid is gone are rewritten. AO-AUDIT-002.
+    if getattr(args, "reconcile", False):
+        for run_dir_path, _payload in entries:
+            reconcile_status_file(run_dir_path)
+        # Re-list after reconcile so the reported status reflects the
+        # rewritten file.
+        entries = list_status(root, run_id=args.run_id)
 
     if not entries:
         if args.run_id:

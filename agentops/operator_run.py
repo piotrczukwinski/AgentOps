@@ -2970,6 +2970,59 @@ def _resolve_runtime_status(run_dir_path: Path, payload: dict[str, Any]) -> dict
     return out
 
 
+def reconcile_status_file(run_dir_path: Path) -> dict[str, Any] | None:
+    """Promote the runtime overlay to the persisted ``status.json``.
+
+    This is the AO-AUDIT-002 fix: when ``_resolve_runtime_status``
+    detects a stale pid (persisted ``running`` / ``retry_waiting`` but
+    the pid is gone) the on-disk file still lies. Direct readers
+    (cron jobs, future agents, the web UI) see "running" for a dead
+    process. This function rewrites the persisted ``status`` field to
+    the canonical overlay status and records a
+    ``failure_category: stale_pid`` so the morning checklist can grep
+    for the reconciliation.
+
+    The rewrite is idempotent: a terminal status is never demoted, and
+    a run that is already consistent (persisted == canonical) is left
+    untouched. Returns the updated payload, or ``None`` when the run
+    directory has no ``status.json`` (e.g. a pre-launch run that was
+    never started).
+    """
+    status_path = run_dir_path / "status.json"
+    if not status_path.exists():
+        return None
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    overlay = _resolve_runtime_status(run_dir_path, payload)
+    persisted = payload.get("status")
+    runtime = overlay.get("runtime_status")
+    # Only reconcile when the persisted status claims a live process but
+    # the pid is gone. We never demote a real terminal status
+    # (succeeded / failed / needs_operator / transient_failed) and we
+    # never touch a run that is already consistent.
+    if persisted not in {RUNNING_STATUS, RETRYING_STATUS, RETRY_WAITING_STATUS}:
+        return None
+    if runtime not in {"stale_pid", "exited_or_stale"}:
+        return None
+    # Rewrite the persisted status. We do NOT keep ``running`` /
+    # ``retry_waiting``: those are the lie we are correcting. The
+    # canonical replacement is ``needs_operator`` with
+    # ``failure_category: stale_pid`` so the runbook and the morning
+    # checklist can grep for the exact reason.
+    payload["status"] = NEEDS_OPERATOR_STATUS
+    payload["failure_category"] = "stale_pid"
+    payload["reconciled_at"] = utc_now()
+    payload["reconciled_from"] = persisted
+    payload["runtime_status"] = runtime
+    payload["pid_alive"] = False
+    status_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
 def normalize_status(persisted: str | None, exit_code: int | None = None) -> str:
     """Map a persisted status string to the canonical model.
 
