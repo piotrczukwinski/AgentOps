@@ -601,18 +601,55 @@ class OperatorRunsEndpointTests(unittest.TestCase):
         for key in (
             "run_id",
             "name",
+            "status",
             "canonical_status",
             "runtime_status",
+            "runtime_status_alias",
+            "runtime_status_note",
             "pid",
             "pid_alive",
             "active_attempt",
             "active_combined_log",
             "log_size_bytes",
             "idle_for_seconds",
+            "failure_category",
             "result_json_present",
             "suggested_action",
         ):
             self.assertIn(key, sample)
+
+    def test_operator_runs_endpoint_surfaces_stale_pid_overlay(self):
+        # AO-AUDIT C9: a run whose persisted status.json says "running"
+        # but whose pid is gone must surface as stale_pid in the web UI
+        # without the operator having to run `operator-status --reconcile`.
+        with mock.patch.dict(os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False):
+            run = self.repo / ".operator-runs" / "20260617T000200Z-stale-deadbeef"
+            run.mkdir(parents=True, exist_ok=True)
+            (run / "combined.log").write_text("line\n", encoding="utf-8")
+            (run / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "20260617T000200Z-stale-deadbeef",
+                        "name": "stale",
+                        "status": "running",
+                        "pid": 0,
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "failure_category": "stale_pid",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status, data = self._get("/api/operator-runs")
+        self.assertEqual(status, 200)
+        row = next(r for r in data["runs"] if r["run_id"] == "20260617T000200Z-stale-deadbeef")
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["canonical_status"], "running")
+        self.assertEqual(row["runtime_status"], "stale_pid")
+        self.assertEqual(row["runtime_status_alias"], "exited")
+        self.assertIn("pid not alive", row["runtime_status_note"] or "")
+        self.assertFalse(row["pid_alive"])
+        self.assertEqual(row["failure_category"], "stale_pid")
+        self.assertEqual(row["suggested_action"], "operator-retry")
 
     def test_operator_runs_tail_returns_latest_log(self):
         with mock.patch.dict(os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False):
@@ -623,6 +660,21 @@ class OperatorRunsEndpointTests(unittest.TestCase):
         self.assertEqual(data["lines"], 2)
         self.assertIn("c", data["text"])
         self.assertIn("d", data["text"])
+        # AO-AUDIT C9: the per-run tail endpoint also surfaces the
+        # runtime overlay so the detail view shows stale_pid /
+        # failure_category without a separate status endpoint.
+        run = data.get("run")
+        self.assertIsInstance(run, dict)
+        self.assertEqual(run["run_id"], "20260617T000000Z-fake-cccccccc")
+        for key in (
+            "runtime_status",
+            "runtime_status_alias",
+            "runtime_status_note",
+            "failure_category",
+            "idle_for_seconds",
+            "suggested_action",
+        ):
+            self.assertIn(key, run)
 
     def test_operator_runs_tail_rejects_traversal(self):
         status, _ = self._get("/api/operator-runs/..%2F..%2Fetc%2Fpasswd/tail?lines=10")
@@ -651,6 +703,10 @@ class OperatorRunsEndpointTests(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         self.assertIn("Operator runs (monitor)", body)
         self.assertIn("/api/operator-runs", body)
+        # AO-AUDIT C9: the operator-runs table surfaces the persisted
+        # status, the runtime overlay, and failure_category columns.
+        self.assertIn("runtime-stale", body)
+        self.assertIn("status-dot stale", body)
         for forbidden in ("/api/exec", "/api/shell", "/api/command", "/api/run_command"):
             self.assertNotIn(forbidden, body)
 

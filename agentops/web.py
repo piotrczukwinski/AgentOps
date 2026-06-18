@@ -256,18 +256,30 @@ def _project_operator_run_for_api(
 
     The projection is the single source of truth for the
     dashboard contract. Tests assert on this exact shape.
+
+    AO-AUDIT C9: the projection forwards the runtime overlay fields
+    (``runtime_status_alias``, ``runtime_status_note``,
+    ``failure_category``) so the web UI can surface a stale-pid run as
+    stale even when the persisted ``status.json`` still says
+    ``running``. The persisted ``status`` field is also exposed so the
+    UI can show when the runtime overlay disagrees with the on-disk
+    record without having to read ``status.json`` itself.
     """
     return {
         "run_id": str(payload.get("run_id") or run_dir_path.name),
         "name": payload.get("name"),
+        "status": payload.get("status"),
         "canonical_status": payload.get("canonical_status"),
         "runtime_status": payload.get("runtime_status"),
+        "runtime_status_alias": payload.get("runtime_status_alias"),
+        "runtime_status_note": payload.get("runtime_status_note"),
         "pid": payload.get("pid"),
         "pid_alive": bool(payload.get("pid_alive")),
         "active_attempt": payload.get("active_attempt"),
         "active_combined_log": payload.get("active_combined_log"),
         "log_size_bytes": int(payload.get("log_size_bytes") or 0),
         "idle_for_seconds": payload.get("idle_for_seconds"),
+        "failure_category": payload.get("failure_category"),
         "result_json_present": bool(payload.get("result_json_present")),
         "suggested_action": payload.get("suggested_action"),
     }
@@ -303,6 +315,12 @@ def collect_operator_run_tail(
     Raises :class:`FileNotFoundError` when the run directory does
     not exist. Raises :class:`ValueError` when ``run_id`` contains
     a path separator or a ``..`` component.
+
+    AO-AUDIT C9: the response also carries the projected runtime
+    overlay (under ``run``) so the per-run detail view surfaces the
+    same stale-pid / ``failure_category`` fields as the list
+    endpoint. The overlay is read-only; this function never writes
+    to ``status.json``.
     """
     if not isinstance(run_id, str) or not run_id.strip():
         raise ValueError("run_id is required")
@@ -310,6 +328,7 @@ def collect_operator_run_tail(
         raise ValueError("run_id must be a single path component")
     from .operator_run import (
         latest_combined_log,
+        list_status,
         resolve_run,
         tail_combined,
     )
@@ -319,11 +338,24 @@ def collect_operator_run_tail(
     log_path = latest_combined_log(target)
     cap = max(1, min(int(lines), 5000))
     tail_lines = tail_combined(target, lines=cap)
+    # Attach the runtime overlay so the per-run detail view surfaces the
+    # same fields as the list endpoint (stale_pid, failure_category,
+    # suggested_action, ...). ``list_status`` reads ``status.json`` and
+    # applies the overlay without writing back to disk.
+    run_proj: dict[str, Any] | None = None
+    try:
+        entries = list_status(root, run_id=run_id)
+    except FileNotFoundError:
+        entries = []
+    if entries:
+        _path, overlay = entries[0]
+        run_proj = _project_operator_run_for_api(target, overlay)
     return {
         "run_id": run_id,
         "active_combined_log": str(log_path),
         "lines": cap,
         "text": "\n".join(tail_lines),
+        "run": run_proj,
     }
 
 
@@ -605,6 +637,9 @@ INDEX_TEMPLATE = """<!doctype html>
   .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: #888; }
   .status-dot.ok { background: #2a9d4a; }
   .status-dot.bad { background: var(--err); }
+  .status-dot.stale { background: #d97706; }
+  .runtime-stale { color: #d97706; font-weight: 600; }
+  @media (prefers-color-scheme: dark) { .runtime-stale { color: #f0a830; } }
 </style>
 </head>
 <body>
@@ -659,9 +694,9 @@ INDEX_TEMPLATE = """<!doctype html>
     <h2 style="margin-top:0;font-size:15px;">Operator runs (monitor)</h2>
     <table>
       <thead>
-        <tr><th>Run id</th><th>Name</th><th>Runtime</th><th>PID</th><th>Idle (s)</th><th>Log size</th><th>Result</th><th>Suggested</th><th>Action</th></tr>
+        <tr><th>Run id</th><th>Name</th><th>Status</th><th>Runtime</th><th>PID</th><th>Idle (s)</th><th>Log size</th><th>Failure</th><th>Result</th><th>Suggested</th><th>Action</th></tr>
       </thead>
-      <tbody id="operator-runs-rows"><tr><td colspan="9" class="muted">loading&hellip;</td></tr></tbody>
+      <tbody id="operator-runs-rows"><tr><td colspan="11" class="muted">loading&hellip;</td></tr></tbody>
     </table>
     <div class="row" style="margin-top:8px;">
       <label for="operator-run-input" class="muted">Run id:</label>
@@ -811,20 +846,33 @@ INDEX_TEMPLATE = """<!doctype html>
 
 function renderOperatorRuns(runs) {
   if (!runs || !runs.length) {
-    operatorRunsRows.innerHTML = '<tr><td colspan="9" class="muted">No operator runs yet</td></tr>';
+    operatorRunsRows.innerHTML = '<tr><td colspan="11" class="muted">No operator runs yet</td></tr>';
     return;
   }
   operatorRunsRows.innerHTML = runs.map(function (r) {
     const idle = r.idle_for_seconds == null ? "-" : Math.round(Number(r.idle_for_seconds));
     const suggested = r.suggested_action || "none";
     const result = r.result_json_present ? "present" : "absent";
+    const persisted = r.canonical_status || r.status || "-";
+    const runtime = r.runtime_status || "-";
+    const differs = runtime && persisted && runtime !== persisted;
+    const runtimeCell = differs
+      ? '<span class="status-dot stale"></span> <span class="runtime-stale">' + escapeHtml(runtime)
+        + '</span> <span class="muted">(persisted: ' + escapeHtml(persisted) + ')</span>'
+      : escapeHtml(runtime);
+    const failure = r.failure_category || "-";
+    const note = r.runtime_status_note
+      ? ' <span class="muted" title="' + escapeHtml(r.runtime_status_note) + '">&#9432;</span>'
+      : "";
     return "<tr>"
       + "<td>" + escapeHtml(r.run_id) + "</td>"
       + "<td>" + escapeHtml(r.name || "-") + "</td>"
-      + "<td>" + escapeHtml(r.runtime_status || "-") + "</td>"
+      + "<td>" + escapeHtml(persisted) + "</td>"
+      + "<td>" + runtimeCell + note + "</td>"
       + "<td>" + escapeHtml(r.pid == null ? "-" : r.pid) + "</td>"
       + "<td>" + escapeHtml(idle) + "</td>"
       + "<td>" + escapeHtml(r.log_size_bytes) + "</td>"
+      + "<td>" + escapeHtml(failure) + "</td>"
       + "<td>" + escapeHtml(result) + "</td>"
       + "<td>" + escapeHtml(suggested) + "</td>"
       + '<td><button class="secondary op-tail-btn" data-run-id="' + escapeHtml(r.run_id) + '">Tail</button></td>'
