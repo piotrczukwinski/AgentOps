@@ -153,6 +153,9 @@ class PromptCompiler:
                 "",
                 attempt_block,
                 "",
+                "# Original task spec (what the executor was asked to implement)",
+                _spec_block(task),
+                "",
                 "# Review decision options",
                 "- ACCEPT: task is safe, scoped, validated, and aligned with policy.",
                 "- REQUEST_CHANGES: task is directionally OK but needs a bounded repair prompt for executor.",
@@ -412,6 +415,21 @@ def _classify_file_scope(
     if not allowed:
         return True, "allowed_files is empty; policy accepts any change"
     return False, "does not match any allowed_files pattern"
+
+
+def _spec_block(task: TaskConfig) -> str:
+    """Return the original task prompt text for inclusion in the review packet.
+
+    The reviewer (Codex) needs the spec the executor was asked to implement so
+    it can compare "what was requested" against "what was built". The prompt
+    file always exists at plan time (``lint_roadmap`` enforces it); reading it
+    here keeps the review packet self-contained. Read failures fall back to a
+    short note so the review can still proceed.
+    """
+    try:
+        return task.prompt_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"(could not read task spec {task.prompt_path}: {exc})"
 
 
 def _truncate(text: str, limit: int) -> str:
