@@ -27,16 +27,21 @@ from unittest import mock
 from agentops import cli
 from agentops.operator_run import (
     TRANSIENT_FAILED_STATUS,
+    CodeFenceResultRejected,
     ResultNotFound,
+    TemplateResultRejected,
     attempt_dir,
     backoff_for_attempt,
     build_argv,
     build_resume_hint,
+    classify_result_marker,
     classify_transient,
     extract_result,
+    failure_category_for_result_marker,
     format_status_line,
     generate_run_id,
     is_git_repo_with_changes,
+    is_template_placeholder_result,
     latest_attempt_no,
     latest_combined_log,
     list_status,
@@ -533,6 +538,204 @@ class OperatorResultTests(unittest.TestCase):
             )
             with self.assertRaises(ResultNotFound):
                 extract_result(target)
+
+    # ------------------------------------------------------------------
+    # Result JSON contract hardening (fix/result-json-contract-hardening)
+    # ------------------------------------------------------------------
+
+    def test_extracts_colon_marker_own_line(self) -> None:
+        """Preferred form: ``AGENTOPS_RESULT_JSON:`` on its own line, JSON below."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "preamble\nAGENTOPS_RESULT_JSON:\n{\"status\": \"done\", \"summary\": \"colon own line\"}\n",
+                encoding="utf-8",
+            )
+            payload = extract_result(target)
+            self.assertEqual(payload["status"], "done")
+            self.assertEqual(payload["summary"], "colon own line")
+
+    def test_extracts_colon_marker_same_line(self) -> None:
+        """Preferred form: ``AGENTOPS_RESULT_JSON: {...}`` on a single line."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON: {\"status\": \"done\", \"summary\": \"colon same line\"}\n",
+                encoding="utf-8",
+            )
+            payload = extract_result(target)
+            self.assertEqual(payload["status"], "done")
+            self.assertEqual(payload["summary"], "colon same line")
+
+    def test_extracts_equals_marker(self) -> None:
+        """Tolerated legacy / common variant: ``AGENTOPS_RESULT_JSON={...}``."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON={\"status\": \"done\", \"summary\": \"equals\"}\n",
+                encoding="utf-8",
+            )
+            payload = extract_result(target)
+            self.assertEqual(payload["status"], "done")
+            self.assertEqual(payload["summary"], "equals")
+
+    def test_extracts_equals_marker_with_space(self) -> None:
+        """Tolerated legacy / common variant: ``AGENTOPS_RESULT_JSON= {...}``."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON= {\"status\": \"done\", \"summary\": \"equals space\"}\n",
+                encoding="utf-8",
+            )
+            payload = extract_result(target)
+            self.assertEqual(payload["status"], "done")
+            self.assertEqual(payload["summary"], "equals space")
+
+    def test_raises_when_malformed_json_after_colon(self) -> None:
+        """Malformed JSON after the colon marker must fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON: {not valid json}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_raises_when_malformed_json_after_equals(self) -> None:
+        """Malformed JSON after the equals marker must fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON={not valid json}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_raises_when_marker_missing(self) -> None:
+        """Missing marker must fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "no marker anywhere in this log\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_raises_when_result_body_empty(self) -> None:
+        """Empty body after the marker must fail (treated as missing)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "preamble\nAGENTOPS_RESULT_JSON:\n\ntrailing\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_raises_when_result_body_whitespace_only(self) -> None:
+        """Whitespace-only body after the marker must fail (treated as missing)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON:    \n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ResultNotFound):
+                extract_result(target)
+
+    def test_raises_for_template_placeholder(self) -> None:
+        """Template placeholder result must fail (existing behaviour preserved)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON: \"done|blocked\"\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(TemplateResultRejected):
+                extract_result(target)
+
+    def test_raises_for_template_placeholder_with_equals_marker(self) -> None:
+        """Template placeholder result via the legacy equals marker must fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON=\"done|blocked\"\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(TemplateResultRejected):
+                extract_result(target)
+
+    def test_raises_for_code_fence_on_marker_line(self) -> None:
+        """Markdown code-fenced result is rejected (stricter behaviour)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON: ```json\n{\"status\": \"done\"}\n```\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(CodeFenceResultRejected):
+                extract_result(target)
+
+    def test_raises_for_code_fence_in_body(self) -> None:
+        """A code fence in the body (marker on its own line) is also rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run"
+            target.mkdir()
+            (target / "combined.log").write_text(
+                "AGENTOPS_RESULT_JSON:\n```json\n{\"status\": \"done\"}\n```\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(CodeFenceResultRejected):
+                extract_result(target)
+
+    def test_classify_marker_variants(self) -> None:
+        """``classify_result_marker`` must accept the new variants as 'real'."""
+        real_cases = (
+            "AGENTOPS_RESULT_JSON: {\"status\": \"done\"}",
+            "AGENTOPS_RESULT_JSON={\"status\": \"done\"}",
+            "AGENTOPS_RESULT_JSON= {\"status\": \"done\"}",
+            "AGENTOPS_RESULT_JSON:\n{\"status\": \"done\"}",
+            "AGENTOPS_RESULT_JSON\n{\"status\": \"done\"}",
+        )
+        for text in real_cases:
+            with self.subTest(text=text):
+                self.assertEqual(classify_result_marker(text), "real")
+
+    def test_classify_marker_template_via_equals(self) -> None:
+        """Template placeholder via the equals marker must classify as 'template'."""
+        text = "AGENTOPS_RESULT_JSON=\"done|blocked\""
+        self.assertEqual(classify_result_marker(text), "template")
+
+    def test_classify_marker_missing_for_empty_body(self) -> None:
+        """Empty body after the marker must classify as 'missing'."""
+        self.assertEqual(classify_result_marker("AGENTOPS_RESULT_JSON:\n"), "missing")
+        self.assertEqual(classify_result_marker("AGENTOPS_RESULT_JSON="), "missing")
+
+    def test_failure_category_for_equals_marker_real(self) -> None:
+        """Real result via equals marker must not produce a failure category."""
+        text = "AGENTOPS_RESULT_JSON={\"status\": \"done\"}"
+        self.assertIsNone(failure_category_for_result_marker(text))
+
+    def test_is_template_placeholder_dict_with_only_status(self) -> None:
+        """A dict whose only field is a placeholder status is a template."""
+        self.assertTrue(
+            is_template_placeholder_result({"status": "passed|awaiting_review|failed|blocked"})
+        )
 
     def test_write_result_creates_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

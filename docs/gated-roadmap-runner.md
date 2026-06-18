@@ -754,6 +754,52 @@ explicitly about BusinessAgent), and merging the PR. The
 `--max-cycles` guard (default 3) stops the loop from spinning
 forever; once it fires the operator decides the next move.
 
+### `AGENTOPS_RESULT_JSON` marker contract
+
+The repair prompt and the executor prompt demand the **preferred
+colon form**:
+
+```text
+AGENTOPS_RESULT_JSON:
+{
+  "status": "done",
+  ...
+}
+```
+
+The executor is told to:
+
+* use the colon form (`AGENTOPS_RESULT_JSON:`) — the preferred
+  form for new output;
+* never use the equals sign (`AGENTOPS_RESULT_JSON=`) — tolerated
+  by AgentOps as a legacy / common variant but explicitly listed
+  in the "do not" section of the prompt;
+* never wrap the final JSON in markdown backticks / code fences
+  (` ```json ... ``` ` or ` ``` ... ``` `);
+* never print the marker through `cat <<EOF` / heredoc / file
+  indirection;
+* never prefix the marker with a shell prompt (`$`, `#`, `bash$`,
+  `>`, etc.);
+* return the marker and the JSON object directly on stdout.
+
+AgentOps's parser (see `extract_result` and `classify_result_marker`
+in `agentops/operator_run.py`) tolerates the equals form, the colon
+form on its own line, the colon form with the JSON on the same line,
+and multi-line banner forms, but **rejects**:
+
+* a missing marker;
+* a marker followed by a non-parseable body (malformed JSON);
+* a marker followed by an empty / whitespace-only body;
+* a marker followed by a template / placeholder value (e.g.
+  `"done|blocked"`, `"..."`);
+* a marker whose line or body contains a markdown code fence
+  (` ``` `).
+
+A missing or malformed result blocks the task with the canonical
+`failure_category: missing_result` or `template_result` on the
+`BLOCKED` transition, so a fence-only / equals-only / malformed
+output never silently slips through.
+
 ### Cycle layout
 
 ```
