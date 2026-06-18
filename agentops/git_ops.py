@@ -147,9 +147,22 @@ def collect_diff(
             name_status_lines.append(f"{status}\t{path}")
 
     # Pick the diff comparison point. ``git diff <base_sha>`` includes
-    # both staged and unstaged changes since ``base_sha``; without a
-    # base SHA we fall back to the legacy working-tree-vs-index form.
+    # committed, staged, and unstaged changes since ``base_sha``;
+    # without a base SHA we fall back to the legacy
+    # working-tree-vs-index form.
     if base_sha:
+        tracked_name_status = run_git(
+            repo, ["diff", "--name-status", base_sha, "--"], check=False
+        ).stdout
+        for line in tracked_name_status.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            status = parts[0] or "M"
+            path = parts[-1]
+            if path:
+                changed_files.append(path)
+                name_status_lines.append(f"{status}\t{path}")
         stat_tracked = run_git(
             repo, ["diff", "--stat", base_sha, "--"], check=False
         ).stdout
