@@ -170,6 +170,16 @@ class FrontendMonitorHistoryTests(unittest.TestCase):
         self.assertIn("/api/run", html)
         self.assertIn("/api/bundles", html)
 
+    def test_render_escapes_javascript_newlines(self) -> None:
+        # Python triple-quoted templates must emit JS "\\n" escapes, not raw
+        # newline characters inside string literals, otherwise the whole
+        # dashboard script fails to parse and no buttons are wired.
+        html = web.render_index_html()
+        self.assertIn('+ "\\n";', html)
+        self.assertIn('[truncated, showing tail]\\n', html)
+        self.assertNotIn('+ "\n";', html)
+        self.assertNotIn('[truncated, showing tail]\n', html)
+
 
 class WebSafetyTests(unittest.TestCase):
     def test_is_loopback_host(self) -> None:

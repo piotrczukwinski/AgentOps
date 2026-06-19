@@ -2047,18 +2047,18 @@ async function tailOperatorRun() {
     );
     monitorES.addEventListener("log", function (e) {
       try {
-        out.textContent += (JSON.parse(e.data).text || "") + "\n";
-      } catch (err) { out.textContent += "[bad log frame: " + err + "]\n"; }
+        out.textContent += (JSON.parse(e.data).text || "") + "\\n";
+      } catch (err) { out.textContent += "[bad log frame: " + err + "]\\n"; }
       out.scrollTop = out.scrollHeight;
     });
     monitorES.addEventListener("done", function (e) {
       let reason = "?";
       try { reason = (JSON.parse(e.data).reason || "?"); } catch (err) { reason = "?"; }
-      out.textContent += "\n[stream ended: " + reason + "]\n";
+      out.textContent += "\\n[stream ended: " + reason + "]\\n";
       stopMonitor();
     });
     monitorES.addEventListener("error", function (e) {
-      if (e && e.data) out.textContent += "\n[error: " + e.data + "]\n";
+      if (e && e.data) out.textContent += "\\n[error: " + e.data + "]\\n";
       stopMonitor();
     });
   }
@@ -2078,18 +2078,18 @@ async function tailOperatorRun() {
     taskES = new EventSource(url);
     taskES.addEventListener("log", function (e) {
       try {
-        out.textContent += (JSON.parse(e.data).text || "") + "\n";
-      } catch (err) { out.textContent += "[bad log frame: " + err + "]\n"; }
+        out.textContent += (JSON.parse(e.data).text || "") + "\\n";
+      } catch (err) { out.textContent += "[bad log frame: " + err + "]\\n"; }
       out.scrollTop = out.scrollHeight;
     });
     taskES.addEventListener("done", function (e) {
       let reason = "?";
       try { reason = (JSON.parse(e.data).reason || "?"); } catch (err) { reason = "?"; }
-      out.textContent += "\n[stream ended: " + reason + "]\n";
+      out.textContent += "\\n[stream ended: " + reason + "]\\n";
       stopTask();
     });
     taskES.addEventListener("error", function (e) {
-      if (e && e.data) out.textContent += "\n[error: " + e.data + "]\n";
+      if (e && e.data) out.textContent += "\\n[error: " + e.data + "]\\n";
       stopTask();
     });
   }
@@ -2115,7 +2115,7 @@ async function tailOperatorRun() {
       b.addEventListener("click", function () {
         currentHistoryRoadmap = b.getAttribute("data-roadmap") || "";
         historySummary.textContent = "selected roadmap: " + currentHistoryRoadmap
-          + "\n(use the log viewer below; attempt listing: /api/tasks/<id>/attempts)";
+          + "\\n(use the log viewer below; attempt listing: /api/tasks/<id>/attempts)";
         if (logTask) logTask.focus();
       });
     });
@@ -2138,7 +2138,7 @@ async function tailOperatorRun() {
     const res = await fetchJson(url);
     if (!res.ok) { out.textContent = (res.data && res.data.error) || ("HTTP " + res.status); return; }
     if (!res.data.found) { out.textContent = "not found: " + (res.data.path || ""); return; }
-    out.textContent = (res.data.truncated ? "[truncated, showing tail]\n" : "")
+    out.textContent = (res.data.truncated ? "[truncated, showing tail]\\n" : "")
       + (res.data.text || "");
   }
 
