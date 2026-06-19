@@ -379,6 +379,33 @@ def _default_agentops_runs_root() -> Path:
     return _resolve_allowed_roots().repo_root / ".agentops" / "runs"
 
 
+def _repo_root_for_roadmap(state: StateStore, roadmap_id: str) -> Path | None:
+    """Return the target repository root recorded for ``roadmap_id``.
+
+    Bundled roadmaps can run against a different repository than the dashboard
+    process. Task logs live under that target repo's ``.agentops/runs``.
+    """
+    if not isinstance(roadmap_id, str) or not roadmap_id:
+        return None
+    try:
+        state.init()
+        with state.connect() as conn:
+            row = conn.execute(
+                "SELECT repo_path FROM roadmaps WHERE id=?",
+                (roadmap_id,),
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001 - best-effort UI lookup
+        log.warning("repo root lookup failed for roadmap %s: %s", roadmap_id, exc)
+        return None
+    if not row:
+        return None
+    try:
+        repo_path = Path(str(row["repo_path"])).expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+    return repo_path if repo_path.is_dir() else None
+
+
 def _file_size(path: Path) -> int:
     """Return the current size of ``path`` in bytes, or ``0`` on error.
 
@@ -1179,9 +1206,15 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             max_bytes = max(1, min(max_bytes, 1_000_000))
         else:
             max_bytes = 200_000
+        repo_root = _repo_root_for_roadmap(self._server_state().state, roadmap)
         try:
             payload = read_run_log(
-                roadmap, task, attempt, kind, max_bytes=max_bytes
+                roadmap,
+                task,
+                attempt,
+                kind,
+                max_bytes=max_bytes,
+                repo_root=repo_root,
             )
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
@@ -1329,7 +1362,6 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         )
         from_end = _truthy_param((query.get("from_end") or [None])[0])
 
-        runs_root = _default_agentops_runs_root()
         roadmap_raw = (query.get("roadmap") or [None])[0]
         if isinstance(roadmap_raw, str) and roadmap_raw.strip():
             try:
@@ -1337,14 +1369,43 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
+            repo_root = _repo_root_for_roadmap(self._server_state().state, roadmap)
+            runs_root = _runs_root(repo_root) if repo_root else _default_agentops_runs_root()
             log_path = resolve_task_combined_log(runs_root, roadmap, task_id)
         else:
+            runs_root = _default_agentops_runs_root()
             resolved = resolve_task_combined_log_any_roadmap(runs_root, task_id)
             if resolved is None:
                 roadmap = "*"
                 log_path = None
+                try:
+                    rows = self._server_state().state.task_rows()
+                except Exception:  # noqa: BLE001 - best-effort UI lookup
+                    rows = []
+                for row in rows:
+                    if row["id"] != task_id:
+                        continue
+                    candidate_roadmap = str(row["roadmap_id"])
+                    repo_root = _repo_root_for_roadmap(
+                        self._server_state().state, candidate_roadmap
+                    )
+                    if not repo_root:
+                        continue
+                    repo_log_path = resolve_task_combined_log(
+                        _runs_root(repo_root), candidate_roadmap, task_id
+                    )
+                    if repo_log_path is not None:
+                        roadmap = candidate_roadmap
+                        log_path = repo_log_path
+                        break
             else:
                 roadmap, log_path = resolved
+                repo_root = _repo_root_for_roadmap(self._server_state().state, roadmap)
+                if repo_root:
+                    repo_runs_root = _runs_root(repo_root)
+                    repo_log_path = resolve_task_combined_log(repo_runs_root, roadmap, task_id)
+                    if repo_log_path is not None:
+                        log_path = repo_log_path
         if log_path is None:
             self._send_sse()
             try:  # noqa: SIM105 - spec mandates try/except, not suppress
@@ -1986,28 +2047,40 @@ INDEX_TEMPLATE = """<!doctype html>
 
 
   const runsRes = await fetchJson("/api/runs");
-  if (runsRes.ok) renderRuns(runsRes.data.runs);
+  const panelRuns = runsRes.ok ? (runsRes.data.runs || []) : [];
+  if (runsRes.ok) renderRuns(panelRuns);
 
   const opRes = await fetchJson("/api/operator-runs");
-  if (opRes.ok) renderOperatorRuns(opRes.data.runs);
+  renderOperatorRuns(opRes.ok ? (opRes.data.runs || []) : [], panelRuns);
 }
 
-function renderOperatorRuns(runs) {
+function renderOperatorRuns(runs, panelRuns) {
+  const processOptions = [];
+  (panelRuns || []).forEach(function (r) {
+    processOptions.push({
+      value: r.run_id || "",
+      label: "panel | " + (r.running ? "running" : "exit=" + r.exit_code) + " | " + (r.run_id || ""),
+    });
+  });
+  (runs || []).forEach(function (r) {
+    processOptions.push({
+      value: r.run_id || "",
+      label: (r.name || "operator") + " | " + (r.runtime_status || r.canonical_status || r.status || "-") + " | " + (r.run_id || ""),
+    });
+  });
+  if (operatorRunSelect) {
+    const selectedRunId = operatorRunSelect.value;
+    operatorRunSelect.innerHTML = processOptions.length
+      ? '<option value="">(select process&hellip;)</option>'
+        + processOptions.map(function (item) {
+          return '<option value="' + escapeHtml(item.value) + '">' + escapeHtml(item.label) + '</option>';
+        }).join("")
+      : '<option value="">(no processes)</option>';
+    if (selectedRunId) operatorRunSelect.value = selectedRunId;
+  }
   if (!runs || !runs.length) {
     operatorRunsRows.innerHTML = '<tr><td colspan="11" class="muted">No operator runs yet</td></tr>';
-    if (operatorRunSelect) operatorRunSelect.innerHTML = '<option value="">(no processes)</option>';
     return;
-  }
-  const selectedRunId = operatorRunSelect ? operatorRunSelect.value : "";
-  if (operatorRunSelect) {
-    operatorRunSelect.innerHTML = '<option value="">(select process&hellip;)</option>'
-      + runs.map(function (r) {
-        const label = (r.name || r.run_id || "run")
-          + " | " + (r.runtime_status || r.canonical_status || r.status || "-")
-          + " | " + (r.run_id || "");
-        return '<option value="' + escapeHtml(r.run_id || "") + '">' + escapeHtml(label) + '</option>';
-      }).join("");
-    if (selectedRunId) operatorRunSelect.value = selectedRunId;
   }
   operatorRunsRows.innerHTML = runs.map(function (r) {
     const idle = r.idle_for_seconds == null ? "-" : Math.round(Number(r.idle_for_seconds));
