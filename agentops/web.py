@@ -48,6 +48,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from . import bundles
+from .artifacts import safe_name
 from .plan import lint_roadmap
 from .state import StateStore
 
@@ -836,6 +837,63 @@ def collect_operator_runs() -> dict[str, Any]:
     return {"runs": runs}
 
 
+def _tail_text_file(path: Path, *, lines: int) -> str:
+    cap = max(1, min(int(lines), 5000))
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(text.splitlines()[-cap:])
+
+
+def _latest_roadmap_combined_log(
+    state: StateStore, run_id: str
+) -> tuple[str, Path] | None:
+    """Resolve a synthetic ``<roadmap_id>-<pid>`` run to the latest task log."""
+    try:
+        state.init()
+        with state.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, repo_path FROM roadmaps ORDER BY id"
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 - best-effort dashboard fallback
+        log.warning("synthetic run lookup failed: %s", exc)
+        return None
+    for row in rows:
+        roadmap_id = str(row["id"])
+        prefix = f"{roadmap_id}-"
+        if not run_id.startswith(prefix):
+            continue
+        pid_raw = run_id[len(prefix):]
+        try:
+            pid = int(pid_raw)
+            os.kill(pid, 0)
+        except (OSError, ValueError):
+            return None
+        repo_root = Path(str(row["repo_path"])).expanduser().resolve()
+        runs_root = repo_root / ".agentops" / "runs" / safe_name(roadmap_id)
+        try:
+            runs_root_resolved = runs_root.resolve()
+        except OSError:
+            return None
+        candidates: list[tuple[float, Path]] = []
+        try:
+            for path in runs_root_resolved.glob("*/*/executor.combined.log"):
+                try:
+                    resolved = path.resolve()
+                    if _is_within(resolved, runs_root_resolved) and resolved.is_file():
+                        candidates.append((resolved.stat().st_mtime, resolved))
+                except OSError:
+                    continue
+        except OSError:
+            return None
+        if not candidates:
+            return None
+        _mtime, log_path = max(candidates, key=lambda item: item[0])
+        return roadmap_id, log_path
+    return None
+
+
 def collect_operator_run_tail(
     run_id: str, *, lines: int = 100
 ) -> dict[str, Any]:
@@ -1299,6 +1357,21 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=400)
             return
         except FileNotFoundError as exc:
+            resolved = _latest_roadmap_combined_log(self._server_state().state, run_id)
+            if resolved is not None:
+                roadmap_id, log_path = resolved
+                cap = max(1, min(int(lines), 5000))
+                self._send_json(
+                    {
+                        "run_id": run_id,
+                        "roadmap_id": roadmap_id,
+                        "active_combined_log": str(log_path),
+                        "lines": cap,
+                        "text": _tail_text_file(log_path, lines=cap),
+                        "run": {"run_id": run_id, "runtime_status": "running"},
+                    }
+                )
+                return
             self._send_json({"error": str(exc)}, status=404)
             return
         self._send_json(payload)
@@ -1346,6 +1419,24 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
                 target = resolve_run(root, run_id)
                 log_path = latest_combined_log(target)
             except (FileNotFoundError, ValueError):
+                resolved = _latest_roadmap_combined_log(
+                    self._server_state().state, run_id
+                )
+                if resolved is not None:
+                    _roadmap_id, log_path = resolved
+                    self._send_sse()
+                    self._stream_log_loop(
+                        log_path=log_path,
+                        id_field="run_id",
+                        id_value=run_id,
+                        max_seconds=max_seconds,
+                        idle_seconds=idle_seconds,
+                        from_end=from_end,
+                        tail_lines=200,
+                        is_alive=None,
+                        include_pid_alive=False,
+                    )
+                    return
                 # Start the SSE response so the client gets a single error
                 # frame instead of a 404 with a connection upgrade failure.
                 self._send_sse()
