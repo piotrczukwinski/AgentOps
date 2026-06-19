@@ -1761,6 +1761,8 @@ INDEX_TEMPLATE = """<!doctype html>
       <tbody id="operator-runs-rows"><tr><td colspan="11" class="muted">loading&hellip;</td></tr></tbody>
     </table>
     <div class="row" style="margin-top:8px;">
+      <label for="operator-run-select" class="muted">Process:</label>
+      <select id="operator-run-select"></select>
       <label for="operator-run-input" class="muted">Run id:</label>
       <input id="operator-run-input" type="text" placeholder="20260617T004015Z-..." size="42" />
       <button class="secondary" id="operator-tail-btn">Tail (200 lines)</button>
@@ -1832,6 +1834,7 @@ INDEX_TEMPLATE = """<!doctype html>
   const taskCount = $("task-count");
   const runsList = $("runs-list");
   const operatorRunsRows = $("operator-runs-rows");
+  const operatorRunSelect = $("operator-run-select");
   const operatorRunInput = $("operator-run-input");
   const operatorTailOutput = $("operator-tail-output");
   const operatorTailBtn = $("operator-tail-btn");
@@ -1992,7 +1995,19 @@ INDEX_TEMPLATE = """<!doctype html>
 function renderOperatorRuns(runs) {
   if (!runs || !runs.length) {
     operatorRunsRows.innerHTML = '<tr><td colspan="11" class="muted">No operator runs yet</td></tr>';
+    if (operatorRunSelect) operatorRunSelect.innerHTML = '<option value="">(no processes)</option>';
     return;
+  }
+  const selectedRunId = operatorRunSelect ? operatorRunSelect.value : "";
+  if (operatorRunSelect) {
+    operatorRunSelect.innerHTML = '<option value="">(select process&hellip;)</option>'
+      + runs.map(function (r) {
+        const label = (r.name || r.run_id || "run")
+          + " | " + (r.runtime_status || r.canonical_status || r.status || "-")
+          + " | " + (r.run_id || "");
+        return '<option value="' + escapeHtml(r.run_id || "") + '">' + escapeHtml(label) + '</option>';
+      }).join("");
+    if (selectedRunId) operatorRunSelect.value = selectedRunId;
   }
   operatorRunsRows.innerHTML = runs.map(function (r) {
     const idle = r.idle_for_seconds == null ? "-" : Math.round(Number(r.idle_for_seconds));
@@ -2026,14 +2041,18 @@ function renderOperatorRuns(runs) {
   const buttons = operatorRunsRows.querySelectorAll(".op-tail-btn");
   buttons.forEach(function (btn) {
     btn.addEventListener("click", function () {
-      operatorRunInput.value = btn.getAttribute("data-run-id") || "";
+      const runId = btn.getAttribute("data-run-id") || "";
+      operatorRunInput.value = runId;
+      monitorRunInput.value = runId;
+      if (operatorRunSelect) operatorRunSelect.value = runId;
       tailOperatorRun();
     });
   });
 }
 
 async function tailOperatorRun() {
-  const runId = (operatorRunInput.value || "").trim();
+  const selectedRunId = operatorRunSelect ? operatorRunSelect.value : "";
+  const runId = (operatorRunInput.value || selectedRunId || "").trim();
   if (!runId) {
     operatorTailOutput.textContent = "enter or select a run id first";
     return;
@@ -2053,7 +2072,8 @@ async function tailOperatorRun() {
   }
   function startMonitor() {
     stopMonitor();
-    const runId = (monitorRunInput.value || "").trim();
+    const selectedRunId = operatorRunSelect ? operatorRunSelect.value : "";
+    const runId = (monitorRunInput.value || selectedRunId || "").trim();
     if (!runId) { monitorLiveOutput.textContent = "enter a run id"; return; }
     const out = monitorLiveOutput;
     out.textContent = "";
@@ -2176,6 +2196,13 @@ async function tailOperatorRun() {
   }
 
   $("refresh-btn").addEventListener("click", refresh);
+  if (operatorRunSelect) {
+    operatorRunSelect.addEventListener("change", function () {
+      const runId = operatorRunSelect.value || "";
+      operatorRunInput.value = runId;
+      monitorRunInput.value = runId;
+    });
+  }
   if (operatorTailBtn) operatorTailBtn.addEventListener("click", tailOperatorRun);
   $("plan-btn").addEventListener("click", async function () {
     const roadmap = getRoadmap();

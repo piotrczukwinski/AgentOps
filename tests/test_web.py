@@ -153,6 +153,7 @@ class FrontendMonitorHistoryTests(unittest.TestCase):
     def test_render_has_monitor_and_history_anchors(self) -> None:
         html = web.render_index_html()
         # New anchors required for the Monitor (live SSE) + History sections.
+        self.assertIn("operator-run-select", html)
         self.assertIn("monitor-start-btn", html)
         self.assertIn("EventSource", html)
         self.assertIn("history-rows", html)
