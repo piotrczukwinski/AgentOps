@@ -2248,6 +2248,7 @@ async function tailOperatorRun() {
       btn.addEventListener("click", function () {
         const roadmapPath = btn.getAttribute("data-roadmap") || "";
         roadmapInput.value = roadmapPath;
+        if (roadmapSelect) roadmapSelect.value = roadmapPath;
         if (roadmapInput.scrollIntoView) {
           roadmapInput.scrollIntoView({ behavior: "smooth", block: "start" });
         }
@@ -2287,6 +2288,7 @@ async function tailOperatorRun() {
       bundleUploadStatus.textContent = "uploaded " + data.name + " " + data.version;
       bundleFile.value = "";
       loadBundles();
+      loadRoadmaps();
     } catch (err) {
       bundleUploadStatus.className = "err";
       bundleUploadStatus.textContent = "upload error: " + err;
