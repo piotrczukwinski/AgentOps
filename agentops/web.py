@@ -1942,15 +1942,30 @@ INDEX_TEMPLATE = """<!doctype html>
 
   async function loadRoadmaps() {
     const res = await fetchJson("/api/roadmaps");
-    if (!res.ok) {
+    const bundlesRes = await fetchJson("/api/bundles");
+    if (!res.ok && !bundlesRes.ok) {
       roadmapSelect.innerHTML = '<option value="">(none)</option>';
       return;
     }
-    const items = res.data.roadmaps || [];
-    roadmapSelect.innerHTML = '<option value="">(select&hellip;)</option>'
-      + items.map(function (it) {
+    const items = res.ok ? (res.data.roadmaps || []) : [];
+    const bundleItems = bundlesRes.ok ? (bundlesRes.data.bundles || []) : [];
+    let html = '<option value="">(select&hellip;)</option>';
+    if (bundleItems.length) {
+      html += '<optgroup label="Bundles">'
+        + bundleItems.map(function (b) {
+          const label = (b.name || "bundle") + (b.version ? " " + b.version : "");
+          return '<option value="' + escapeHtml(b.roadmap_path || "") + '">' + escapeHtml(label) + '</option>';
+        }).join("")
+        + "</optgroup>";
+    }
+    if (items.length) {
+      html += '<optgroup label="Roadmaps">'
+        + items.map(function (it) {
         return '<option value="' + escapeHtml(it.path) + '">' + escapeHtml(it.rel) + '</option>';
-      }).join("");
+      }).join("")
+        + "</optgroup>";
+    }
+    roadmapSelect.innerHTML = html;
   }
 
   async function refresh() {
