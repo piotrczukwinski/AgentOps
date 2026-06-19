@@ -156,6 +156,7 @@ def _is_within(path: Path, root: Path) -> bool:
 def build_run_command(
     roadmap_path: str | Path,
     *,
+    no_codex: bool = False,
     autonomous: bool = False,
     reviewer: str | None = None,
     max_tasks: int | None = None,
@@ -164,8 +165,8 @@ def build_run_command(
     """Build the controlled subprocess argv used by /api/run.
 
     Exposed for tests so the command construction is independently verifiable.
-    The argv contains no shell, no user-provided shell string, and never
-    includes Codex. The roadmap path is resolved through the allowlist.
+    The argv contains no shell and no user-provided shell string. The roadmap
+    path is resolved through the allowlist.
 
     Optional flags:
 
@@ -183,8 +184,10 @@ def build_run_command(
     py = python_executable or sys.executable
     argv = [
         py, "-m", "agentops", "--db", _default_db_arg(), "run",
-        "--roadmap", str(resolved), "--no-codex",
+        "--roadmap", str(resolved),
     ]
+    if no_codex:
+        argv.append("--no-codex")
     if autonomous:
         argv.append("--autonomous")
     if isinstance(reviewer, str) and reviewer:
@@ -1545,15 +1548,14 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(roadmap, str) or not roadmap.strip():
             self._send_json({"started": False, "error": "roadmap is required"}, status=400)
             return
-        no_codex = bool(payload.get("no_codex", True))
-        if not no_codex:
-            # The web UI is strictly Codex-off; operators who want Codex must
-            # use the CLI directly where the choice is intentional.
+        no_codex_raw = payload.get("no_codex", False)
+        if not isinstance(no_codex_raw, bool):
             self._send_json(
-                {"started": False, "error": "no_codex must be true from the web UI"},
+                {"started": False, "error": "no_codex must be a boolean"},
                 status=400,
             )
             return
+        no_codex = no_codex_raw
 
         autonomous_raw = payload.get("autonomous", False)
         if not isinstance(autonomous_raw, bool):
@@ -1602,6 +1604,7 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         try:
             argv = build_run_command(
                 roadmap,
+                no_codex=no_codex,
                 autonomous=autonomous,
                 reviewer=reviewer,
                 max_tasks=max_tasks,
@@ -1610,7 +1613,7 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"started": False, "error": str(exc)}, status=400)
             return
 
-        env = _safe_subprocess_env()
+        env = _safe_subprocess_env(no_codex=no_codex)
         try:
             proc = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
@@ -1620,23 +1623,27 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"started": True, "run_id": run_id, "pid": proc.pid, "argv": argv})
 
 
-def _safe_subprocess_env() -> dict[str, str]:
+def _safe_subprocess_env(*, no_codex: bool = False) -> dict[str, str]:
     """Build a minimal env for the run subprocess.
 
-    We strip well-known secret-bearing variables before launching the run,
-    matching the executor-safety defaults documented in the project README.
+    We always strip Git write tokens before launching the run. Model-provider
+    credentials are preserved only when Codex review is enabled, because the
+    reviewer may need them in the child process.
     """
     drop = {
         "GITHUB_TOKEN",
         "GH_TOKEN",
         "GITLAB_TOKEN",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
         "AGENTOPS_WEB_TOKEN",
     }
+    if no_codex:
+        drop.update({"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_API_KEY"})
     env = {key: value for key, value in os.environ.items() if key not in drop}
-    # Force Codex off in the subprocess and disable terminal prompts.
-    env["AGENTOPS_NO_CODEX"] = "1"
+    if no_codex:
+        env["AGENTOPS_NO_CODEX"] = "1"
+    else:
+        env.pop("AGENTOPS_NO_CODEX", None)
+    # Disable interactive git prompts in every web-launched subprocess.
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = "/bin/false"
     return env
@@ -1712,9 +1719,9 @@ INDEX_TEMPLATE = """<!doctype html>
       <label for="roadmap-input" class="muted">or path:</label>
       <input id="roadmap-input" type="text" placeholder="examples/roadmaps/demo-shell.json" size="42" />
       <button id="plan-btn">Plan</button>
-      <button id="run-btn">Run (no-codex)</button>
+      <button id="run-btn">Run with Codex review</button>
       <label><input id="run-autonomous" type="checkbox" /> autonomous</label>
-      <label>reviewer: <select id="run-reviewer"><option value="">(default)</option><option value="codex">codex</option><option value="heuristic">heuristic</option></select></label>
+      <label>reviewer: <select id="run-reviewer"><option value="codex" selected>codex</option><option value="heuristic">heuristic</option><option value="">(roadmap default)</option></select></label>
       <label>max-tasks: <input id="run-max-tasks" type="number" min="1" placeholder="(none)" size="4" /></label>
     </div>
     <div id="plan-output" class="muted" style="margin-top:8px;"></div>
@@ -2167,13 +2174,13 @@ async function tailOperatorRun() {
   $("run-btn").addEventListener("click", async function () {
     const roadmap = getRoadmap();
     if (!roadmap) { planOutput.textContent = "select or type a roadmap first"; return; }
-    const body = { roadmap: roadmap, no_codex: true, autonomous: !!(runAutonomous && runAutonomous.checked) };
+    const body = { roadmap: roadmap, no_codex: false, autonomous: !!(runAutonomous && runAutonomous.checked) };
     if (runReviewer && runReviewer.value) body.reviewer = runReviewer.value;
     if (runMaxTasks && runMaxTasks.value) {
       const n = Number(runMaxTasks.value);
       if (n > 0) body.max_tasks = Math.floor(n);
     }
-    planOutput.textContent = "starting run (no-codex)...";
+    planOutput.textContent = "starting run with Codex review...";
     const res = await postJson("/api/run", body);
     if (!res.ok) { planOutput.className = "err"; planOutput.textContent = res.data.error || "run failed"; return; }
     planOutput.className = "muted";

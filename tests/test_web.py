@@ -127,6 +127,7 @@ class FrontendBundlesTests(unittest.TestCase):
         self.assertIn("/api/runs", html)
         self.assertIn("bundle-upload-btn", html)
         self.assertIn("bundle-validate-btn", html)
+        self.assertIn("Run with Codex review", html)
         self.assertIn("run-autonomous", html)
         # The title and legacy endpoints must still be present.
         self.assertIn("AgentOps Local UI", html)
@@ -360,19 +361,27 @@ class WebApiTests(unittest.TestCase):
         self.assertFalse(data["started"])
         self.assertIn("outside allowed roots", data["error"])
 
-    def test_run_endpoint_rejects_codex_on(self) -> None:
-        status, data = self._post("/api/run", {"roadmap": str(self.roadmap), "no_codex": False})
-        self.assertEqual(status, 400)
-        self.assertFalse(data["started"])
+    def test_run_endpoint_allows_codex_review(self) -> None:
+        fake_proc = mock.Mock(pid=1234)
+        with mock.patch("agentops.web.subprocess.Popen", return_value=fake_proc) as popen:
+            status, data = self._post(
+                "/api/run",
+                {"roadmap": str(self.roadmap), "no_codex": False, "reviewer": "codex"},
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["started"])
+        argv = popen.call_args.args[0]
+        self.assertNotIn("--no-codex", argv)
+        self.assertIn("--reviewer", argv)
+        self.assertEqual(argv[argv.index("--reviewer") + 1], "codex")
 
     def test_run_endpoint_does_not_use_shell(self) -> None:
-        # The argv must be a list (no shell) and must not contain any string
-        # of "no_codex" except the literal flag. We also assert no codex flag
-        # is present in the constructed command.
+        # The argv must be a list (no shell) and can enable Codex review by
+        # omitting --no-codex unless the caller explicitly asks for it.
         argv = web.build_run_command(str(self.roadmap), python_executable="python")
         self.assertIsInstance(argv, list)
         self.assertNotIn("--codex", argv)
-        self.assertIn("--no-codex", argv)
+        self.assertNotIn("--no-codex", argv)
         # argv must not contain any user-injected shell metacharacters as a
         # single argument.
         for arg in argv:
@@ -557,13 +566,28 @@ class WebEnvSafetyTests(unittest.TestCase):
             "USER": "tester",
         }
         with mock.patch.dict(os.environ, env, clear=True):
-            safe = web._safe_subprocess_env()
+            safe = web._safe_subprocess_env(no_codex=True)
         self.assertNotIn("GITHUB_TOKEN", safe)
         self.assertNotIn("OPENAI_API_KEY", safe)
         self.assertNotIn("AGENTOPS_WEB_TOKEN", safe)
         self.assertEqual(safe["AGENTOPS_NO_CODEX"], "1")
         self.assertEqual(safe["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(safe["GIT_ASKPASS"], "/bin/false")
+
+    def test_safe_subprocess_env_allows_model_keys_for_codex(self) -> None:
+        env = {
+            "PATH": "/usr/bin",
+            "GITHUB_TOKEN": "secret",
+            "OPENAI_API_KEY": "model-secret",
+            "ANTHROPIC_API_KEY": "model-secret",
+            "AGENTOPS_NO_CODEX": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            safe = web._safe_subprocess_env(no_codex=False)
+        self.assertNotIn("GITHUB_TOKEN", safe)
+        self.assertEqual(safe["OPENAI_API_KEY"], "model-secret")
+        self.assertEqual(safe["ANTHROPIC_API_KEY"], "model-secret")
+        self.assertNotIn("AGENTOPS_NO_CODEX", safe)
 
 
 if __name__ == "__main__":
@@ -793,6 +817,7 @@ class BundleApiTests(unittest.TestCase):
         roadmap = real_repo / "examples" / "roadmaps" / "demo-shell.json"
         argv = web.build_run_command(
             str(roadmap),
+            no_codex=True,
             autonomous=True,
             reviewer="heuristic",
             max_tasks=2,
@@ -808,7 +833,7 @@ class BundleApiTests(unittest.TestCase):
         real_repo = Path(__file__).resolve().parent.parent
         roadmap = real_repo / "examples" / "roadmaps" / "demo-shell.json"
         argv = web.build_run_command(str(roadmap))
-        self.assertIn("--no-codex", argv)
+        self.assertNotIn("--no-codex", argv)
         self.assertNotIn("--autonomous", argv)
         self.assertNotIn("--reviewer", argv)
         self.assertNotIn("--max-tasks", argv)
