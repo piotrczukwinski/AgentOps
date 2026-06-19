@@ -522,6 +522,208 @@ def collect_logs(state: StateStore, task_id: str) -> dict[str, Any]:
     }
 
 
+# --- run history -----------------------------------------------------------
+#
+# T5 surface: list past roadmap runs from the SQLite events log, fetch the
+# per-task attempt rows, and serve the historical log files written under
+# ``.agentops/runs/<roadmap>/<task>/<attempt>/<kind>``. Every file read is
+# constrained to the runs root via :func:`_is_within` and a per-component
+# allowlist; nothing else in the filesystem is reachable through this
+# surface.
+
+ALLOWED_LOG_KINDS = {
+    "executor.combined.log",
+    "executor.stdout.log",
+    "executor.stderr.log",
+    "review.result.json",
+    "review.stdout.jsonl",
+    "validation.result.json",
+    "diff.patch",
+    "diff.stat",
+    "changed_files.txt",
+}
+
+
+def _parse_event_payload(value: Any) -> dict[str, Any]:
+    """Best-effort decode of a stored event payload.
+
+    The ``events.payload_json`` column is written as a JSON object, but a
+    future code path or a hand-edited DB could leave a JSON string in
+    place. We accept both shapes and degrade to an empty dict for anything
+    unparseable so a corrupt row can never raise out of the public API.
+    """
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value:
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        if isinstance(decoded, dict):
+            return decoded
+    return {}
+
+
+def collect_run_history(state: StateStore, *, limit: int = 100) -> dict[str, Any]:
+    """Return past roadmap runs derived from ``roadmap.finished`` events.
+
+    Scans ``latest_events(limit)`` for events whose ``type`` is
+    ``roadmap.finished`` and returns one row per matching event with
+    ``roadmap_id``, ``created_at``, ``run_verdict`` (from the event
+    payload) and the event ``seq``. The result is sorted newest first
+    by ``seq`` and is always returned as a dict with the ``runs`` key;
+    this function never raises so the public API can degrade gracefully
+    if the events table is missing or corrupt.
+    """
+    try:
+        state.init()
+        rows = list(state.latest_events(max(1, int(limit))))
+    except Exception as exc:  # noqa: BLE001 - defensive: never raise out
+        log.warning("collect_run_history: latest_events failed: %s", exc)
+        return {"runs": []}
+    runs: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            event_type = row["type"]
+        except (KeyError, TypeError, IndexError):
+            continue
+        if event_type != "roadmap.finished":
+            continue
+        row_dict = _row_to_dict(row)
+        payload = _parse_event_payload(row_dict.get("payload_json"))
+        try:
+            seq_value = int(row["seq"])
+        except (KeyError, TypeError, ValueError):
+            seq_value = 0
+        try:
+            roadmap_id = row["roadmap_id"]
+        except (KeyError, TypeError):
+            roadmap_id = None
+        try:
+            created_at = row["created_at"]
+        except (KeyError, TypeError):
+            created_at = None
+        runs.append(
+            {
+                "roadmap_id": roadmap_id,
+                "created_at": created_at,
+                "run_verdict": payload.get("run_verdict"),
+                "seq": seq_value,
+            }
+        )
+    runs.sort(key=lambda item: int(item.get("seq") or 0), reverse=True)
+    return {"runs": runs}
+
+
+def collect_task_attempts(state: StateStore, task_id: str) -> dict[str, Any]:
+    """Return the attempt rows for ``task_id`` together with the task row.
+
+    The task row lookup is a best-effort linear scan of ``state.task_rows()``
+    so we can include it when present. A missing task id returns
+    ``{"task_id": .., "found": False, "attempts": []}`` and never raises.
+    """
+    if not isinstance(task_id, str) or not task_id:
+        return {"task_id": str(task_id), "found": False, "attempts": [], "task": None}
+    try:
+        state.init()
+        attempts = [_row_to_dict(row) for row in state.attempts_for_task(task_id)]
+        task_row = None
+        for row in state.task_rows():
+            try:
+                if row["id"] == task_id:
+                    task_row = _row_to_dict(row)
+                    break
+            except (KeyError, TypeError):
+                continue
+    except Exception as exc:  # noqa: BLE001 - defensive: never raise out
+        log.warning("collect_task_attempts: state lookup failed: %s", exc)
+        return {"task_id": task_id, "found": False, "attempts": [], "task": None}
+    found = bool(task_row) or bool(attempts)
+    return {
+        "task_id": task_id,
+        "found": found,
+        "attempts": attempts,
+        "task": task_row,
+    }
+
+
+def _runs_root(repo_root: Path | None) -> Path:
+    """Return the resolved ``.agentops/runs`` root for ``repo_root``.
+
+    The path is constrained to the resolved repo root so a hostile
+    ``repo_root`` cannot redirect the lookup; callers are responsible
+    for having validated ``repo_root`` through the allowlist helpers.
+    """
+    roots = _resolve_allowed_roots(repo_root)
+    return roots.repo_root / ".agentops" / "runs"
+
+
+def read_run_log(
+    roadmap: str,
+    task: str,
+    attempt: str,
+    kind: str,
+    *,
+    max_bytes: int = 200_000,
+    repo_root: Path | None = None,
+) -> dict[str, Any]:
+    """Read a historical run artifact/log file, size-capped and path-safe.
+
+    Each of ``roadmap``, ``task`` and ``attempt`` must be a single safe
+    path component (see :func:`_require_single_component`). ``kind`` must
+    be in :data:`ALLOWED_LOG_KINDS`. The resolved path must live under
+    ``<repo_root>/.agentops/runs/<roadmap>/<task>/<attempt>/``; any
+    attempt to escape that root raises :class:`ValueError` and the
+    function never reads bytes outside it.
+
+    When the file is larger than ``max_bytes`` the last ``max_bytes``
+    are returned (tail) and ``truncated`` is set to ``True``. The
+    returned text is decoded as UTF-8 with ``errors="replace"`` so a
+    corrupt byte cannot abort the response. Missing files return
+    ``{"found": False, "path": <str>}``.
+    """
+    if not isinstance(kind, str) or kind not in ALLOWED_LOG_KINDS:
+        raise ValueError(f"unsupported log kind: {kind!r}")
+    safe_roadmap = _require_single_component(roadmap)
+    safe_task = _require_single_component(task)
+    safe_attempt = _require_single_component(attempt)
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    runs_root = _runs_root(repo_root)
+    try:
+        runs_root_resolved = runs_root.resolve()
+    except OSError as exc:
+        raise ValueError(f"runs root is not resolvable: {exc}") from exc
+    candidate = (
+        runs_root_resolved / safe_roadmap / safe_task / safe_attempt / kind
+    ).resolve()
+    if not _is_within(candidate, runs_root_resolved):
+        raise ValueError("path escapes the runs root")
+    target = candidate
+    try:
+        size = target.stat().st_size
+    except FileNotFoundError:
+        return {"found": False, "path": str(target)}
+    except OSError as exc:
+        raise ValueError(f"stat failed: {exc}") from exc
+    truncated = False
+    with target.open("rb") as fh:
+        if size > max_bytes:
+            fh.seek(size - max_bytes)
+            raw = fh.read(max_bytes)
+            truncated = True
+        else:
+            raw = fh.read()
+    text = raw.decode("utf-8", errors="replace")
+    return {
+        "found": True,
+        "path": str(target),
+        "size": int(size),
+        "truncated": truncated,
+        "text": text,
+    }
+
+
 
 
 
@@ -862,6 +1064,9 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/runs":
             self._send_json({"runs": self._server_state().active_runs()})
             return
+        if path == "/api/run-history":
+            self._handle_run_history(query)
+            return
         if path == "/api/operator-runs":
             self._send_json(collect_operator_runs())
             return
@@ -871,8 +1076,14 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/operator-runs/") and path.endswith("/stream"):
             self._handle_operator_run_stream(path, query)
             return
+        if path.startswith("/api/tasks/") and path.endswith("/attempts"):
+            self._handle_task_attempts(path)
+            return
         if path.startswith("/api/tasks/") and path.endswith("/stream"):
             self._handle_task_stream(path, query)
+            return
+        if path == "/api/run-logs":
+            self._handle_run_logs(query)
             return
         if path == "/api/bundles":
             self._send_json(collect_bundles())
@@ -913,6 +1124,66 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             self._handle_run(payload)
             return
         self._send_json({"error": f"not found: {path}"}, status=404)
+
+    # GET handlers ----------------------------------------------------------
+
+    def _handle_run_history(self, query: dict) -> None:
+        """Serve :func:`collect_run_history` with a clamped ``?limit=``."""
+        limit_raw = (query.get("limit") or ["100"])[0]
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 1000))
+        self._send_json(collect_run_history(self._server_state().state, limit=limit))
+
+    def _handle_task_attempts(self, path: str) -> None:
+        """Serve :func:`collect_task_attempts` for ``/api/tasks/<id>/attempts``."""
+        task_id_raw = path[len("/api/tasks/"):-len("/attempts")]
+        try:
+            task_id = _urllib_unquote(task_id_raw)
+        except Exception:  # noqa: BLE001
+            self._send_json({"error": "invalid task id"}, status=400)
+            return
+        try:
+            task_id = _require_single_component(task_id)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        self._send_json(collect_task_attempts(self._server_state().state, task_id))
+
+    def _handle_run_logs(self, query: dict) -> None:
+        """Serve :func:`read_run_log` for ``/api/run-logs``.
+
+        Required query parameters are ``roadmap``, ``task``, ``attempt`` and
+        ``kind``; an unknown or missing parameter returns 400 without
+        touching the filesystem.
+        """
+        roadmap = (query.get("roadmap") or [None])[0]
+        task = (query.get("task") or [None])[0]
+        attempt = (query.get("attempt") or [None])[0]
+        kind = (query.get("kind") or [None])[0]
+        for name, value in (("roadmap", roadmap), ("task", task), ("attempt", attempt), ("kind", kind)):
+            if not isinstance(value, str) or not value:
+                self._send_json({"error": f"{name} is required"}, status=400)
+                return
+        max_bytes_raw = (query.get("max_bytes") or [None])[0]
+        if isinstance(max_bytes_raw, str) and max_bytes_raw:
+            try:
+                max_bytes = int(max_bytes_raw)
+            except (TypeError, ValueError):
+                max_bytes = 200_000
+            max_bytes = max(1, min(max_bytes, 1_000_000))
+        else:
+            max_bytes = 200_000
+        try:
+            payload = read_run_log(
+                roadmap, task, attempt, kind, max_bytes=max_bytes
+            )
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        self._send_json(payload)
 
     # POST handlers ----------------------------------------------------------
 

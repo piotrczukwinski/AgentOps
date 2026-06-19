@@ -1129,3 +1129,316 @@ class SseStreamTests(unittest.TestCase):
             self.assertIn("event: log", text)
             self.assertIn("partial-final", text)
             self.assertLess(text.index("partial-final"), text.index("event: done"))
+
+
+class HistoryApiTests(unittest.TestCase):
+    """Tests for the T5 run-history, task-attempts, and run-log APIs."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        # The repo_root for read_run_log tests is a *plain* directory; we
+        # do not need a real git repo because the log read never invokes
+        # git, just resolves a path under .agentops/runs.
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        self.store = StateStore(self.tmp / "state.sqlite")
+
+    # --- read_run_log -------------------------------------------------------
+
+    def test_read_run_log_rejects_traversal(self) -> None:
+        with self.assertRaises(ValueError):
+            web.read_run_log("..", "t", "1", "executor.combined.log", repo_root=self.repo)
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "..", "1", "executor.combined.log", repo_root=self.repo)
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "..", "executor.combined.log", repo_root=self.repo)
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "1", "../x", repo_root=self.repo)
+        # Path-separator inside a component also rejected.
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "1", "sub/dir.log", repo_root=self.repo)
+        # Unknown kind rejected even if every other component is fine.
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "1", "secret.log", repo_root=self.repo)
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "1", "", repo_root=self.repo)
+
+    def test_read_run_log_missing_and_present(self) -> None:
+        log_path = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "1"
+        log_path.mkdir(parents=True)
+        (log_path / "executor.combined.log").write_text("hello world", encoding="utf-8")
+
+        present = web.read_run_log(
+            "rmap", "T1", "1", "executor.combined.log", repo_root=self.repo
+        )
+        self.assertTrue(present["found"])
+        self.assertIn("hello world", present["text"])
+        self.assertFalse(present["truncated"])
+        self.assertEqual(present["size"], len("hello world"))
+
+        missing = web.read_run_log(
+            "rmap", "T1", "1", "executor.stderr.log", repo_root=self.repo
+        )
+        self.assertFalse(missing["found"])
+        self.assertTrue(missing["path"].endswith("executor.stderr.log"))
+
+        no_dir = web.read_run_log(
+            "rmap", "T1", "9", "executor.combined.log", repo_root=self.repo
+        )
+        self.assertFalse(no_dir["found"])
+
+    def test_read_run_log_truncates_large_file(self) -> None:
+        log_dir = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "1"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "executor.combined.log"
+        log_file.write_bytes(b"x" * 300_000)
+
+        result = web.read_run_log(
+            "rmap",
+            "T1",
+            "1",
+            "executor.combined.log",
+            max_bytes=1000,
+            repo_root=self.repo,
+        )
+        self.assertTrue(result["found"])
+        self.assertTrue(result["truncated"])
+        self.assertLessEqual(len(result["text"]), 1000)
+        # The returned text is the tail, so the byte at index -1 must be 'x'.
+        self.assertTrue(result["text"].endswith("x"))
+
+    def test_read_run_log_refuses_path_outside_runs_root(self) -> None:
+        # A symlink inside the runs root that resolves outside the runs
+        # root must NOT be served: the contained check should trip.
+        # We create a directory that is a symlink to a file outside.
+        runs_root = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "1"
+        runs_root.mkdir(parents=True)
+        outside = self.tmp / "outside.txt"
+        outside.write_text("outside-data", encoding="utf-8")
+        try:
+            (runs_root / "executor.combined.log").symlink_to(outside)
+            symlink_path = runs_root / "executor.combined.log"
+            self.assertTrue(symlink_path.is_symlink())
+            # The file is resolvable but resolves OUTSIDE the runs root, so
+            # the helper must refuse to read it.
+            with self.assertRaises(ValueError):
+                web.read_run_log(
+                    "rmap", "T1", "1", "executor.combined.log", repo_root=self.repo
+                )
+        except (OSError, NotImplementedError):
+            # Some filesystems (Windows) do not support symlinks; skip.
+            self.skipTest("symlink unsupported on this filesystem")
+
+    # --- collect_run_history ------------------------------------------------
+
+    def test_collect_run_history_from_state(self) -> None:
+        self.store.init()
+        self.store.event(
+            "rmap-history", "T-history", "1", "roadmap.finished", {"run_verdict": "passed"}
+        )
+        result = web.collect_run_history(self.store)
+        runs = result["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["roadmap_id"], "rmap-history")
+        self.assertEqual(runs[0]["run_verdict"], "passed")
+        self.assertIsInstance(runs[0]["seq"], int)
+
+    def test_collect_run_history_ignores_other_event_types(self) -> None:
+        self.store.init()
+        self.store.event("rmap-1", "T1", "1", "attempt.started", {"attempt_no": 1})
+        self.store.event("rmap-1", "T1", "1", "roadmap.finished", {"run_verdict": "ok"})
+        runs = web.collect_run_history(self.store)["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["run_verdict"], "ok")
+
+    def test_collect_run_history_handles_corrupt_payload(self) -> None:
+        # Inject a corrupt payload directly: not a JSON object, not a JSON
+        # string. The helper must return an empty dict for run_verdict
+        # and still include the row, never raising.
+        self.store.init()
+        self.store.event("rmap-x", "T-x", "1", "roadmap.finished", {"run_verdict": "ok"})
+        # Direct DB poke so the payload_json column holds a non-JSON string.
+        with self.store.connect() as conn:
+            conn.execute(
+                "UPDATE events SET payload_json=? WHERE type='roadmap.finished'",
+                ("not-json-{",),
+            )
+        runs = web.collect_run_history(self.store)["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertIsNone(runs[0]["run_verdict"])
+
+    # --- collect_task_attempts ---------------------------------------------
+
+    def test_collect_task_attempts_unknown(self) -> None:
+        self.store.init()
+        result = web.collect_task_attempts(self.store, "NOPE")
+        self.assertFalse(result["found"])
+        self.assertEqual(result["task_id"], "NOPE")
+        self.assertEqual(result["attempts"], [])
+
+    def test_collect_task_attempts_known(self) -> None:
+        # Use the public StateStore API to record an attempt, then make
+        # sure the helper surfaces it.
+        from agentops.models import (
+            RepoConfig,
+            ReviewConfig,
+            RoadmapConfig,
+            TaskConfig,
+            TaskState,
+        )
+
+        self.store.init()
+        repo = RepoConfig(
+            id="r", path=Path("/tmp"), base_branch="main", integration_branch="int"
+        )
+        # Build a minimal task + roadmap to satisfy the schema and
+        # ``create_attempt``.
+        task = TaskConfig(
+            id="T1",
+            kind="guard",
+            risk=1,
+            priority=10,
+            prompt_path=Path("/tmp/p.md"),
+            branch_prefix="agentops",
+            allowed_files=[],
+            review=ReviewConfig(codex="never"),
+        )
+        self.store.import_roadmap(
+            RoadmapConfig(
+                version=1,
+                roadmap_id="r-collect",
+                repo=repo,
+                tasks=[task],
+            )
+        )
+        self.store.transition_task("r-collect", "T1", TaskState.EXECUTOR_RUNNING)
+        self.store.create_attempt(
+            "r-collect", task, 1, self.tmp / "ws", "branch-x", "base-sha"
+        )
+
+        result = web.collect_task_attempts(self.store, "T1")
+        self.assertTrue(result["found"])
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["attempt_no"], 1)
+        self.assertIsNotNone(result["task"])
+
+    def test_collect_task_attempts_empty_task_id(self) -> None:
+        self.store.init()
+        result = web.collect_task_attempts(self.store, "")
+        self.assertFalse(result["found"])
+        self.assertEqual(result["attempts"], [])
+
+    # --- endpoint integration ----------------------------------------------
+
+    def _start_server(self) -> int:
+        port = _free_port()
+        server = web.make_server("127.0.0.1", port, state=self.store)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(lambda: thread.join(timeout=5))
+        # Wait for the server to be ready.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=1)
+                conn.connect()
+                conn.close()
+                return port
+            except OSError:
+                time.sleep(0.05)
+        self.fail("server did not start")
+
+    def _get(self, port: int, path: str) -> tuple[int, dict]:
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read()
+            return resp.status, json.loads(body.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def test_run_history_endpoint_empty(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(port, "/api/run-history")
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"runs": []})
+
+    def test_run_history_endpoint_returns_runs(self) -> None:
+        self.store.init()
+        self.store.event(
+            "r-end", "T1", "1", "roadmap.finished", {"run_verdict": "ok"}
+        )
+        port = self._start_server()
+        status, data = self._get(port, "/api/run-history?limit=10")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["runs"]), 1)
+        self.assertEqual(data["runs"][0]["roadmap_id"], "r-end")
+        self.assertEqual(data["runs"][0]["run_verdict"], "ok")
+
+    def test_task_attempts_endpoint_rejects_traversal(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(port, "/api/tasks/..%2Fbad/attempts")
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_task_attempts_endpoint_unknown(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(port, "/api/tasks/UNKNOWN/attempts")
+        self.assertEqual(status, 200)
+        self.assertFalse(data["found"])
+
+    def test_run_logs_endpoint_serves_text(self) -> None:
+        self.store.init()
+        log_dir = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "1"
+        log_dir.mkdir(parents=True)
+        (log_dir / "executor.combined.log").write_text("payload-line", encoding="utf-8")
+        with mock.patch.object(
+            web, "_resolve_allowed_roots", return_value=web._AllowedRoots(
+                repo_root=self.repo, tmp_root=self.tmp
+            )
+        ):
+            port = self._start_server()
+            status, data = self._get(
+                port,
+                "/api/run-logs?roadmap=rmap&task=T1&attempt=1&kind=executor.combined.log",
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["found"])
+        self.assertIn("payload-line", data["text"])
+
+    def test_run_logs_endpoint_missing_param(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(
+            port, "/api/run-logs?roadmap=rmap&task=T1&attempt=1"
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("kind is required", data["error"])
+
+    def test_run_logs_endpoint_rejects_unknown_kind(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(
+            port,
+            "/api/run-logs?roadmap=rmap&task=T1&attempt=1&kind=etc-passwd",
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_run_logs_endpoint_rejects_traversal(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(
+            port,
+            "/api/run-logs?roadmap=..&task=T1&attempt=1&kind=executor.combined.log",
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
