@@ -2089,7 +2089,7 @@ async function tailOperatorRun() {
 
   async function loadHistory() {
     if (!historyRows) return;
-    const res = await fetchJson("/api/runs?limit=100");
+    const res = await fetchJson("/api/run-history?limit=100");
     const runs = (res.data && res.data.runs) || [];
     if (!runs.length) {
       historyRows.innerHTML = '<tr><td colspan="4" class="muted">no finished runs</td></tr>';

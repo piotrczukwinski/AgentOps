@@ -156,7 +156,7 @@ class FrontendMonitorHistoryTests(unittest.TestCase):
         self.assertIn("EventSource", html)
         self.assertIn("history-rows", html)
         self.assertIn("log-view-btn", html)
-        self.assertIn("/api/runs", html)
+        self.assertIn("/api/run-history", html)
         self.assertIn("/api/run-logs", html)
 
     def test_render_keeps_legacy_anchors(self) -> None:
