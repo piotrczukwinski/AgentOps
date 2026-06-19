@@ -382,6 +382,8 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(data["started"])
         argv = popen.call_args.args[0]
+        db_idx = argv.index("--db")
+        self.assertEqual(Path(argv[db_idx + 1]), self.db.resolve())
         self.assertNotIn("--no-codex", argv)
         self.assertIn("--reviewer", argv)
         self.assertEqual(argv[argv.index("--reviewer") + 1], "codex")

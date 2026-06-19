@@ -160,6 +160,7 @@ def build_run_command(
     autonomous: bool = False,
     reviewer: str | None = None,
     max_tasks: int | None = None,
+    db_path: str | Path | None = None,
     python_executable: str | None = None,
 ) -> list[str]:
     """Build the controlled subprocess argv used by /api/run.
@@ -182,8 +183,9 @@ def build_run_command(
     """
     resolved = validate_roadmap_path(str(roadmap_path))
     py = python_executable or sys.executable
+    db_arg = str(Path(db_path).expanduser().resolve()) if db_path else _default_db_arg()
     argv = [
-        py, "-m", "agentops", "--db", _default_db_arg(), "run",
+        py, "-m", "agentops", "--db", db_arg, "run",
         "--roadmap", str(resolved),
     ]
     if no_codex:
@@ -1669,6 +1671,7 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
                 autonomous=autonomous,
                 reviewer=reviewer,
                 max_tasks=max_tasks,
+                db_path=self._server_state().state.db_path,
             )
         except RoadmapPathError as exc:
             self._send_json({"started": False, "error": str(exc)}, status=400)
