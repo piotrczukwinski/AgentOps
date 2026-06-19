@@ -150,6 +150,47 @@ class OpenCodeRunner(BaseRunner):
         )
 
 
+class CodexExecutorRunner(BaseRunner):
+    """Use Codex as a write-capable repair executor.
+
+    This runner is intentionally separate from ``CodexRunner`` review mode:
+    review uses a read-only sandbox and structured JSON output, while takeover
+    execution must be able to edit the task worktree and then let AgentOps run
+    the normal diff, validation, policy, and review gates.
+    """
+
+    def run(
+        self,
+        task: TaskConfig,
+        prompt: str,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        startup_timeout: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
+        prompt_file = artifact_dir / "executor.input.md"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        command = ["codex", "exec", "--sandbox", "workspace-write"]
+        if task.model and task.model != "minimax/MiniMax-M3":
+            command.extend(["-m", str(task.model)])
+        if task.review.model_reasoning_effort:
+            command.extend(["-c", f"model_reasoning_effort={task.review.model_reasoning_effort}"])
+        command.append(str(prompt_file))
+        return run_argv_streaming(
+            command,
+            cwd=cwd,
+            artifact_dir=artifact_dir,
+            stdout_name="executor.stdout.log",
+            stderr_name="executor.stderr.log",
+            combined_name="executor.combined.log",
+            timeout_seconds=task.timeout_seconds,
+            env=reviewer_env(),
+            startup_timeout=startup_timeout,
+            idle_timeout=idle_timeout,
+        )
+
+
 def yolo_enabled(task: TaskConfig) -> bool:
     """Return True when the task (or its roadmap defaults) explicitly opted
     into ``--dangerously-skip-permissions`` for the opencode executor.
@@ -418,6 +459,8 @@ def runner_for(task: TaskConfig) -> BaseRunner:
         return ShellRunner()
     if task.executor in {"opencode", "minimax", "minimax-m3"}:
         return OpenCodeRunner()
+    if task.executor == "codex":
+        return CodexExecutorRunner()
     raise ValueError(f"Unsupported executor {task.executor!r}")
 
 

@@ -15,15 +15,15 @@ returns a structured JSON verdict.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .artifacts import ArtifactStore
 from .budget import BudgetManager
 from .git_ops import (
-    IntegrationBranchBlocked,
     CherryPickConflict,
+    IntegrationBranchBlocked,
     branch_exists,
     branch_for_task,
     collect_diff,
@@ -34,7 +34,6 @@ from .git_ops import (
     is_git_repo,
     is_protected_branch,
     merge_integration,
-    prune_worktrees,
     push,
     rev_parse,
     worktree_is_clean,
@@ -47,11 +46,10 @@ from .models import (
     RoadmapConfig,
     TaskConfig,
     TaskState,
-    TERMINAL_STATES,
 )
 from .policy import PolicyEngine
 from .prompting import PromptCompiler
-from .repo_lock import RunAlreadyLockedError, acquire_run_lock
+from .repo_lock import acquire_run_lock
 from .review import (
     CodexReviewService,
     HeuristicReviewer,
@@ -238,6 +236,8 @@ class _TaskRuntime:
     repair_prompt: str | None = None
     review_decision: ReviewDecision | None = None
     review_verdict: ReviewVerdict | None = None
+    codex_takeover_active: bool = False
+    codex_takeover_used: bool = False
 
 
 class Orchestrator:
@@ -551,7 +551,9 @@ class Orchestrator:
 
         max_attempts = self._effective_max_attempts(task, roadmap)
         accepted_outcome = False
-        for attempt_no in range(1, max_attempts + 1):
+        for attempt_no in range(1, max_attempts + 2):
+            if attempt_no > max_attempts and not runtime.codex_takeover_active:
+                break
             attempt_budget = budget.can_start_attempt(task_id=task.id)
             if not attempt_budget.allowed:
                 # ``max_total_task_attempts`` blocks the run as a whole;
@@ -580,8 +582,26 @@ class Orchestrator:
             budget.record_attempt_started(task_id=task.id)
             runtime.attempt = attempt_no
             attempt_dir = artifact_store.attempt_dir(roadmap.roadmap_id, task.id, attempt_no)
+            effective_task = task
+            if runtime.codex_takeover_active:
+                effective_task = replace(
+                    task,
+                    executor="codex",
+                    model=task.review.codex_model or "",
+                )
+                self.state.event(
+                    roadmap.roadmap_id,
+                    task.id,
+                    None,
+                    "task.codex_takeover_started",
+                    {
+                        "attempt": attempt_no,
+                        "after_executor": task.executor,
+                        "reason": "max_repair_attempts",
+                    },
+                )
             attempt_id = self.state.create_attempt(
-                roadmap.roadmap_id, task, attempt_no, execution_cwd, runtime.branch, runtime.base_sha
+                roadmap.roadmap_id, effective_task, attempt_no, execution_cwd, runtime.branch, runtime.base_sha
             )
             prompt = runtime.repair_prompt or compiler.executor_prompt(task)
             prompt_path = artifact_store.write_text(attempt_dir, "executor.prompt.md", prompt)
@@ -592,8 +612,8 @@ class Orchestrator:
                 roadmap.roadmap_id, task.id, TaskState.EXECUTOR_RUNNING, {"attempt": attempt_no}
             )
 
-            result = self._runner_for(task).run(
-                task,
+            result = self._runner_for(effective_task).run(
+                effective_task,
                 prompt,
                 execution_cwd,
                 attempt_dir,
@@ -942,6 +962,45 @@ class Orchestrator:
                     )
                     self.state.transition_task(
                         roadmap.roadmap_id, task.id, TaskState.REPAIR_PROMPT_READY
+                    )
+                    continue
+                if (
+                    attempt_no == max_attempts
+                    and self.options.autonomous
+                    and task.executor != "codex"
+                    and not runtime.codex_takeover_used
+                ):
+                    runtime.codex_takeover_active = True
+                    runtime.codex_takeover_used = True
+                    runtime.repair_prompt = compiler.repair_prompt_from_review(
+                        task, verdict, base=verdict.repair_prompt
+                    )
+                    repair_path = artifact_store.write_text(
+                        attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                    )
+                    self.state.record_artifact(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "repair_prompt",
+                        repair_path,
+                        artifact_store.sha256(repair_path),
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.REPAIR_PROMPT_READY,
+                        {
+                            "reason": "codex_takeover",
+                            "after_attempt": attempt_no,
+                            "next_executor": "codex",
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.codex_takeover_queued",
+                        task.id,
+                        extra={"after_attempt": attempt_no, "next_attempt": attempt_no + 1},
                     )
                     continue
                 # Max repair attempts exhausted. Block the task and
