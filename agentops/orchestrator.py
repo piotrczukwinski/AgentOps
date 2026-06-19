@@ -759,6 +759,86 @@ class Orchestrator:
                 policy.as_jsonable(policy_result),
             )
             if not policy_result.ok:
+                issue_names = {issue.name for issue in policy_result.issues}
+                only_empty_diff = issue_names == {"files.empty_diff"}
+                if only_empty_diff and self.options.autonomous and task.executor != "codex":
+                    empty_diff_prompt = "\n".join(
+                        [
+                            "# AgentOps autonomous repair: executor produced no file changes",
+                            "",
+                            "The previous executor attempt exited successfully but produced an empty diff.",
+                            "Continue from the current working tree and complete the original task.",
+                            "You must modify at least one allowed file unless the task is genuinely impossible.",
+                            "If the task is blocked, return AGENTOPS_RESULT_JSON with status \"blocked\" and a concrete blocker.",
+                            "",
+                            "Do not restart from scratch. Inspect the allowed files and implement the smallest correct change.",
+                        ]
+                    )
+                    if attempt_no < max_attempts:
+                        runtime.repair_prompt = empty_diff_prompt
+                        repair_path = artifact_store.write_text(
+                            attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                        )
+                        self.state.record_artifact(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "repair_prompt",
+                            repair_path,
+                            artifact_store.sha256(repair_path),
+                        )
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            task.id,
+                            TaskState.REPAIR_PROMPT_READY,
+                            {
+                                "reason": "empty_diff_retry",
+                                "after_attempt": attempt_no,
+                            },
+                        )
+                        self._record_roadmap_event(
+                            roadmap,
+                            "task.empty_diff_retry_queued",
+                            task.id,
+                            extra={"after_attempt": attempt_no, "next_attempt": attempt_no + 1},
+                        )
+                        continue
+                    if attempt_no == max_attempts and not runtime.codex_takeover_used:
+                        runtime.codex_takeover_active = True
+                        runtime.codex_takeover_used = True
+                        runtime.repair_prompt = empty_diff_prompt
+                        repair_path = artifact_store.write_text(
+                            attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                        )
+                        self.state.record_artifact(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "repair_prompt",
+                            repair_path,
+                            artifact_store.sha256(repair_path),
+                        )
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            task.id,
+                            TaskState.REPAIR_PROMPT_READY,
+                            {
+                                "reason": "empty_diff_codex_takeover",
+                                "after_attempt": attempt_no,
+                                "next_executor": "codex",
+                            },
+                        )
+                        self._record_roadmap_event(
+                            roadmap,
+                            "task.codex_takeover_queued",
+                            task.id,
+                            extra={
+                                "after_attempt": attempt_no,
+                                "next_attempt": attempt_no + 1,
+                                "reason": "empty_diff",
+                            },
+                        )
+                        continue
                 self.state.transition_task(
                     roadmap.roadmap_id, task.id, TaskState.BLOCKED, policy.as_jsonable(policy_result)
                 )
