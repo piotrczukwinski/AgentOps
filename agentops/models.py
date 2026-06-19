@@ -78,6 +78,15 @@ class ReviewConfig:
     # ``review.reasoning_effort`` alias) ->
     # ``AGENTOPS_CODEX_MODEL_REASONING_EFFORT`` env var -> ``None``.
     model_reasoning_effort: str | None = None
+    # Self-fix: on REQUEST_CHANGES, give the reviewer a bounded write-pass
+    # to apply a SMALL fix directly in the worktree instead of re-running
+    # the executor. The prompt carries the line budget UPSTREAM so the
+    # reviewer self-limits (it skips with a marker when the fix is too
+    # big); ``self_fix_max_lines`` is a backstop, not the primary guard.
+    # Default on so trivial REQUEST_CHANGES do not burn a full executor
+    # re-run. Tasks/roadmaps can opt out with ``review.self_fix: false``.
+    self_fix: bool = True
+    self_fix_max_lines: int = 30
 
 
 @dataclass(frozen=True)

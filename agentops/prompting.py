@@ -4,6 +4,7 @@ import json
 
 from .models import DiffSnapshot, PolicyResult, ReviewVerdict, TaskConfig, ValidationResult
 from .policy import PolicyEngine
+from .self_fix import SELF_FIX_SKIP_MARKER
 
 EXECUTOR_CONTRACT = """# AgentOps executor contract
 
@@ -199,6 +200,72 @@ class PromptCompiler:
                 diff.stat or "(none)",
                 "# Patch",
                 _truncate(diff.patch, 60000),
+            ]
+        )
+
+    def self_fix_prompt(
+        self,
+        task: TaskConfig,
+        verdict: ReviewVerdict,
+        *,
+        max_lines: int,
+    ) -> str:
+        """Build the bounded write-pass prompt for a REQUEST_CHANGES self-fix.
+
+        The constraint is enforced UPSTREAM by this prompt: the reviewer is
+        told the line budget and the allowed_files, and is instructed to
+        make NO change and emit ``AGENTOPS_SELF_FIX_SKIP: <reason>`` when
+        the fix will not fit or is ambiguous. This avoids paying for a
+        large edit that AgentOps would then reject.
+        """
+        blocking_lines: list[str] = []
+        for index, issue in enumerate(verdict.blocking_issues or (), start=1):
+            if not isinstance(issue, dict):
+                continue
+            file_ = str(issue.get("file") or "")
+            severity = str(issue.get("severity") or "medium")
+            issue_text = str(issue.get("issue") or "")
+            fix = str(issue.get("suggested_fix") or "")
+            blocking_lines.append(
+                f"{index}. (severity={severity}) file={file_ or '?'}\n"
+                f"   issue: {issue_text}\n"
+                f"   suggested_fix: {fix}"
+            )
+        blocking_block = "\n".join(blocking_lines) or "(none reported)"
+        reviewer_text = (verdict.repair_prompt or "").strip() or "(reviewer left no repair_prompt)"
+        forbidden_globs = tuple(self.policy_engine.global_forbidden) + tuple(task.forbidden_globs)
+        return "\n".join(
+            [
+                "# AgentOps self-fix pass (REQUEST_CHANGES)",
+                "You previously reviewed this attempt and returned REQUEST_CHANGES.",
+                "You now have ONE bounded write pass to apply the fix YOURSELF.",
+                "Apply the MINIMAL edit that resolves the blocking issues below.",
+                "",
+                "# Hard budget (enforced upstream - read carefully)",
+                f"- You may change AT MOST ~{max_lines} lines in total (added + removed).",
+                "- Edit ONLY files listed under Allowed files. Any other file is out of scope.",
+                "- Do NOT refactor, rename, reformat, reorder, or 'improve' anything else.",
+                "- Do NOT weaken or remove existing tests or validations.",
+                "- Make the smallest possible change that fixes the reported issues.",
+                "",
+                "# If the fix does not fit the budget",
+                "If the correct fix is larger than the budget, or is ambiguous, or needs",
+                "architectural judgement: make NO file changes and instead print exactly:",
+                f"    {SELF_FIX_SKIP_MARKER}: <short reason>",
+                "AgentOps will then fall back to the executor. Skipping is the correct",
+                "choice for non-trivial fixes; do NOT attempt a partial or large edit.",
+                "",
+                "# Allowed files (edit only these)",
+                _bullet(task.allowed_files) or "- (none)",
+                "# Forbidden globs",
+                _bullet(forbidden_globs),
+                "",
+                "# Reviewer summary",
+                verdict.summary or "(no summary)",
+                "# Blocking issues",
+                blocking_block,
+                "# Reviewer repair prompt (verbatim, for reference)",
+                reviewer_text,
             ]
         )
 

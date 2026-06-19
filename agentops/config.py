@@ -167,6 +167,8 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 fallback_heuristic=roadmap_review.fallback_heuristic,
                 codex_model=roadmap_review.codex_model,
                 model_reasoning_effort=roadmap_review.model_reasoning_effort,
+                self_fix=roadmap_review.self_fix,
+                self_fix_max_lines=roadmap_review.self_fix_max_lines,
             )
         elif isinstance(review_data, str):
             review = ReviewConfig(codex=review_data)
@@ -185,6 +187,10 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 ),
                 model_reasoning_effort=_resolve_model_reasoning_effort(
                     review_data, defaults, roadmap_review=roadmap_review
+                ),
+                self_fix=bool(review_data.get("self_fix", roadmap_review.self_fix)),
+                self_fix_max_lines=int(
+                    review_data.get("self_fix_max_lines", roadmap_review.self_fix_max_lines)
                 ),
             )
         else:
@@ -342,6 +348,8 @@ def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -
         fallback_heuristic=bool(value.get("fallback_heuristic", defaults.get("review_fallback_heuristic", False))),
         codex_model=_resolve_codex_model(value, defaults),
         model_reasoning_effort=_resolve_model_reasoning_effort(value, defaults),
+        self_fix=bool(value.get("self_fix", defaults.get("review_self_fix", True))),
+        self_fix_max_lines=int(value.get("self_fix_max_lines", defaults.get("review_self_fix_max_lines", 30))),
     )
 
 

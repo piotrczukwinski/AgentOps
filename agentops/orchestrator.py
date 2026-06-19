@@ -59,6 +59,13 @@ from .review import (
     ReviewRouter,
 )
 from .runners import BaseRunner, runner_for
+from .self_fix import (
+    SelfFixOutcome,
+    changed_line_count,
+    detect_skip,
+    restore_working_files,
+    snapshot_working_files,
+)
 from .state import StateStore
 from .validation import ValidationEngine
 
@@ -919,6 +926,37 @@ class Orchestrator:
 
             if verdict.verdict == "REQUEST_CHANGES":
                 self._record_roadmap_event(roadmap, "task.request_changes", task.id)
+                # Self-fix: give the reviewer ONE bounded write-pass to
+                # apply a SMALL fix directly, instead of re-running the
+                # executor. The prompt carries the line budget upstream so
+                # the reviewer self-limits (or skips with a marker); the
+                # size cap here is a backstop. Falls back to executor
+                # repair on any gate failure or reviewer skip.
+                if (
+                    attempt_no < max_attempts
+                    and task.review.self_fix
+                    and codex_service.is_available()
+                ):
+                    sf = self._try_self_fix(
+                        roadmap=roadmap,
+                        task=task,
+                        verdict=verdict,
+                        target_worktree=target_worktree,
+                        attempt_dir=attempt_dir,
+                        attempt_id=attempt_id,
+                        artifact_store=artifact_store,
+                        policy=policy,
+                        compiler=compiler,
+                        codex_service=codex_service,
+                        heuristic=heuristic,
+                        budget=budget,
+                        runtime=runtime,
+                        attempt_no=attempt_no,
+                        max_attempts=max_attempts,
+                    )
+                    if sf.accepted:
+                        accepted_outcome = True
+                        return
                 if attempt_no < max_attempts:
                     # REQUEST_CHANGES is repairable. Build a bounded
                     # repair prompt for the next executor attempt. The
@@ -1299,6 +1337,179 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Finalize (commit, push, merge)
     # ------------------------------------------------------------------
+    def _try_self_fix(
+        self,
+        *,
+        roadmap: RoadmapConfig,
+        task: TaskConfig,
+        verdict: ReviewVerdict,
+        target_worktree: Path,
+        attempt_dir: Path,
+        attempt_id: str,
+        artifact_store: ArtifactStore,
+        policy: PolicyEngine,
+        compiler: PromptCompiler,
+        codex_service: CodexReviewService,
+        heuristic: HeuristicReviewer,
+        budget: BudgetManager,
+        runtime: _TaskRuntime,
+        attempt_no: int,
+        max_attempts: int,
+    ) -> SelfFixOutcome:
+        """One bounded Codex write-pass to fix a small REQUEST_CHANGES.
+
+        The prompt carries the line budget upstream so the reviewer
+        self-limits (it skips with a marker when the fix is too big); the
+        gates below (policy / size backstop / validation / re-review) are
+        safety nets. On any non-ACCEPT outcome the caller falls back to
+        the executor repair, so self-fix never blocks a task.
+        """
+        del max_attempts  # budget is enforced by the attempt loop caller
+        max_lines = int(task.review.self_fix_max_lines)
+        self.state.event(
+            roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_started", {"max_lines": max_lines}
+        )
+
+        sf_prompt = compiler.self_fix_prompt(task, verdict, max_lines=max_lines)
+        sf_prompt_path = artifact_store.write_text(attempt_dir, "self_fix.prompt.md", sf_prompt)
+        self.state.record_artifact(
+            roadmap.roadmap_id, task.id, attempt_id, "self_fix_prompt", sf_prompt_path,
+            artifact_store.sha256(sf_prompt_path),
+        )
+
+        base_branch = roadmap.repo.base_branch
+        try:
+            pre_patch = collect_diff(target_worktree, base_branch, base_sha=runtime.base_sha).patch
+        except Exception:  # noqa: BLE001
+            pre_patch = ""
+        pre_lines = changed_line_count(pre_patch)
+
+        # Snapshot the worktree so a failed self-fix can be reverted: if a
+        # gate rejects the write-pass (out-of-scope / too-large / validation
+        # / re-review), the reviewer's edits are undone so the next executor
+        # attempt starts from the clean pre-self-fix state.
+        pre_snap = snapshot_working_files(target_worktree)
+
+        def _fallback(reason: str, *, skipped: bool = False) -> SelfFixOutcome:
+            try:
+                restore_working_files(target_worktree, pre_snap)
+            except Exception:  # noqa: BLE001 - cleanup must never mask the real reason
+                pass
+            return SelfFixOutcome(accepted=False, reason=reason, skipped=skipped)
+
+        try:
+            result = codex_service.self_fix(
+                sf_prompt_path,
+                target_worktree,
+                attempt_dir,
+                timeout_seconds=min(task.timeout_seconds, 1800),
+                model=task.review.codex_model,
+                model_reasoning_effort=task.review.model_reasoning_effort,
+                idle_timeout=self.options.codex_idle_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - never let self-fix crash the run
+            self.state.event(
+                roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_error", {"error": str(exc)}
+            )
+            return _fallback("self_fix_error")
+
+        try:
+            self.state.record_artifact(
+                roadmap.roadmap_id, task.id, attempt_id, "self_fix_result", result.stdout_path,
+                artifact_store.sha256(result.stdout_path),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 1. Skip marker: the reviewer decided the fix is too big / ambiguous.
+        try:
+            stdout_text = result.stdout_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            stdout_text = ""
+        skip_reason = detect_skip(stdout_text)
+        if skip_reason is not None:
+            self.state.event(
+                roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_skipped", {"reason": skip_reason}
+            )
+            self._record_roadmap_event(
+                roadmap, "task.self_fix_skipped", task.id, extra={"reason": skip_reason}
+            )
+            return _fallback("self_fix_skipped", skipped=True)
+
+        # 2. Re-collect the diff and enforce the allowed_files policy.
+        post_diff = collect_diff(target_worktree, base_branch, base_sha=runtime.base_sha)
+        post_policy = policy.check_diff(task, post_diff)
+        if not post_policy.ok:
+            self.state.event(
+                roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_out_of_scope", {}
+            )
+            return _fallback("self_fix_out_of_scope")
+
+        # 3. Size backstop (the prompt self-limits; this catches misjudgement).
+        delta = changed_line_count(post_diff.patch) - pre_lines
+        if delta > max_lines:
+            self.state.event(
+                roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_too_large",
+                {"delta": delta, "max_lines": max_lines},
+            )
+            return _fallback("self_fix_too_large")
+
+        # No change at all and no skip marker: treat as a no-op fallback.
+        if delta <= 0 and not post_diff.changed_files:
+            self.state.event(
+                roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_noop", {}
+            )
+            return _fallback("self_fix_noop")
+
+        # 4. Re-run the task validations on the patched worktree.
+        validation = ValidationEngine(
+            timeout_seconds=min(task.timeout_seconds, 1800)
+        ).run_all(task.validations, target_worktree, attempt_dir)
+        if not validation.ok:
+            self.state.event(
+                roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_validation_failed", {}
+            )
+            return _fallback("self_fix_validation_failed")
+
+        # 5. Re-review (read-only Codex) on the post-fix diff for independence.
+        re_verdict = self._run_review(
+            roadmap=roadmap,
+            task=task,
+            diff=post_diff,
+            policy_result=post_policy,
+            validation=validation,
+            decision=ReviewDecision(run_codex=True, reason="self_fix_review", reviewer="codex"),
+            codex_service=codex_service,
+            heuristic=heuristic,
+            budget=budget,
+            target_worktree=target_worktree,
+            attempt_dir=attempt_dir,
+            attempt_id=attempt_id,
+            artifact_store=artifact_store,
+            attempt_no=attempt_no,
+        )
+        if re_verdict is not None and re_verdict.verdict == "ACCEPT":
+            finalized = self._finalize(
+                roadmap=roadmap,
+                task=task,
+                target_worktree=target_worktree,
+                branch=runtime.branch,
+                artifact_store=artifact_store,
+                attempt_dir=attempt_dir,
+                attempt_id=attempt_id,
+                verdict=re_verdict,
+                runtime=runtime,
+            )
+            if finalized:
+                self._record_roadmap_event(roadmap, "task.self_fix_accepted", task.id)
+                return SelfFixOutcome(accepted=True, reason="self_fix_accepted")
+            return _fallback("self_fix_finalize_failed")
+        self.state.event(
+            roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_review_rejected",
+            {"verdict": re_verdict.verdict if re_verdict else None},
+        )
+        return _fallback("self_fix_review_rejected")
+
     def _finalize(
         self,
         *,

@@ -242,6 +242,57 @@ class CodexRunner:
             stderr_path.write_text((exc.stderr or "") + f"\nTIMEOUT after {timeout_seconds}s\n", encoding="utf-8", errors="replace")
             return RunnerResult(124, stdout_path, stderr_path, started, utc_now(), timed_out=True)
 
+    def run_self_fix(
+        self,
+        prompt_path: Path,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        timeout_seconds: int = 1800,
+        model: str | None = None,
+        model_reasoning_effort: str | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
+        """Run a bounded Codex self-fix write-pass in ``cwd``.
+
+        Uses ``workspace-write`` sandbox so the reviewer can apply a small
+        edit. stdout/stderr are captured to ``self_fix.stdout.log`` /
+        ``self_fix.stderr.log`` so the orchestrator can detect the skip
+        marker and the operator can audit the pass. Short bounded fixes do
+        not need the streaming watchdog path, but ``idle_timeout`` is
+        honored when set to avoid a wedged pass hanging the run.
+        """
+        command = build_codex_self_fix_command(
+            prompt_path,
+            binary="codex",
+            model=model,
+            model_reasoning_effort=model_reasoning_effort,
+        )
+        stdout_path = artifact_dir / "self_fix.stdout.log"
+        stderr_path = artifact_dir / "self_fix.stderr.log"
+        started = utc_now()
+        try:
+            with prompt_path.open("r", encoding="utf-8") as stdin:
+                proc = subprocess.run(
+                    command,
+                    cwd=str(cwd),
+                    stdin=stdin,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                    env=reviewer_env(),
+                    check=False,
+                )
+            stdout_path.write_text(proc.stdout, encoding="utf-8", errors="replace")
+            stderr_path.write_text(proc.stderr, encoding="utf-8", errors="replace")
+            return RunnerResult(proc.returncode, stdout_path, stderr_path, started, utc_now())
+        except subprocess.TimeoutExpired as exc:
+            stdout_path.write_text(exc.stdout or "", encoding="utf-8", errors="replace")
+            stderr_path.write_text(
+                (exc.stderr or "") + f"\nTIMEOUT after {timeout_seconds}s\n", encoding="utf-8", errors="replace"
+            )
+            return RunnerResult(124, stdout_path, stderr_path, started, utc_now(), timed_out=True)
+
     def _run_review_streaming(
         self,
         command: list[str],
@@ -357,6 +408,32 @@ class CodexRunner:
             )
             return RunnerResult(124, stdout_path, stderr_path, started, utc_now(), timed_out=True)
         return RunnerResult(exit_code, stdout_path, stderr_path, started, utc_now())
+
+
+def build_codex_self_fix_command(
+    prompt_path: Path,
+    *,
+    binary: str = "codex",
+    model: str | None = None,
+    model_reasoning_effort: str | None = None,
+) -> list[str]:
+    """Build the argv for a Codex self-fix write-pass.
+
+    A self-fix pass runs in ``workspace-write`` sandbox (scoped to the
+    worktree cwd) so the reviewer can apply a SMALL edit directly. Unlike
+    the review command there is no ``--output-schema``: the pass edits
+    files and prints a short status; AgentOps measures the resulting diff.
+    The reviewer is told the line budget in the prompt and skips (no edits)
+    when the fix is too big, so we do not pay for a large edit and then
+    reject it.
+    """
+    command = [binary, "exec", "--sandbox", "workspace-write"]
+    if model:
+        command.extend(["-m", str(model)])
+    if model_reasoning_effort:
+        command.extend(["-c", f"model_reasoning_effort={model_reasoning_effort}"])
+    command.append(str(prompt_path))
+    return command
 
 
 def build_codex_command(
