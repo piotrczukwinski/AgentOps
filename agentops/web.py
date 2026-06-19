@@ -983,8 +983,10 @@ class _State:
     def active_runs(self) -> list[dict[str, Any]]:
         with self._lock:
             live: list[dict[str, Any]] = []
+            seen_pids: set[int] = set()
             for run_id, rec in self._procs.items():
                 poll = rec.proc.poll()
+                seen_pids.add(int(rec.proc.pid))
                 live.append(
                     {
                         "run_id": run_id,
@@ -993,6 +995,41 @@ class _State:
                         "argv": list(rec.argv),
                         "exit_code": poll,
                         "running": poll is None,
+                    }
+                )
+            try:
+                self.state.init()
+                with self.state.connect() as conn:
+                    rows = conn.execute(
+                        "SELECT id, path, repo_path FROM roadmaps ORDER BY id"
+                    ).fetchall()
+            except Exception as exc:  # noqa: BLE001 - best-effort dashboard fallback
+                log.warning("active run lock lookup failed: %s", exc)
+                rows = []
+            for row in rows:
+                try:
+                    lock_path = Path(str(row["repo_path"])) / ".agentops" / "run.lock"
+                    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+                    pid = int(payload.get("pid"))
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if pid in seen_pids:
+                    continue
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    continue
+                seen_pids.add(pid)
+                roadmap_id = str(payload.get("roadmap_id") or row["id"])
+                live.append(
+                    {
+                        "run_id": f"{roadmap_id}-{pid}",
+                        "roadmap": str(row["path"]),
+                        "pid": pid,
+                        "argv": [],
+                        "exit_code": None,
+                        "running": True,
+                        "source": "repo_lock",
                     }
                 )
             return live
