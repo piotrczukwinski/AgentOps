@@ -1759,6 +1759,13 @@ INDEX_TEMPLATE = """<!doctype html>
       <button class="secondary" id="operator-tail-btn">Tail (200 lines)</button>
     </div>
     <pre id="operator-tail-output" class="muted">click Tail to load the latest attempt log for the selected run id.</pre>
+    <div class="row" style="margin-top:8px;">
+      <label for="monitor-run-input" class="muted">Operator run id:</label>
+      <input id="monitor-run-input" type="text" placeholder="20260617T..." size="40" />
+      <button class="secondary" id="monitor-start-btn">Start live</button>
+      <button class="secondary" id="monitor-stop-btn">Stop</button>
+    </div>
+    <pre id="monitor-live-output">click Start live to stream.</pre>
   </section>
 
   <section class="card">
@@ -1770,6 +1777,41 @@ INDEX_TEMPLATE = """<!doctype html>
       <button class="secondary" id="artifacts-btn">Load artifacts</button>
     </div>
     <pre id="detail-output">select a task and press a button.</pre>
+    <div class="row" style="margin-top:8px;">
+      <label for="monitor-task-roadmap" class="muted">Roadmap:</label>
+      <input id="monitor-task-roadmap" type="text" placeholder="roadmap_id" size="20" />
+      <button class="secondary" id="task-live-btn">Task live</button>
+      <button class="secondary" id="task-live-stop-btn">Stop</button>
+    </div>
+    <pre id="task-live-output">click Task live to stream the executor log.</pre>
+  </section>
+
+  <section class="card">
+    <h2 style="margin-top:0;font-size:15px;">History</h2>
+    <table>
+      <thead>
+        <tr><th>Roadmap</th><th>Created</th><th>Verdict</th><th>Action</th></tr>
+      </thead>
+      <tbody id="history-rows"><tr><td colspan="4" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <pre id="history-summary">select a run.</pre>
+    <div class="row" style="margin-top:8px;">
+      <label for="log-task" class="muted">Task:</label>
+      <input id="log-task" type="text" size="20" />
+      <label for="log-attempt" class="muted">Attempt:</label>
+      <input id="log-attempt" type="text" size="4" />
+      <label for="log-kind" class="muted">Kind:</label>
+      <select id="log-kind">
+        <option>executor.combined.log</option>
+        <option>executor.stdout.log</option>
+        <option>executor.stderr.log</option>
+        <option>validation.result.json</option>
+        <option>review.result.json</option>
+        <option>diff.patch</option>
+      </select>
+      <button class="secondary" id="log-view-btn">View log</button>
+    </div>
+    <pre id="log-view-output">choose a run, task, attempt and kind.</pre>
   </section>
 </main>
 
@@ -1798,8 +1840,26 @@ INDEX_TEMPLATE = """<!doctype html>
   const runAutonomous = $("run-autonomous");
   const runReviewer = $("run-reviewer");
   const runMaxTasks = $("run-max-tasks");
+  const monitorRunInput = $("monitor-run-input");
+  const monitorStartBtn = $("monitor-start-btn");
+  const monitorStopBtn = $("monitor-stop-btn");
+  const monitorLiveOutput = $("monitor-live-output");
+  const monitorTaskRoadmap = $("monitor-task-roadmap");
+  const taskLiveBtn = $("task-live-btn");
+  const taskLiveStopBtn = $("task-live-stop-btn");
+  const taskLiveOutput = $("task-live-output");
+  const historyRows = $("history-rows");
+  const historySummary = $("history-summary");
+  const logTask = $("log-task");
+  const logAttempt = $("log-attempt");
+  const logKind = $("log-kind");
+  const logViewBtn = $("log-view-btn");
+  const logViewOutput = $("log-view-output");
 
   let autoTimer = null;
+  let monitorES = null;
+  let taskES = null;
+  let currentHistoryRoadmap = "";
 
   function escapeHtml(value) {
     return String(value == null ? "" : value)
@@ -1961,6 +2021,130 @@ async function tailOperatorRun() {
   operatorTailOutput.textContent = JSON.stringify(res.data, null, 2);
 }
 
+  // ---- Monitor (live SSE) + History (T7) ---------------------------------
+  // The dashboard streams operator-run and per-task logs over SSE using the
+  // browser-native EventSource API; no external library. Streams are closed
+  // on the server's ``done``/``error`` events and on ``beforeunload``.
+
+  function stopMonitor() {
+    if (monitorES) { monitorES.close(); monitorES = null; }
+  }
+  function startMonitor() {
+    stopMonitor();
+    const runId = (monitorRunInput.value || "").trim();
+    if (!runId) { monitorLiveOutput.textContent = "enter a run id"; return; }
+    const out = monitorLiveOutput;
+    out.textContent = "";
+    monitorES = new EventSource(
+      "/api/operator-runs/" + encodeURIComponent(runId) + "/stream"
+    );
+    monitorES.addEventListener("log", function (e) {
+      try {
+        out.textContent += (JSON.parse(e.data).text || "") + "\n";
+      } catch (err) { out.textContent += "[bad log frame: " + err + "]\n"; }
+      out.scrollTop = out.scrollHeight;
+    });
+    monitorES.addEventListener("done", function (e) {
+      let reason = "?";
+      try { reason = (JSON.parse(e.data).reason || "?"); } catch (err) { reason = "?"; }
+      out.textContent += "\n[stream ended: " + reason + "]\n";
+      stopMonitor();
+    });
+    monitorES.addEventListener("error", function (e) {
+      if (e && e.data) out.textContent += "\n[error: " + e.data + "]\n";
+      stopMonitor();
+    });
+  }
+
+  function stopTask() {
+    if (taskES) { taskES.close(); taskES = null; }
+  }
+  function startTask() {
+    stopTask();
+    const taskId = ($("task-input").value || "").trim();
+    const roadmap = (monitorTaskRoadmap.value || "").trim();
+    if (!taskId) { taskLiveOutput.textContent = "enter a task id (use the Task detail row above)"; return; }
+    const out = taskLiveOutput;
+    out.textContent = "";
+    const url = "/api/tasks/" + encodeURIComponent(taskId) + "/stream"
+      + (roadmap ? "?roadmap=" + encodeURIComponent(roadmap) : "");
+    taskES = new EventSource(url);
+    taskES.addEventListener("log", function (e) {
+      try {
+        out.textContent += (JSON.parse(e.data).text || "") + "\n";
+      } catch (err) { out.textContent += "[bad log frame: " + err + "]\n"; }
+      out.scrollTop = out.scrollHeight;
+    });
+    taskES.addEventListener("done", function (e) {
+      let reason = "?";
+      try { reason = (JSON.parse(e.data).reason || "?"); } catch (err) { reason = "?"; }
+      out.textContent += "\n[stream ended: " + reason + "]\n";
+      stopTask();
+    });
+    taskES.addEventListener("error", function (e) {
+      if (e && e.data) out.textContent += "\n[error: " + e.data + "]\n";
+      stopTask();
+    });
+  }
+
+  async function loadHistory() {
+    if (!historyRows) return;
+    const res = await fetchJson("/api/runs?limit=100");
+    const runs = (res.data && res.data.runs) || [];
+    if (!runs.length) {
+      historyRows.innerHTML = '<tr><td colspan="4" class="muted">no finished runs</td></tr>';
+      return;
+    }
+    historyRows.innerHTML = runs.map(function (r) {
+      return "<tr>"
+        + "<td>" + escapeHtml(r.roadmap_id) + "</td>"
+        + "<td>" + escapeHtml(r.created_at) + "</td>"
+        + '<td><span class="pill">' + escapeHtml(r.run_verdict || "-") + "</span></td>"
+        + '<td><button class="secondary history-view-btn" data-roadmap="'
+        + escapeHtml(r.roadmap_id) + '">View</button></td>'
+        + "</tr>";
+    }).join("");
+    historyRows.querySelectorAll(".history-view-btn").forEach(function (b) {
+      b.addEventListener("click", function () {
+        currentHistoryRoadmap = b.getAttribute("data-roadmap") || "";
+        historySummary.textContent = "selected roadmap: " + currentHistoryRoadmap
+          + "\n(use the log viewer below; attempt listing: /api/tasks/<id>/attempts)";
+        if (logTask) logTask.focus();
+      });
+    });
+  }
+
+  async function viewLog() {
+    const roadmap = currentHistoryRoadmap;
+    const task = (logTask.value || "").trim();
+    const attempt = (logAttempt.value || "").trim();
+    const kind = logKind.value;
+    const out = logViewOutput;
+    if (!roadmap || !task || !attempt) {
+      out.textContent = "select a run (View), then enter task + attempt";
+      return;
+    }
+    out.textContent = "loading...";
+    const url = "/api/run-logs?roadmap=" + encodeURIComponent(roadmap)
+      + "&task=" + encodeURIComponent(task) + "&attempt=" + encodeURIComponent(attempt)
+      + "&kind=" + encodeURIComponent(kind);
+    const res = await fetchJson(url);
+    if (!res.ok) { out.textContent = (res.data && res.data.error) || ("HTTP " + res.status); return; }
+    if (!res.data.found) { out.textContent = "not found: " + (res.data.path || ""); return; }
+    out.textContent = (res.data.truncated ? "[truncated, showing tail]\n" : "")
+      + (res.data.text || "");
+  }
+
+  if (monitorStartBtn) monitorStartBtn.addEventListener("click", startMonitor);
+  if (monitorStopBtn) monitorStopBtn.addEventListener("click", stopMonitor);
+  if (taskLiveBtn) taskLiveBtn.addEventListener("click", startTask);
+  if (taskLiveStopBtn) taskLiveStopBtn.addEventListener("click", stopTask);
+  if (logViewBtn) logViewBtn.addEventListener("click", viewLog);
+  window.addEventListener("beforeunload", function () {
+    stopMonitor();
+    stopTask();
+  });
+
   async function postJson(path, body) {
     return fetchJson(path, {
       method: "POST",
@@ -2100,6 +2284,7 @@ async function tailOperatorRun() {
   if (bundleUploadBtn) bundleUploadBtn.addEventListener("click", uploadBundle);
 
   loadBundles();
+  loadHistory();
   loadRoadmaps();
   refresh();
   autoTimer = setInterval(refresh, 3000);

@@ -142,6 +142,34 @@ class FrontendBundlesTests(unittest.TestCase):
         self.assertIn("stream", html)
 
 
+class FrontendMonitorHistoryTests(unittest.TestCase):
+    """T7 frontend contracts: Monitor (live SSE) + History browser render.
+
+    These are pure HTML-string assertions (no browser) following the same
+    pattern as :class:`WebRenderTests` and :class:`FrontendBundlesTests`.
+    """
+
+    def test_render_has_monitor_and_history_anchors(self) -> None:
+        html = web.render_index_html()
+        # New anchors required for the Monitor (live SSE) + History sections.
+        self.assertIn("monitor-start-btn", html)
+        self.assertIn("EventSource", html)
+        self.assertIn("history-rows", html)
+        self.assertIn("log-view-btn", html)
+        self.assertIn("/api/runs", html)
+        self.assertIn("/api/run-logs", html)
+
+    def test_render_keeps_legacy_anchors(self) -> None:
+        # T7 regression guard: every anchor added by T1..T6 must still
+        # render so the page is forward-compatible with the merged stack.
+        html = web.render_index_html()
+        self.assertIn("AgentOps Local UI", html)
+        self.assertIn("/api/status", html)
+        self.assertIn("/api/plan", html)
+        self.assertIn("/api/run", html)
+        self.assertIn("/api/bundles", html)
+
+
 class WebSafetyTests(unittest.TestCase):
     def test_is_loopback_host(self) -> None:
         self.assertTrue(web.is_loopback_host("127.0.0.1"))
