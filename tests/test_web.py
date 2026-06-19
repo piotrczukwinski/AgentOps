@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
@@ -812,6 +813,319 @@ class BundleApiTests(unittest.TestCase):
                 dest_root = Path(dest_tmp)
                 bundles_dir = dest_root / "bundles"
                 bundles_dir.mkdir()
-                unpacked = bundles.unpack_bundle(zip_path, bundles_dir)
-                self.assertEqual(unpacked.manifest.name, "demo")
-                self.assertEqual(unpacked.manifest.version, "1.0.0")
+            unpacked = bundles.unpack_bundle(zip_path, bundles_dir)
+            self.assertEqual(unpacked.manifest.name, "demo")
+            self.assertEqual(unpacked.manifest.version, "1.0.0")
+
+
+# ---------------------------------------------------------------------------
+# SSE live-log streaming endpoints (AO-ADMIN-T4-WEB-SSE-STREAMS)
+# ---------------------------------------------------------------------------
+
+
+class SseStreamTests(unittest.TestCase):
+    """Unit + smoke tests for the SSE live-log streaming endpoints.
+
+    The pure-helper tests exercise the framing format, the single-component
+    path validator, and the per-task log resolver without an HTTP server.
+    The endpoint tests use the real :class:`ThreadingHTTPServer` +
+    :class:`http.client.HTTPConnection` pair to confirm the wire format and
+    the path-traversal rejection over a real socket.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Spin up one server for the endpoint tests; the pure-helper tests
+        # ignore it. A class-level fixture keeps the pure tests fast while
+        # still letting the end-to-end tests use the same pattern as the
+        # rest of this file.
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name)
+        cls.repo = _init_repo(cls.tmp)
+        cls.db = cls.tmp / "state.sqlite"
+        cls.store = StateStore(cls.db)
+        cls.store.init()
+        cls.port = _free_port()
+        cls.server = web.make_server("127.0.0.1", cls.port, state=cls.store)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                conn = HTTPConnection("127.0.0.1", cls.port, timeout=1)
+                conn.connect()
+                conn.close()
+                return
+            except OSError:
+                time.sleep(0.05)
+        raise RuntimeError("SSE test server did not start")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls._tmp.cleanup()
+
+    # --- pure-helper tests -------------------------------------------------
+
+    def test_format_sse_frame_log_event(self) -> None:
+        out = web.format_sse_frame("log", {"run_id": "r1", "text": "hello\nworld"})
+        # Event line comes first, then one data: line per source line, then
+        # the SSE blank line terminator.
+        self.assertTrue(out.startswith("event: log\n"))
+        self.assertIn("data: {\"run_id\": \"r1\", \"text\": \"hello\\nworld\"}\n", out)
+        self.assertTrue(out.endswith("\n\n"))
+
+    def test_format_sse_frame_string_payload(self) -> None:
+        out = web.format_sse_frame("done", "ok")
+        self.assertEqual(out, "event: done\ndata: ok\n\n")
+
+    def test_format_sse_frame_no_event(self) -> None:
+        out = web.format_sse_frame("", "raw message")
+        self.assertTrue(out.startswith("data: raw message\n"))
+        self.assertTrue(out.endswith("\n\n"))
+        self.assertNotIn("event:", out)
+
+    def test_format_sse_frame_multiline_payload(self) -> None:
+        out = web.format_sse_frame("log", "line1\nline2\nline3")
+        # Each source line becomes its own data: line; no raw newlines leak.
+        self.assertIn("data: line1\n", out)
+        self.assertIn("data: line2\n", out)
+        self.assertIn("data: line3\n", out)
+        self.assertTrue(out.endswith("\n\n"))
+        # A raw newline must NEVER appear inside a data: line; the SSE wire
+        # format requires the data to be split.
+        for bad in ("data: line1\nline2", "data: line2\nline3"):
+            self.assertNotIn(bad, out)
+
+    def test_require_single_component_accepts_simple(self) -> None:
+        self.assertEqual(web._require_single_component("foo"), "foo")
+        self.assertEqual(web._require_single_component("foo-bar_1.0"), "foo-bar_1.0")
+
+    def test_require_single_component_rejects_traversal(self) -> None:
+        with self.assertRaises(ValueError):
+            web._require_single_component("../x")
+        with self.assertRaises(ValueError):
+            web._require_single_component("foo/../bar")
+        with self.assertRaises(ValueError):
+            web._require_single_component("a/b")
+        with self.assertRaises(ValueError):
+            web._require_single_component("a\\b")
+        with self.assertRaises(ValueError):
+            web._require_single_component("")
+        with self.assertRaises(ValueError):
+            web._require_single_component("   ")
+
+    def test_resolve_task_combined_log_picks_highest_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            t1 = runs / "rmap" / "T1"
+            (t1 / "1").mkdir(parents=True)
+            (t1 / "1" / "executor.combined.log").write_text("first\n", encoding="utf-8")
+            (t1 / "3").mkdir(parents=True)
+            (t1 / "3" / "executor.combined.log").write_text("third\n", encoding="utf-8")
+            # Out-of-order creation: the resolver must sort by attempt
+            # number, not by mtime.
+            (t1 / "2").mkdir(parents=True)
+            (t1 / "2" / "executor.combined.log").write_text("second\n", encoding="utf-8")
+            result = web.resolve_task_combined_log(runs, "rmap", "T1")
+            self.assertEqual(result, t1 / "3" / "executor.combined.log")
+
+    def test_resolve_task_combined_log_skips_attempts_without_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            t1 = runs / "rmap" / "T1"
+            (t1 / "1").mkdir(parents=True)
+            (t1 / "1" / "executor.combined.log").write_text("first\n", encoding="utf-8")
+            (t1 / "2").mkdir(parents=True)
+            # Attempt 2 has no log file; the resolver must fall back to 1.
+            result = web.resolve_task_combined_log(runs, "rmap", "T1")
+            self.assertEqual(result, t1 / "1" / "executor.combined.log")
+
+    def test_resolve_task_combined_log_returns_none_when_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            # Runs root does not even exist yet.
+            self.assertIsNone(web.resolve_task_combined_log(runs, "rmap", "T1"))
+            # Runs root exists but the per-task dir is missing.
+            runs.mkdir()
+            self.assertIsNone(web.resolve_task_combined_log(runs, "rmap", "T1"))
+            # Task dir exists but no attempts.
+            (runs / "rmap" / "T1").mkdir(parents=True)
+            self.assertIsNone(web.resolve_task_combined_log(runs, "rmap", "T1"))
+            # Task dir has a non-numeric entry only.
+            bogus = runs / "rmap" / "T1" / "notanumber"
+            bogus.mkdir()
+            self.assertIsNone(web.resolve_task_combined_log(runs, "rmap", "T1"))
+
+    def test_resolve_task_combined_log_handles_missing_root(self) -> None:
+        # The runs root does not exist; the resolver must not raise.
+        self.assertIsNone(web.resolve_task_combined_log(Path("/no/such/path"), "r", "t"))
+
+    def test_resolve_task_combined_log_any_roadmap_picks_highest_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            old = runs / "old-roadmap" / "T1" / "5"
+            old.mkdir(parents=True)
+            (old / "executor.combined.log").write_text("old\n", encoding="utf-8")
+            latest = runs / "new-roadmap" / "T1" / "6"
+            latest.mkdir(parents=True)
+            (latest / "executor.combined.log").write_text("latest\n", encoding="utf-8")
+            ignored = runs / "../bad" / "T1" / "99"
+            ignored.mkdir(parents=True)
+
+            result = web.resolve_task_combined_log_any_roadmap(runs, "T1")
+
+            self.assertIsNotNone(result)
+            roadmap, log_path = result or ("", Path())
+            self.assertEqual(roadmap, "new-roadmap")
+            self.assertEqual(log_path, latest / "executor.combined.log")
+
+    def test_default_agentops_runs_root_under_repo(self) -> None:
+        real_repo = Path(__file__).resolve().parent.parent
+        with mock.patch.object(
+            web, "_resolve_allowed_roots", return_value=web._AllowedRoots(
+                repo_root=real_repo, tmp_root=Path("/tmp")
+            )
+        ):
+            self.assertEqual(
+                web._default_agentops_runs_root(), real_repo / ".agentops" / "runs"
+            )
+
+    # --- endpoint tests ----------------------------------------------------
+
+    def _get_raw(self, path: str, *, timeout: float = 5.0) -> bytes:
+        # Use a raw socket because ``http.client.HTTPResponse.read`` reads
+        # through a ``BufferedReader`` that tries to fill its 8 KiB buffer
+        # before returning; for a small SSE response that would block
+        # forever. ``socket.makefile`` with a small read buffer streams
+        # the response as it arrives.
+        import socket as _socket
+        with _socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as s:
+            s.sendall(
+                f"GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode("ascii")
+            )
+            chunks: list[bytes] = []
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    chunk = s.recv(4096)
+                except (TimeoutError, OSError):
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"event: done" in b"".join(chunks):
+                    break
+        data = b"".join(chunks)
+        # Split off headers; the test only asserts on the body.
+        _, _, body = data.partition(b"\r\n\r\n")
+        return body
+
+    def test_operator_stream_endpoint_rejects_traversal(self) -> None:
+        # Path-traversal run ids are rejected with 400 (no SSE upgrade).
+        with mock.patch.dict(
+            os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False
+        ):
+            conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+            try:
+                conn.request(
+                    "GET", "/api/operator-runs/..%2F..%2Fetc%2Fpasswd/stream"
+                )
+                resp = conn.getresponse()
+                # Read the small JSON error body.
+                body = resp.read()
+            finally:
+                conn.close()
+        self.assertEqual(resp.status, 400)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("error", payload)
+        self.assertIn("single path component", payload["error"])
+
+    def test_operator_stream_endpoint_sends_initial_tail_and_done(self) -> None:
+        # End-to-end smoke: a complete, static log must produce one
+        # ``event: log`` frame containing the last 200 lines, then a
+        # ``event: done`` frame once the loop decides the run is closed.
+        with mock.patch.dict(
+            os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False
+        ):
+            _seed_operator_run(
+                self.repo,
+                "20260617T000000Z-fake-stream-1",
+                combined_log="alpha\nbeta\ngamma\n",
+            )
+            body = self._get_raw(
+                "/api/operator-runs/20260617T000000Z-fake-stream-1/stream"
+                "?max_seconds=1&idle_seconds=1",
+                timeout=8.0,
+            )
+        text = body.decode("utf-8", errors="replace")
+        # The body must contain the SSE frames; the HTTP headers (which
+        # carry ``text/event-stream``) are stripped by ``_get_raw``.
+        self.assertIn("event: log", text)
+        self.assertIn("data: {\"run_id\":", text)
+        self.assertIn("alpha", text)
+        self.assertIn("beta", text)
+        self.assertIn("gamma", text)
+        self.assertIn("event: done", text)
+        self.assertIn("\"reason\":", text)
+        # pid_alive is forwarded by the operator-run endpoint.
+        self.assertIn("\"pid_alive\":", text)
+
+    def test_task_stream_endpoint_resolves_log_without_roadmap(self) -> None:
+        runs = self.repo / ".agentops" / "runs"
+        log_dir = runs / "roadmap-a" / "T1" / "2"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "executor.combined.log").write_text(
+            "task-alpha\ntask-beta\n", encoding="utf-8"
+        )
+
+        with mock.patch.object(
+            web, "_resolve_allowed_roots", return_value=web._AllowedRoots(
+                repo_root=self.repo, tmp_root=Path("/tmp")
+            )
+        ):
+            body = self._get_raw(
+                "/api/tasks/T1/stream?max_seconds=1&idle_seconds=1",
+                timeout=8.0,
+            )
+
+        text = body.decode("utf-8", errors="replace")
+        self.assertIn("event: log", text)
+        self.assertIn("task-alpha", text)
+        self.assertIn("task-beta", text)
+        self.assertIn("event: done", text)
+
+    def test_stream_log_loop_flushes_final_buffer_before_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "executor.combined.log"
+            log_path.write_text("", encoding="utf-8")
+            handler = web.AgentOpsRequestHandler.__new__(web.AgentOpsRequestHandler)
+            handler.wfile = io.BytesIO()
+
+            def append_partial() -> None:
+                time.sleep(0.1)
+                log_path.write_text("partial-final", encoding="utf-8")
+
+            writer = threading.Thread(target=append_partial)
+            writer.start()
+            try:
+                handler._stream_log_loop(
+                    log_path=log_path,
+                    id_field="task_id",
+                    id_value="T1",
+                    max_seconds=1,
+                    idle_seconds=5,
+                    from_end=True,
+                    tail_lines=200,
+                    is_alive=None,
+                    include_pid_alive=False,
+                )
+            finally:
+                writer.join(timeout=5)
+
+            text = handler.wfile.getvalue().decode("utf-8")
+            self.assertIn("event: log", text)
+            self.assertIn("partial-final", text)
+            self.assertLess(text.index("partial-final"), text.index("event: done"))

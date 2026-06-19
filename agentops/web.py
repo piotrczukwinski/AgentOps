@@ -38,7 +38,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -200,6 +202,246 @@ def _default_db_arg() -> str:
     # Mirror the CLI default; the orchestrator will still resolve it relative
     # to the operator's CWD.
     return str(Path(".agentops") / "state.sqlite")
+
+
+# --- SSE helpers -----------------------------------------------------------
+#
+# The web UI follows long-running operator runs and per-task executor logs via
+# Server-Sent Events. SSE is served over the stdlib ``http.server``: the
+# handler sends a chunked response, then writes ``data: <line>\\n\\n`` frames
+# to ``self.wfile`` until the run is done (process gone and no growth for
+# ``idle_seconds``) or ``max_seconds`` has elapsed. See docs/local-web-ui.md
+# and docs/admin-panel-architecture.md for the contract.
+
+
+def format_sse_frame(event: str, payload: Any) -> str:
+    """Serialize ``payload`` as a single SSE frame string.
+
+    Pure function so the framing format can be unit-tested without an HTTP
+    server. The output is terminated with the SSE blank line (``\\n\\n``).
+    ``data:`` lines are split on the payload's own newlines so the frame
+    can safely carry multi-line text without violating the SSE wire format.
+    """
+    text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    out = ""
+    if event:
+        out += f"event: {event}\n"
+    for line in text.splitlines() or [""]:
+        out += f"data: {line}\n"
+    out += "\n"
+    return out
+
+
+def _require_single_component(value: str) -> str:
+    """Validate that ``value`` is a single path-safe component.
+
+    Mirrors the validation in :func:`collect_operator_run_tail`: rejects
+    empty values, path separators (``/`` and ``\\``), and any ``..`` path
+    component. Used by the SSE stream handlers for ``run_id``, ``task_id``,
+    and the ``roadmap`` query parameter so a hostile or accidental path
+    can never escape the runs root.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("value is required")
+    if "/" in value or "\\" in value or ".." in Path(value).parts:
+        raise ValueError("value must be a single path component")
+    return value
+
+
+def resolve_task_combined_log(
+    runs_root: Path, roadmap: str, task_id: str
+) -> Path | None:
+    """Return the latest attempt's ``executor.combined.log``.
+
+    The path layout is
+    ``<runs_root>/<roadmap_id>/<task_id>/<attempt>/executor.combined.log``;
+    this helper picks the highest-numbered attempt directory that contains
+    an ``executor.combined.log`` and returns its absolute path. Returns
+    ``None`` when the runs root, the per-task directory, or any attempt
+    directory is missing/empty. The resolved path is constrained to live
+    under ``runs_root`` (defence in depth; ``_require_single_component``
+    is the primary guard).
+    """
+    if not isinstance(roadmap, str) or not roadmap:
+        return None
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    try:
+        root_resolved = runs_root.resolve()
+    except OSError:
+        return None
+    task_dir = root_resolved / roadmap / task_id
+    try:
+        task_dir.relative_to(root_resolved)
+    except ValueError:
+        return None
+    if not task_dir.is_dir():
+        return None
+    candidates: list[tuple[int, Path]] = []
+    try:
+        entries = list(task_dir.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        try:
+            n = int(entry.name)
+        except ValueError:
+            continue
+        candidates.append((n, entry))
+    if not candidates:
+        return None
+    # Walk highest-first so the first attempt with a real log wins. A
+    # mid-flight attempt may exist as an empty directory; we deliberately
+    # skip it and return the most recent *complete* attempt instead.
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    for _n, attempt_dir in candidates:
+        log_path = attempt_dir / "executor.combined.log"
+        try:
+            log_path.relative_to(root_resolved)
+        except ValueError:
+            continue
+        if log_path.is_file():
+            return log_path
+    return None
+
+
+def resolve_task_combined_log_any_roadmap(
+    runs_root: Path, task_id: str
+) -> tuple[str, Path] | None:
+    """Return the latest task log found across roadmap run directories."""
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    try:
+        root_resolved = runs_root.resolve()
+    except OSError:
+        return None
+    if not root_resolved.is_dir():
+        return None
+    try:
+        roadmap_dirs = list(root_resolved.iterdir())
+    except OSError:
+        return None
+
+    candidates: list[tuple[int, float, str, Path]] = []
+    for roadmap_dir in roadmap_dirs:
+        if not roadmap_dir.is_dir():
+            continue
+        try:
+            roadmap = _require_single_component(roadmap_dir.name)
+        except ValueError:
+            continue
+        task_dir = roadmap_dir / task_id
+        try:
+            task_dir.relative_to(root_resolved)
+        except ValueError:
+            continue
+        if not task_dir.is_dir():
+            continue
+        try:
+            attempt_dirs = list(task_dir.iterdir())
+        except OSError:
+            continue
+        for attempt_dir in attempt_dirs:
+            if not attempt_dir.is_dir():
+                continue
+            try:
+                attempt_number = int(attempt_dir.name)
+            except ValueError:
+                continue
+            log_path = attempt_dir / "executor.combined.log"
+            try:
+                log_path.relative_to(root_resolved)
+                mtime = log_path.stat().st_mtime
+            except (OSError, ValueError):
+                continue
+            if log_path.is_file():
+                candidates.append((attempt_number, mtime, roadmap, log_path))
+
+    if not candidates:
+        return None
+    _attempt_number, _mtime, roadmap, log_path = max(
+        candidates, key=lambda item: (item[0], item[1], item[2])
+    )
+    return roadmap, log_path
+
+
+def _default_agentops_runs_root() -> Path:
+    r"""Return the per-task executor runs root.
+
+    Defaults to ``<repo_root>/.agentops/runs``; tests can monkeypatch
+    :func:`_resolve_allowed_roots` to point the helper at a tempdir.
+    """
+    return _resolve_allowed_roots().repo_root / ".agentops" / "runs"
+
+
+def _file_size(path: Path) -> int:
+    """Return the current size of ``path`` in bytes, or ``0`` on error.
+
+    The streaming loop polls this every cycle; a missing or unreadable
+    file is treated as "no bytes" so the loop simply waits for the file
+    to appear.
+    """
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def _bounded_tail(
+    path: Path, max_lines: int, max_bytes: int = 1_000_000
+) -> list[str]:
+    """Return up to the last ``max_lines`` of ``path``.
+
+    Reads at most ``max_bytes`` bytes from the end of the file so a huge
+    log cannot be loaded into memory. When the file is larger than
+    ``max_bytes`` the first emitted line is dropped (it is a partial
+    suffix of a longer line that started before our read window).
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    if size <= 0 or max_lines <= 0:
+        return []
+    read_size = min(size, max_bytes)
+    with path.open("rb") as fh:
+        fh.seek(size - read_size)
+        raw = fh.read(read_size)
+    text = raw.decode("utf-8", errors="replace")
+    if not text:
+        return []
+    lines = text.splitlines()
+    if size > read_size and lines:
+        # We started mid-file; the first line is partial.
+        lines = lines[1:]
+    return lines[-max_lines:]
+
+
+def _parse_int_param(
+    value: str | None, *, default: int, lo: int, hi: int
+) -> int:
+    """Parse and clamp a query-string integer parameter.
+
+    Returns ``default`` when ``value`` is missing or unparseable, then
+    clamps the result to ``[lo, hi]`` so a hostile query string cannot
+    request an unbounded stream.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(n, hi))
+
+
+def _truthy_param(value: str | None) -> bool:
+    """Return True when ``value`` is one of ``1``/``true``/``yes``/``on``."""
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # --- data fetchers ---------------------------------------------------------
@@ -562,6 +804,31 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_sse(self) -> None:
+        """Begin an SSE response. Caller then writes frames to self.wfile."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+    def _sse_frame(self, event: str, data: Any) -> None:
+        """Write one SSE frame to ``self.wfile``.
+
+        The ``write`` is not guarded: a closed client surfaces as
+        ``BrokenPipeError`` / ``ConnectionResetError`` and propagates to
+        the caller's try/except, which terminates the stream cleanly.
+        The ``flush`` is best-effort because the kernel may have already
+        torn down the socket by the time we ask.
+        """
+        chunk = format_sse_frame(event, data)
+        self.wfile.write(chunk.encode("utf-8"))
+        try:  # noqa: SIM105 - the spec mandates a try/except, not suppress
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     # Routing ----------------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
@@ -600,6 +867,12 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/operator-runs/") and path.endswith("/tail"):
             self._handle_operator_run_tail(path, query)
+            return
+        if path.startswith("/api/operator-runs/") and path.endswith("/stream"):
+            self._handle_operator_run_stream(path, query)
+            return
+        if path.startswith("/api/tasks/") and path.endswith("/stream"):
+            self._handle_task_stream(path, query)
             return
         if path == "/api/bundles":
             self._send_json(collect_bundles())
@@ -683,6 +956,265 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=404)
             return
         self._send_json(payload)
+
+    def _handle_operator_run_stream(self, path: str, query: dict) -> None:
+        # path is "/api/operator-runs/<id>/stream".
+        run_id_raw = path[len("/api/operator-runs/"):-len("/stream")]
+        try:
+            run_id = _urllib_unquote(run_id_raw)
+        except Exception:  # noqa: BLE001
+            self._send_json({"error": "invalid run_id"}, status=400)
+            return
+        try:
+            run_id = _require_single_component(run_id)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        max_seconds = _parse_int_param(
+            (query.get("max_seconds") or ["300"])[0], default=300, lo=1, hi=1800
+        )
+        idle_seconds = _parse_int_param(
+            (query.get("idle_seconds") or ["60"])[0], default=60, lo=5, hi=600
+        )
+        from_end = _truthy_param((query.get("from_end") or [None])[0])
+
+        from .operator_run import (  # local import to avoid cycles at module load
+            latest_combined_log,
+            list_status,
+            resolve_run,
+        )
+
+        root = _default_operator_runs_root()
+
+        def _check_alive() -> bool:
+            try:
+                entries = list_status(root, run_id=run_id)
+            except (FileNotFoundError, OSError):
+                return False
+            if not entries:
+                return False
+            return bool(entries[0][1].get("pid_alive"))
+
+        try:
+            try:
+                target = resolve_run(root, run_id)
+                log_path = latest_combined_log(target)
+            except (FileNotFoundError, ValueError):
+                # Start the SSE response so the client gets a single error
+                # frame instead of a 404 with a connection upgrade failure.
+                self._send_sse()
+                try:  # noqa: SIM105 - spec mandates try/except, not suppress
+                    self._sse_frame(
+                        "error", {"error": f"operator run not found: {run_id}"}
+                    )
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
+
+            self._send_sse()
+            self._stream_log_loop(
+                log_path=log_path,
+                id_field="run_id",
+                id_value=run_id,
+                max_seconds=max_seconds,
+                idle_seconds=idle_seconds,
+                from_end=from_end,
+                tail_lines=200,
+                is_alive=_check_alive,
+                include_pid_alive=True,
+            )
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        except Exception as exc:  # noqa: BLE001 - last-resort guard
+            log.exception("operator run stream failed: %s", exc)
+            try:  # noqa: SIM105 - spec mandates try/except, not suppress
+                self._sse_frame("error", {"error": str(exc)})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    def _handle_task_stream(self, path: str, query: dict) -> None:
+        # path is "/api/tasks/<id>/stream". When the roadmap query parameter
+        # is omitted, search all known roadmap run directories for the task.
+        task_id_raw = path[len("/api/tasks/"):-len("/stream")]
+        try:
+            task_id = _urllib_unquote(task_id_raw)
+        except Exception:  # noqa: BLE001
+            self._send_json({"error": "invalid task_id"}, status=400)
+            return
+        try:
+            task_id = _require_single_component(task_id)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+
+        max_seconds = _parse_int_param(
+            (query.get("max_seconds") or ["300"])[0], default=300, lo=1, hi=1800
+        )
+        idle_seconds = _parse_int_param(
+            (query.get("idle_seconds") or ["60"])[0], default=60, lo=5, hi=600
+        )
+        from_end = _truthy_param((query.get("from_end") or [None])[0])
+
+        runs_root = _default_agentops_runs_root()
+        roadmap_raw = (query.get("roadmap") or [None])[0]
+        if isinstance(roadmap_raw, str) and roadmap_raw.strip():
+            try:
+                roadmap = _require_single_component(roadmap_raw)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            log_path = resolve_task_combined_log(runs_root, roadmap, task_id)
+        else:
+            resolved = resolve_task_combined_log_any_roadmap(runs_root, task_id)
+            if resolved is None:
+                roadmap = "*"
+                log_path = None
+            else:
+                roadmap, log_path = resolved
+        if log_path is None:
+            self._send_sse()
+            try:  # noqa: SIM105 - spec mandates try/except, not suppress
+                self._sse_frame(
+                    "error",
+                    {"error": f"task log not found: {roadmap}/{task_id}"},
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+
+        try:
+            self._send_sse()
+            self._stream_log_loop(
+                log_path=log_path,
+                id_field="task_id",
+                id_value=task_id,
+                max_seconds=max_seconds,
+                idle_seconds=idle_seconds,
+                from_end=from_end,
+                tail_lines=200,
+                is_alive=None,
+                include_pid_alive=False,
+            )
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        except Exception as exc:  # noqa: BLE001 - last-resort guard
+            log.exception("task stream failed: %s", exc)
+            try:  # noqa: SIM105 - spec mandates try/except, not suppress
+                self._sse_frame("error", {"error": str(exc)})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    def _stream_log_loop(
+        self,
+        *,
+        log_path: Path,
+        id_field: str,
+        id_value: str,
+        max_seconds: int,
+        idle_seconds: int,
+        from_end: bool,
+        tail_lines: int,
+        is_alive: Callable[[], bool | None] | None,
+        include_pid_alive: bool,
+    ) -> None:
+        """Stream ``log_path`` to ``self.wfile`` as SSE frames.
+
+        The caller must have already called :meth:`_send_sse`. Frames
+        written:
+
+        * ``event: log`` with ``{id_field: id_value, "text": <lines>}`` for
+          every batch of new complete lines observed on disk.
+        * ``event: done`` with
+          ``{id_field: id_value, "reason": "timeout"|"closed"[, "pid_alive": bool]}``
+          when the stream terminates.
+
+        Stop conditions: ``max_seconds`` elapsed, or (process gone AND
+        no growth for ``idle_seconds``). For streams with no PID
+        (``is_alive is None``) the aliveness check is treated as
+        ``False`` and an extra guard refuses to close until at least
+        one growth event has been observed, so a fresh empty log does
+        not get an instant ``closed`` shutdown.
+        """
+        if not from_end:
+            initial = _bounded_tail(log_path, max_lines=tail_lines)
+            if initial:
+                self._sse_frame(
+                    "log", {id_field: id_value, "text": "\n".join(initial)}
+                )
+        last_size = _file_size(log_path)
+
+        start = time.time()
+        last_growth = start
+        pid_alive_value: bool = False
+        reason = "closed"
+        seen_growth = False
+        buffer = ""
+
+        while True:
+            elapsed = time.time() - start
+            if elapsed >= max_seconds:
+                reason = "timeout"
+                break
+
+            current_size = _file_size(log_path)
+            if current_size < last_size:
+                # File was truncated or rotated; restart from the top.
+                last_size = 0
+                buffer = ""
+            if current_size > last_size:
+                try:
+                    with log_path.open("rb") as fh:
+                        fh.seek(last_size)
+                        new_bytes = fh.read(current_size - last_size)
+                except OSError:
+                    new_bytes = b""
+                if new_bytes:
+                    buffer += new_bytes.decode("utf-8", errors="replace")
+                    if "\n" in buffer:
+                        lines, _, buffer = buffer.rpartition("\n")
+                        if lines:
+                            self._sse_frame(
+                                "log", {id_field: id_value, "text": lines}
+                            )
+                            seen_growth = True
+                            last_growth = time.time()
+                last_size = current_size
+
+            if is_alive is not None:
+                try:
+                    pid_alive_value = bool(is_alive())
+                except Exception:  # noqa: BLE001 - liveness probe is best-effort
+                    pid_alive_value = False
+
+            idle = time.time() - last_growth
+            if is_alive is None:
+                # Task stream: stop only after at least one growth event
+                # AND the log has been idle for ``idle_seconds``.
+                if seen_growth and idle >= idle_seconds:
+                    reason = "closed"
+                    break
+            else:
+                # Operator stream: stop when the process is gone and the
+                # log has not grown for ``idle_seconds``.
+                if not pid_alive_value and idle >= idle_seconds:
+                    reason = "closed"
+                    break
+
+            time.sleep(0.5)
+
+        if buffer:
+            try:  # noqa: SIM105 - spec mandates try/except, not suppress
+                self._sse_frame("log", {id_field: id_value, "text": buffer})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+        done_payload: dict[str, Any] = {id_field: id_value, "reason": reason}
+        if include_pid_alive:
+            done_payload["pid_alive"] = pid_alive_value
+        try:  # noqa: SIM105 - spec mandates try/except, not suppress
+            self._sse_frame("done", done_payload)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def _handle_bundle_validate(self, path: str) -> None:
         # path is "/api/bundles/<name>/validate"; strip the prefix/suffix.
