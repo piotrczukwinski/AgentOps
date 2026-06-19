@@ -28,19 +28,24 @@ except ImportError:  # pragma: no cover - stdlib always has unquote
         return value
 
 
+import contextlib
+import io
 import json
 import logging
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import zipfile
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from . import bundles
 from .plan import lint_roadmap
 from .state import StateStore
 
@@ -67,6 +72,21 @@ def _resolve_allowed_roots(repo_root: Path | None = None) -> _AllowedRoots:
     base = (repo_root or Path(__file__).resolve().parent.parent).resolve()
     tmp = Path("/tmp").resolve()
     return _AllowedRoots(repo_root=base, tmp_root=tmp)
+
+
+def _bundles_root(repo_root: Path | None = None) -> Path:
+    """Return the ``bundles/`` directory under the resolved repo root.
+
+    The directory is created on demand so the upload endpoint and the
+    list endpoint can both safely call this without a separate setup
+    step. ``repo_root`` is resolved through the standard allowlist
+    helper, so the returned path is always under the AgentOps repo
+    root (not /tmp, not a user-controlled path).
+    """
+    roots = _resolve_allowed_roots(repo_root)
+    path = roots.repo_root / "bundles"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -131,16 +151,49 @@ def _is_within(path: Path, root: Path) -> bool:
     return True
 
 
-def build_run_command(roadmap_path: str | Path, *, python_executable: str | None = None) -> list[str]:
+def build_run_command(
+    roadmap_path: str | Path,
+    *,
+    autonomous: bool = False,
+    reviewer: str | None = None,
+    max_tasks: int | None = None,
+    python_executable: str | None = None,
+) -> list[str]:
     """Build the controlled subprocess argv used by /api/run.
 
     Exposed for tests so the command construction is independently verifiable.
     The argv contains no shell, no user-provided shell string, and never
     includes Codex. The roadmap path is resolved through the allowlist.
+
+    Optional flags:
+
+    * ``autonomous`` (bool, default ``False``) — appends ``--autonomous`` when
+      truthy.
+    * ``reviewer`` (str, optional) — appends ``--reviewer <value>`` only when
+      a non-empty string is passed. The web layer validates the value against
+      the ``{"codex", "heuristic"}`` set before calling this helper, so this
+      function does not reject arbitrary strings.
+    * ``max_tasks`` (int, optional) — appends ``--max-tasks <int>`` only when
+      a positive integer is passed. Booleans are explicitly rejected because
+      ``bool`` is a subclass of ``int`` in Python.
     """
     resolved = validate_roadmap_path(str(roadmap_path))
     py = python_executable or sys.executable
-    return [py, "-m", "agentops", "--db", _default_db_arg(), "run", "--roadmap", str(resolved), "--no-codex"]
+    argv = [
+        py, "-m", "agentops", "--db", _default_db_arg(), "run",
+        "--roadmap", str(resolved), "--no-codex",
+    ]
+    if autonomous:
+        argv.append("--autonomous")
+    if isinstance(reviewer, str) and reviewer:
+        argv.extend(["--reviewer", reviewer])
+    if (
+        isinstance(max_tasks, int)
+        and not isinstance(max_tasks, bool)
+        and max_tasks > 0
+    ):
+        argv.extend(["--max-tasks", str(int(max_tasks))])
+    return argv
 
 
 def _default_db_arg() -> str:
@@ -365,6 +418,71 @@ def collect_artifacts(state: StateStore, task_id: str) -> dict[str, Any]:
     return {"task_id": task_id, "items": [_row_to_dict(row) for row in rows]}
 
 
+# ---------------------------------------------------------------------------
+# Bundle + validation data fetchers (read-only, loopback-only)
+# ---------------------------------------------------------------------------
+
+
+def collect_bundles(repo_root: Path | None = None) -> dict[str, Any]:
+    """List unpacked bundles under ``bundles/``.
+
+    Returns ``{"bundles": [ {"name","version","roadmap_path","description","dir"} ]}``.
+    A bundle is a subdirectory of ``bundles/`` that contains ``manifest.json``.
+    Each manifest is read with :func:`agentops.bundles.load_manifest`; dirs
+    whose manifest fails to load are silently skipped so the listing never
+    raises. ``roadmap_path`` is constructed as ``<dir>/<manifest.roadmap>``.
+    """
+    bundles_dir = _bundles_root(repo_root)
+    items: list[dict[str, str]] = []
+    if not bundles_dir.is_dir():
+        return {"bundles": items}
+    for entry in sorted(bundles_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        manifest_file = entry / bundles.MANIFEST_NAME
+        if not manifest_file.is_file():
+            continue
+        try:
+            manifest = bundles.load_manifest(manifest_file)
+        except Exception:  # noqa: BLE001 - skip malformed bundles
+            continue
+        items.append(
+            {
+                "name": manifest.name,
+                "version": manifest.version,
+                "roadmap_path": str(entry / manifest.roadmap),
+                "description": manifest.description,
+                "dir": str(entry),
+            }
+        )
+    return {"bundles": items}
+
+
+def collect_bundle_validation(
+    bundle_name: str, repo_root: Path | None = None
+) -> dict[str, Any]:
+    """Run :func:`agentops.bundles.validate_bundle` against ``bundles/<name>/``.
+
+    Raises :class:`ValueError` when ``bundle_name`` is not a single safe
+    path component (mirrors the validation in
+    :func:`collect_operator_run_tail`). Raises :class:`FileNotFoundError`
+    when the bundle directory is missing.
+    """
+    if not isinstance(bundle_name, str) or not bundle_name.strip():
+        raise ValueError("bundle_name is required")
+    if (
+        "/" in bundle_name
+        or "\\" in bundle_name
+        or ".." in bundle_name
+    ):
+        raise ValueError("bundle_name must be a single path component")
+    bundles_dir = _bundles_root(repo_root)
+    bundle_dir = bundles_dir / bundle_name
+    if not bundle_dir.is_dir():
+        raise FileNotFoundError(f"bundle not found: {bundle_name}")
+    return bundles.validate_bundle(bundle_dir).to_dict()
+
+
 # --- HTTP handler ----------------------------------------------------------
 
 class _State:
@@ -483,6 +601,12 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/operator-runs/") and path.endswith("/tail"):
             self._handle_operator_run_tail(path, query)
             return
+        if path == "/api/bundles":
+            self._send_json(collect_bundles())
+            return
+        if path.startswith("/api/bundles/") and path.endswith("/validate"):
+            self._handle_bundle_validate(path)
+            return
         if path == "/api/health":
             self._send_json({"ok": True, "db_path": str(self._server_state().state.db_path)})
             return
@@ -494,6 +618,12 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         length = int(self.headers.get("Content-Length") or "0")
         raw = self.rfile.read(length) if length > 0 else b""
+
+        if path == "/api/bundles/upload":
+            # Body is the raw zip bytes; do NOT JSON-parse.
+            self._handle_bundle_upload(raw)
+            return
+
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except json.JSONDecodeError as exc:
@@ -554,6 +684,59 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json(payload)
 
+    def _handle_bundle_validate(self, path: str) -> None:
+        # path is "/api/bundles/<name>/validate"; strip the prefix/suffix.
+        name = path[len("/api/bundles/"):-len("/validate")]
+        try:
+            name = _urllib_unquote(name)
+        except Exception:  # noqa: BLE001
+            self._send_json({"error": "invalid bundle name"}, status=400)
+            return
+        if not name or "/" in name or "\\" in name or ".." in name:
+            self._send_json({"error": "invalid bundle name"}, status=400)
+            return
+        try:
+            result = collect_bundle_validation(name)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=404)
+            return
+        self._send_json(result)
+
+    def _handle_bundle_upload(self, raw_body: bytes) -> None:
+        if not raw_body:
+            self._send_json({"uploaded": False, "error": "not a zip file"}, status=400)
+            return
+        if not zipfile.is_zipfile(io.BytesIO(raw_body)):
+            self._send_json({"uploaded": False, "error": "not a zip file"}, status=400)
+            return
+        tmp_path: Path | None = None
+        try:
+            fd, name = tempfile.mkstemp(suffix=".zip")
+            tmp_path = Path(name)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw_body)
+            try:
+                unpacked = bundles.unpack_bundle(tmp_path, _bundles_root())
+            except bundles.BundleError as exc:
+                self._send_json({"uploaded": False, "error": str(exc)}, status=400)
+                return
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
+        self._send_json(
+            {
+                "uploaded": True,
+                "name": unpacked.manifest.name,
+                "version": unpacked.manifest.version,
+                "bundle_dir": str(unpacked.bundle_dir),
+                "roadmap_path": str(unpacked.roadmap_path),
+            }
+        )
+
     def _handle_run(self, payload: dict[str, Any]) -> None:
         roadmap = payload.get("roadmap")
         if not isinstance(roadmap, str) or not roadmap.strip():
@@ -568,8 +751,58 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
                 status=400,
             )
             return
+
+        autonomous_raw = payload.get("autonomous", False)
+        if not isinstance(autonomous_raw, bool):
+            self._send_json(
+                {"started": False, "error": "autonomous must be a boolean"},
+                status=400,
+            )
+            return
+        autonomous = autonomous_raw
+
+        reviewer_raw = payload.get("reviewer")
+        reviewer: str | None = None
+        if reviewer_raw is not None:
+            if (
+                not isinstance(reviewer_raw, str)
+                or reviewer_raw not in {"codex", "heuristic"}
+            ):
+                self._send_json(
+                    {
+                        "started": False,
+                        "error": "reviewer must be 'codex' or 'heuristic'",
+                    },
+                    status=400,
+                )
+                return
+            reviewer = reviewer_raw
+
+        max_tasks_raw = payload.get("max_tasks")
+        max_tasks: int | None = None
+        if max_tasks_raw is not None:
+            if (
+                not isinstance(max_tasks_raw, int)
+                or isinstance(max_tasks_raw, bool)
+                or max_tasks_raw <= 0
+            ):
+                self._send_json(
+                    {
+                        "started": False,
+                        "error": "max_tasks must be a positive integer",
+                    },
+                    status=400,
+                )
+                return
+            max_tasks = max_tasks_raw
+
         try:
-            argv = build_run_command(roadmap)
+            argv = build_run_command(
+                roadmap,
+                autonomous=autonomous,
+                reviewer=reviewer,
+                max_tasks=max_tasks,
+            )
         except RoadmapPathError as exc:
             self._send_json({"started": False, "error": str(exc)}, status=400)
             return

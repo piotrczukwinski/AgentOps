@@ -12,7 +12,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from unittest import mock
 
-from agentops import web
+from agentops import bundles, web
 from agentops.cli import build_parser
 from agentops.state import StateStore
 
@@ -715,3 +715,103 @@ class OperatorRunsEndpointTests(unittest.TestCase):
             status, data = self._get(forbidden)
             self.assertEqual(status, 404)
             self.assertIn("not found", data["error"].lower())
+
+
+# ---------------------------------------------------------------------------
+# Bundle + validation + run-launcher API (AO-ADMIN-T3-WEB-BUNDLE-RUN-API)
+# ---------------------------------------------------------------------------
+
+
+class BundleApiTests(unittest.TestCase):
+    """Unit tests for the bundle, validation, and run-flag API additions.
+
+    These tests call the module-level data fetchers and ``build_run_command``
+    directly (no HTTP server). The HTTP-shape tests for upload/validate live
+    in the existing :class:`WebApiTests` set when the server is wired up.
+    """
+
+    def test_build_run_command_with_flags(self) -> None:
+        real_repo = Path(__file__).resolve().parent.parent
+        roadmap = real_repo / "examples" / "roadmaps" / "demo-shell.json"
+        argv = web.build_run_command(
+            str(roadmap),
+            autonomous=True,
+            reviewer="heuristic",
+            max_tasks=2,
+        )
+        self.assertIn("--autonomous", argv)
+        reviewer_idx = argv.index("--reviewer")
+        self.assertEqual(argv[reviewer_idx + 1], "heuristic")
+        max_tasks_idx = argv.index("--max-tasks")
+        self.assertEqual(argv[max_tasks_idx + 1], "2")
+        self.assertIn("--no-codex", argv)
+
+    def test_build_run_command_defaults(self) -> None:
+        real_repo = Path(__file__).resolve().parent.parent
+        roadmap = real_repo / "examples" / "roadmaps" / "demo-shell.json"
+        argv = web.build_run_command(str(roadmap))
+        self.assertIn("--no-codex", argv)
+        self.assertNotIn("--autonomous", argv)
+        self.assertNotIn("--reviewer", argv)
+        self.assertNotIn("--max-tasks", argv)
+
+    def test_collect_bundles_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            self.assertFalse((tmp_path / "bundles").exists())
+            result = web.collect_bundles(repo_root=tmp_path)
+            self.assertEqual(result, {"bundles": []})
+            self.assertTrue((tmp_path / "bundles").is_dir())
+
+    def test_collect_bundles_lists_unpacked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle_dir = tmp_path / "bundles" / "demo"
+            bundle_dir.mkdir(parents=True)
+            (bundle_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "name": "demo",
+                        "version": "1.0.0",
+                        "roadmap": "roadmap.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (bundle_dir / "roadmap.json").write_text("{}", encoding="utf-8")
+            result = web.collect_bundles(repo_root=tmp_path)
+            self.assertEqual(len(result["bundles"]), 1)
+            entry = result["bundles"][0]
+            self.assertEqual(entry["name"], "demo")
+            self.assertEqual(entry["version"], "1.0.0")
+            self.assertEqual(entry["roadmap_path"], str(bundle_dir / "roadmap.json"))
+            self.assertEqual(entry["dir"], str(bundle_dir))
+
+    def test_collect_bundle_validation_rejects_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            web.collect_bundle_validation("../x", repo_root=Path(tmp))
+
+    def test_unpack_bundle_endpoint_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as src_tmp:
+            src = Path(src_tmp) / "srcbundle"
+            src.mkdir()
+            (src / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "name": "demo",
+                        "version": "1.0.0",
+                        "roadmap": "roadmap.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (src / "roadmap.json").write_text("{}", encoding="utf-8")
+            zip_path = Path(src_tmp) / "demo.zip"
+            bundles.pack_bundle(src, zip_path)
+            with tempfile.TemporaryDirectory() as dest_tmp:
+                dest_root = Path(dest_tmp)
+                bundles_dir = dest_root / "bundles"
+                bundles_dir.mkdir()
+                unpacked = bundles.unpack_bundle(zip_path, bundles_dir)
+                self.assertEqual(unpacked.manifest.name, "demo")
+                self.assertEqual(unpacked.manifest.version, "1.0.0")
