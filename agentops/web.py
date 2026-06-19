@@ -847,10 +847,79 @@ def _tail_text_file(path: Path, *, lines: int) -> str:
     return "\n".join(text.splitlines()[-cap:])
 
 
+def _latest_combined_log_for_roadmap(roadmap_id: str, repo_root: Path) -> tuple[str, Path] | None:
+    runs_root = repo_root / ".agentops" / "runs" / safe_name(roadmap_id)
+    try:
+        runs_root_resolved = runs_root.resolve()
+    except OSError:
+        return None
+    candidates: list[tuple[float, Path]] = []
+    try:
+        for path in runs_root_resolved.glob("*/*/executor.combined.log"):
+            try:
+                resolved = path.resolve()
+                if _is_within(resolved, runs_root_resolved) and resolved.is_file():
+                    candidates.append((resolved.stat().st_mtime, resolved))
+            except OSError:
+                continue
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    _mtime, log_path = max(candidates, key=lambda item: item[0])
+    return roadmap_id, log_path
+
+
+def _latest_panel_run_combined_log(
+    server_state: Any, run_id: str
+) -> tuple[str, Path, Callable[[], bool]] | None:
+    """Resolve a web-launched panel run id to the latest task log."""
+    record = server_state.run_record(run_id)
+    if record is None:
+        return None
+    roadmap_path = str(Path(record.roadmap).expanduser())
+    try:
+        server_state.state.init()
+        with server_state.state.connect() as conn:
+            row = conn.execute(
+                "SELECT id, repo_path FROM roadmaps WHERE path=? ORDER BY created_at DESC LIMIT 1",
+                (roadmap_path,),
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001 - best-effort dashboard fallback
+        log.warning("panel run lookup failed: %s", exc)
+        row = None
+    if row is None:
+        try:
+            data = json.loads(Path(record.roadmap).read_text(encoding="utf-8"))
+            roadmap_id = str(data["roadmap_id"])
+            repo_root = Path(str(data["repo"]["path"])).expanduser().resolve()
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+    else:
+        roadmap_id = str(row["id"])
+        repo_root = Path(str(row["repo_path"])).expanduser().resolve()
+    resolved = _latest_combined_log_for_roadmap(roadmap_id, repo_root)
+    if resolved is None:
+        return None
+
+    def _is_alive() -> bool:
+        return record.proc.poll() is None
+
+    roadmap_id, log_path = resolved
+    return roadmap_id, log_path, _is_alive
+
+
 def _latest_roadmap_combined_log(
     state: StateStore, run_id: str
 ) -> tuple[str, Path] | None:
     """Resolve a synthetic ``<roadmap_id>-<pid>`` run to the latest task log."""
+    pid_suffix: int | None = None
+    _prefix, sep, suffix = run_id.rpartition("-")
+    if sep:
+        try:
+            pid_suffix = int(suffix)
+        except ValueError:
+            pid_suffix = None
     try:
         state.init()
         with state.connect() as conn:
@@ -863,35 +932,31 @@ def _latest_roadmap_combined_log(
     for row in rows:
         roadmap_id = str(row["id"])
         prefix = f"{roadmap_id}-"
-        if not run_id.startswith(prefix):
-            continue
-        pid_raw = run_id[len(prefix):]
-        try:
-            pid = int(pid_raw)
-            os.kill(pid, 0)
-        except (OSError, ValueError):
-            return None
         repo_root = Path(str(row["repo_path"])).expanduser().resolve()
-        runs_root = repo_root / ".agentops" / "runs" / safe_name(roadmap_id)
-        try:
-            runs_root_resolved = runs_root.resolve()
-        except OSError:
-            return None
-        candidates: list[tuple[float, Path]] = []
-        try:
-            for path in runs_root_resolved.glob("*/*/executor.combined.log"):
-                try:
-                    resolved = path.resolve()
-                    if _is_within(resolved, runs_root_resolved) and resolved.is_file():
-                        candidates.append((resolved.stat().st_mtime, resolved))
-                except OSError:
-                    continue
-        except OSError:
-            return None
-        if not candidates:
-            return None
-        _mtime, log_path = max(candidates, key=lambda item: item[0])
-        return roadmap_id, log_path
+        if run_id.startswith(prefix):
+            pid_raw = run_id[len(prefix):]
+            try:
+                pid = int(pid_raw)
+                os.kill(pid, 0)
+            except ValueError:
+                continue
+            except OSError:
+                return None
+        else:
+            if pid_suffix is None:
+                continue
+            try:
+                payload = json.loads(
+                    (repo_root / ".agentops" / "run.lock").read_text(encoding="utf-8")
+                )
+                lock_pid = int(payload.get("pid"))
+                lock_roadmap_id = str(payload.get("roadmap_id") or "")
+                os.kill(pid_suffix, 0)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if lock_pid != pid_suffix or lock_roadmap_id != roadmap_id:
+                continue
+        return _latest_combined_log_for_roadmap(roadmap_id, repo_root)
     return None
 
 
@@ -1038,6 +1103,10 @@ class _State:
         with self._lock:
             self._procs[run_id] = _RunRecord(roadmap=roadmap, proc=proc, argv=argv)
         return run_id
+
+    def run_record(self, run_id: str) -> _RunRecord | None:
+        with self._lock:
+            return self._procs.get(run_id)
 
     def active_runs(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -1358,6 +1427,23 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=400)
             return
         except FileNotFoundError as exc:
+            panel_resolved = _latest_panel_run_combined_log(
+                self._server_state(), run_id
+            )
+            if panel_resolved is not None:
+                roadmap_id, log_path, _is_alive = panel_resolved
+                cap = max(1, min(int(lines), 5000))
+                self._send_json(
+                    {
+                        "run_id": run_id,
+                        "roadmap_id": roadmap_id,
+                        "active_combined_log": str(log_path),
+                        "lines": cap,
+                        "text": _tail_text_file(log_path, lines=cap),
+                        "run": {"run_id": run_id, "runtime_status": "running"},
+                    }
+                )
+                return
             resolved = _latest_roadmap_combined_log(self._server_state().state, run_id)
             if resolved is not None:
                 roadmap_id, log_path = resolved
@@ -1420,6 +1506,24 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
                 target = resolve_run(root, run_id)
                 log_path = latest_combined_log(target)
             except (FileNotFoundError, ValueError):
+                panel_resolved = _latest_panel_run_combined_log(
+                    self._server_state(), run_id
+                )
+                if panel_resolved is not None:
+                    _roadmap_id, log_path, is_alive = panel_resolved
+                    self._send_sse()
+                    self._stream_log_loop(
+                        log_path=log_path,
+                        id_field="run_id",
+                        id_value=run_id,
+                        max_seconds=max_seconds,
+                        idle_seconds=idle_seconds,
+                        from_end=from_end,
+                        tail_lines=200,
+                        is_alive=is_alive,
+                        include_pid_alive=True,
+                    )
+                    return
                 resolved = _latest_roadmap_combined_log(
                     self._server_state().state, run_id
                 )
