@@ -570,6 +570,7 @@ ALLOWED_LOG_KINDS = {
     "executor.stderr.log",
     "review.result.json",
     "review.stdout.jsonl",
+    "review.stderr.log",
     "validation.result.json",
     "diff.patch",
     "diff.stat",
@@ -2008,6 +2009,8 @@ INDEX_TEMPLATE = """<!doctype html>
         <option>executor.stderr.log</option>
         <option>validation.result.json</option>
         <option>review.result.json</option>
+        <option>review.stdout.jsonl</option>
+        <option>review.stderr.log</option>
         <option>diff.patch</option>
       </select>
       <button class="secondary" id="log-view-btn">View log</button>
