@@ -1689,6 +1689,22 @@ INDEX_TEMPLATE = """<!doctype html>
 </header>
 <main>
   <section class="card">
+    <h2 style="margin-top:0;font-size:15px;">Bundles</h2>
+    <div class="row">
+      <input id="bundle-file" type="file" accept=".zip" />
+      <button id="bundle-upload-btn">Upload bundle</button>
+      <span id="bundle-upload-status" class="muted"></span>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Version</th><th>Roadmap</th><th>Description</th><th>Action</th></tr>
+      </thead>
+      <tbody id="bundle-rows"><tr><td colspan="5" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <pre id="bundle-validate-output" class="muted">click Validate to check a bundle.</pre>
+  </section>
+
+  <section class="card">
     <h2 style="margin-top:0;font-size:15px;">Roadmap</h2>
     <div class="row">
       <label for="roadmap-select" class="muted">Select:</label>
@@ -1697,6 +1713,9 @@ INDEX_TEMPLATE = """<!doctype html>
       <input id="roadmap-input" type="text" placeholder="examples/roadmaps/demo-shell.json" size="42" />
       <button id="plan-btn">Plan</button>
       <button id="run-btn">Run (no-codex)</button>
+      <label><input id="run-autonomous" type="checkbox" /> autonomous</label>
+      <label>reviewer: <select id="run-reviewer"><option value="">(default)</option><option value="codex">codex</option><option value="heuristic">heuristic</option></select></label>
+      <label>max-tasks: <input id="run-max-tasks" type="number" min="1" placeholder="(none)" size="4" /></label>
     </div>
     <div id="plan-output" class="muted" style="margin-top:8px;"></div>
   </section>
@@ -1771,6 +1790,14 @@ INDEX_TEMPLATE = """<!doctype html>
   const detailOutput = $("detail-output");
   const roadmapSelect = $("roadmap-select");
   const roadmapInput = $("roadmap-input");
+  const bundleRows = $("bundle-rows");
+  const bundleFile = $("bundle-file");
+  const bundleUploadStatus = $("bundle-upload-status");
+  const bundleValidateOutput = $("bundle-validate-output");
+  const bundleUploadBtn = $("bundle-upload-btn");
+  const runAutonomous = $("run-autonomous");
+  const runReviewer = $("run-reviewer");
+  const runMaxTasks = $("run-max-tasks");
 
   let autoTimer = null;
 
@@ -1956,8 +1983,14 @@ async function tailOperatorRun() {
   $("run-btn").addEventListener("click", async function () {
     const roadmap = getRoadmap();
     if (!roadmap) { planOutput.textContent = "select or type a roadmap first"; return; }
+    const body = { roadmap: roadmap, no_codex: true, autonomous: !!(runAutonomous && runAutonomous.checked) };
+    if (runReviewer && runReviewer.value) body.reviewer = runReviewer.value;
+    if (runMaxTasks && runMaxTasks.value) {
+      const n = Number(runMaxTasks.value);
+      if (n > 0) body.max_tasks = Math.floor(n);
+    }
     planOutput.textContent = "starting run (no-codex)...";
-    const res = await postJson("/api/run", { roadmap: roadmap, no_codex: true });
+    const res = await postJson("/api/run", body);
     if (!res.ok) { planOutput.className = "err"; planOutput.textContent = res.data.error || "run failed"; return; }
     planOutput.className = "muted";
     planOutput.textContent = "started run_id=" + res.data.run_id + " pid=" + res.data.pid;
@@ -1976,6 +2009,97 @@ async function tailOperatorRun() {
     detailOutput.textContent = JSON.stringify(res.data, null, 2);
   });
 
+  // ---- Bundles (T6) -------------------------------------------------------
+  // T7 will add a live stream button for operator runs.
+  function renderBundles(items) {
+    if (!items || !items.length) {
+      bundleRows.innerHTML = '<tr><td colspan="5" class="muted">no bundles</td></tr>';
+      return;
+    }
+    bundleRows.innerHTML = items.map(function (b) {
+      const name = b.name || "";
+      const version = b.version || "";
+      const roadmapPath = b.roadmap_path || "";
+      const desc = b.description || "";
+      return "<tr>"
+        + "<td>" + escapeHtml(name) + "</td>"
+        + "<td>" + escapeHtml(version) + "</td>"
+        + "<td>" + escapeHtml(roadmapPath) + "</td>"
+        + "<td>" + escapeHtml(desc) + "</td>"
+        + '<td><button class="secondary bundle-validate-btn" data-name="' + escapeHtml(name) + '">Validate</button> '
+        + '<button class="secondary bundle-use-btn" data-name="' + escapeHtml(name) + '" data-roadmap="' + escapeHtml(roadmapPath) + '">Use</button></td>'
+        + "</tr>";
+    }).join("");
+    const validateButtons = bundleRows.querySelectorAll(".bundle-validate-btn");
+    validateButtons.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        const name = btn.getAttribute("data-name") || "";
+        validateBundle(name);
+      });
+    });
+    const useButtons = bundleRows.querySelectorAll(".bundle-use-btn");
+    useButtons.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        const roadmapPath = btn.getAttribute("data-roadmap") || "";
+        roadmapInput.value = roadmapPath;
+        if (roadmapInput.scrollIntoView) {
+          roadmapInput.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      });
+    });
+  }
+
+  async function loadBundles() {
+    const res = await fetchJson("/api/bundles");
+    if (res.ok) renderBundles(res.data.bundles || []);
+  }
+
+  async function uploadBundle() {
+    if (!bundleFile || !bundleFile.files || !bundleFile.files[0]) {
+      bundleUploadStatus.className = "err";
+      bundleUploadStatus.textContent = "select a .zip file first";
+      return;
+    }
+    const file = bundleFile.files[0];
+    bundleUploadStatus.className = "muted";
+    bundleUploadStatus.textContent = "uploading...";
+    try {
+      const buf = await file.arrayBuffer();
+      const res = await fetch("/api/bundles/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/zip" },
+        body: buf,
+      });
+      let data;
+      try { data = await res.json(); } catch (e) { data = { error: "invalid JSON response" }; }
+      if (!res.ok || (data && data.uploaded === false)) {
+        bundleUploadStatus.className = "err";
+        bundleUploadStatus.textContent = "upload failed: " + ((data && data.error) || res.status);
+        return;
+      }
+      bundleUploadStatus.className = "muted";
+      bundleUploadStatus.textContent = "uploaded " + data.name + " " + data.version;
+      bundleFile.value = "";
+      loadBundles();
+    } catch (err) {
+      bundleUploadStatus.className = "err";
+      bundleUploadStatus.textContent = "upload error: " + err;
+    }
+  }
+
+  async function validateBundle(name) {
+    if (!name) return;
+    bundleValidateOutput.className = "muted";
+    bundleValidateOutput.textContent = "validating...";
+    const res = await fetchJson("/api/bundles/" + encodeURIComponent(name) + "/validate");
+    const data = res.data || {};
+    bundleValidateOutput.className = (data && data.ok) ? "muted" : "err";
+    bundleValidateOutput.textContent = JSON.stringify(data, null, 2);
+  }
+
+  if (bundleUploadBtn) bundleUploadBtn.addEventListener("click", uploadBundle);
+
+  loadBundles();
   loadRoadmaps();
   refresh();
   autoTimer = setInterval(refresh, 3000);

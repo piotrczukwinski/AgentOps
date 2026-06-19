@@ -113,6 +113,35 @@ class WebRenderTests(unittest.TestCase):
         self.assertNotIn("shell", html.lower().split("style")[1].split("</style>")[0])
 
 
+class FrontendBundlesTests(unittest.TestCase):
+    """T6 frontend contracts: bundles + run-launcher flags render into HTML.
+
+    These are pure HTML-string assertions (no browser); they match the
+    existing :class:`WebRenderTests` pattern.
+    """
+
+    def test_render_has_bundle_and_run_anchors(self) -> None:
+        html = web.render_index_html()
+        # New anchors required for the Bundles page and Run Launcher.
+        self.assertIn("/api/bundles", html)
+        self.assertIn("/api/runs", html)
+        self.assertIn("bundle-upload-btn", html)
+        self.assertIn("bundle-validate-btn", html)
+        self.assertIn("run-autonomous", html)
+        # The title and legacy endpoints must still be present.
+        self.assertIn("AgentOps Local UI", html)
+        self.assertIn("/api/status", html)
+        self.assertIn("/api/plan", html)
+        self.assertIn("/api/run", html)
+
+    def test_render_has_operator_runs_stream_anchor(self) -> None:
+        html = web.render_index_html()
+        # T7 will wire a real live stream button; for T6 we only require the
+        # word "stream" to be reachable in the rendered template so the
+        # follow-up task can replace the placeholder with a real button.
+        self.assertIn("stream", html)
+
+
 class WebSafetyTests(unittest.TestCase):
     def test_is_loopback_host(self) -> None:
         self.assertTrue(web.is_loopback_host("127.0.0.1"))
