@@ -69,12 +69,25 @@ class _WatchdogFakeRunner:
 
     name = "watchdog-fake"
 
-    def __init__(self, failure_category: str | None) -> None:
-        self.failure_category = failure_category
+    def __init__(
+        self,
+        failure_category: str | None | list[str | None],
+        *,
+        write_diff_on_calls: set[int] | None = None,
+    ) -> None:
+        if isinstance(failure_category, list):
+            self.failure_categories = list(failure_category)
+        else:
+            self.failure_categories = [failure_category]
         self.calls: list[dict[str, object]] = []
+        self.write_diff_on_calls = write_diff_on_calls or set()
 
     def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[no-untyped-def]
-        self.calls.append({"kwargs": dict(kwargs), "artifact_dir": str(artifact_dir)})
+        index = len(self.calls)
+        failure_category = self.failure_categories[min(index, len(self.failure_categories) - 1)]
+        self.calls.append({"kwargs": dict(kwargs), "artifact_dir": str(artifact_dir), "prompt": prompt})
+        if index in self.write_diff_on_calls:
+            (cwd / "out.txt").write_text("partial diff from stalled executor\n", encoding="utf-8")
         stdout_path = artifact_dir / "executor.stdout.log"
         stderr_path = artifact_dir / "executor.stderr.log"
         combined_path = artifact_dir / "executor.combined.log"
@@ -90,9 +103,9 @@ class _WatchdogFakeRunner:
             started_at=utc_now(),
             ended_at=utc_now(),
             combined_log_path=combined_path,
-            failure_category=self.failure_category,
-            idle_for_seconds=7.0 if self.failure_category == "executor_idle_timeout" else None,
-            startup_for_seconds=11.0 if self.failure_category == "executor_no_output_startup" else None,
+            failure_category=failure_category,
+            idle_for_seconds=7.0 if failure_category == "executor_idle_timeout" else None,
+            startup_for_seconds=11.0 if failure_category == "executor_no_output_startup" else None,
             watchdog_log_size_bytes=42,
         )
 
@@ -136,6 +149,12 @@ def _build_roadmap(parent: Path, repo: Path, *, with_x_allow_empty_diff: bool = 
         payload["tasks"][0]["x_allow_empty_diff"] = True
     roadmap_path.write_text(json.dumps(payload), encoding="utf-8")
     return roadmap_path
+
+
+def _set_max_attempts(roadmap_path: Path, max_attempts: int) -> None:
+    payload = json.loads(roadmap_path.read_text(encoding="utf-8"))
+    payload["defaults"]["max_attempts"] = max_attempts
+    roadmap_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _setup_state_and_roadmap(tmp: Path):
@@ -236,6 +255,92 @@ class WatchdogBlockTests(unittest.TestCase):
             summary = export_summary(state, roadmap.roadmap_id)
             self.assertIn("executor_idle_timeout", summary)
             self.assertIn("**Run verdict:** `blocked`", summary)
+
+    def test_idle_timeout_retries_with_continuation_prompt_when_attempts_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = _init_repo(tmp)
+            (repo / "out.txt").write_text("ok\n", encoding="utf-8")
+            _git(repo, "add", "out.txt")
+            _git(repo, "commit", "-m", "seed out")
+            state_dir = tmp / "state"
+            state_dir.mkdir()
+            state = StateStore(state_dir / "state.sqlite")
+            roadmap_path = _build_roadmap(tmp, repo)
+            _set_max_attempts(roadmap_path, 2)
+            roadmap = load_roadmap(roadmap_path)
+            runner = _WatchdogFakeRunner(["executor_idle_timeout", None])
+            options = RunOptions(
+                no_codex=True,
+                autonomous=True,
+                artifacts_root=state_dir / "artifacts",
+                workspaces_root=state_dir / "workspaces",
+                executor_startup_timeout=None,
+                executor_idle_timeout=900.0,
+            )
+            orchestrator = Orchestrator(state, options, shell_runner=runner)
+            orchestrator.run_roadmap(roadmap)
+
+            row = dict(state.task_rows(roadmap.roadmap_id)[0])
+            self.assertIn(row["state"], {"accepted", "merged"})
+            self.assertEqual(row["current_attempt"], 2)
+            self.assertEqual(len(runner.calls), 2)
+            second_prompt = str(runner.calls[1]["prompt"])
+            self.assertIn("executor continuation task", second_prompt)
+            self.assertIn("Continue from the existing worktree", second_prompt)
+            self.assertIn("executor touched stdout", second_prompt)
+            with state.connect() as conn:
+                events = [
+                    item["type"]
+                    for item in conn.execute(
+                        "SELECT type FROM events WHERE task_id='WG1' ORDER BY seq"
+                    ).fetchall()
+                ]
+            self.assertIn("task.executor_idle_timeout", events)
+            self.assertIn("task.executor_idle_retry", events)
+
+    def test_idle_timeout_with_partial_diff_skips_executor_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = _init_repo(tmp)
+            (repo / "out.txt").write_text("ok\n", encoding="utf-8")
+            _git(repo, "add", "out.txt")
+            _git(repo, "commit", "-m", "seed out")
+            state_dir = tmp / "state"
+            state_dir.mkdir()
+            state = StateStore(state_dir / "state.sqlite")
+            roadmap_path = _build_roadmap(tmp, repo, with_x_allow_empty_diff=False)
+            _set_max_attempts(roadmap_path, 2)
+            roadmap = load_roadmap(roadmap_path)
+            runner = _WatchdogFakeRunner(
+                "executor_idle_timeout",
+                write_diff_on_calls={0},
+            )
+            options = RunOptions(
+                no_codex=True,
+                autonomous=True,
+                artifacts_root=state_dir / "artifacts",
+                workspaces_root=state_dir / "workspaces",
+                executor_startup_timeout=None,
+                executor_idle_timeout=900.0,
+            )
+            orchestrator = Orchestrator(state, options, shell_runner=runner)
+            orchestrator.run_roadmap(roadmap)
+
+            row = dict(state.task_rows(roadmap.roadmap_id)[0])
+            self.assertIn(row["state"], {"accepted", "merged"})
+            self.assertEqual(row["current_attempt"], 1)
+            self.assertEqual(len(runner.calls), 1)
+            with state.connect() as conn:
+                events = [
+                    item["type"]
+                    for item in conn.execute(
+                        "SELECT type FROM events WHERE task_id='WG1' ORDER BY seq"
+                    ).fetchall()
+                ]
+            self.assertIn("task.executor_idle_timeout", events)
+            self.assertIn("task.executor_idle_partial_diff", events)
+            self.assertNotIn("task.executor_idle_retry", events)
 
     def test_no_failure_category_keeps_passing_path(self) -> None:
         """Sanity check: when the runner reports ok and no failure_category,

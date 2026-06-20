@@ -212,11 +212,10 @@ class PromptCompiler:
     ) -> str:
         """Build the bounded write-pass prompt for a REQUEST_CHANGES self-fix.
 
-        The constraint is enforced UPSTREAM by this prompt: the reviewer is
-        told the line budget and the allowed_files, and is instructed to
-        make NO change and emit ``AGENTOPS_SELF_FIX_SKIP: <reason>`` when
-        the fix will not fit or is ambiguous. This avoids paying for a
-        large edit that AgentOps would then reject.
+        The prompt asks the reviewer to decide whether the fix is a good
+        self-fix candidate. The line budget is guidance for that decision,
+        while the orchestrator still enforces allowed files, validations,
+        and re-review after any edit.
         """
         blocking_lines: list[str] = []
         for index, issue in enumerate(verdict.blocking_issues or (), start=1):
@@ -241,19 +240,20 @@ class PromptCompiler:
                 "You now have ONE bounded write pass to apply the fix YOURSELF.",
                 "Apply the MINIMAL edit that resolves the blocking issues below.",
                 "",
-                "# Hard budget (enforced upstream - read carefully)",
-                f"- You may change AT MOST ~{max_lines} lines in total (added + removed).",
+                "# Scope decision",
+                f"- Target a small/medium fix, roughly around {max_lines} changed lines when practical.",
+                "- If the correct fix is larger but still clearly scoped, you may apply it.",
                 "- Edit ONLY files listed under Allowed files. Any other file is out of scope.",
                 "- Do NOT refactor, rename, reformat, reorder, or 'improve' anything else.",
                 "- Do NOT weaken or remove existing tests or validations.",
                 "- Make the smallest possible change that fixes the reported issues.",
                 "",
-                "# If the fix does not fit the budget",
-                "If the correct fix is larger than the budget, or is ambiguous, or needs",
-                "architectural judgement: make NO file changes and instead print exactly:",
+                "# If the fix is too large or ambiguous",
+                "If the correct fix is large, ambiguous, risky, or needs architectural judgement:",
+                "make NO file changes and instead print exactly:",
                 f"    {SELF_FIX_SKIP_MARKER}: <short reason>",
                 "AgentOps will then fall back to the executor. Skipping is the correct",
-                "choice for non-trivial fixes; do NOT attempt a partial or large edit.",
+                "choice for broad repairs; do NOT attempt a partial edit.",
                 "",
                 "# Allowed files (edit only these)",
                 _bullet(task.allowed_files) or "- (none)",
@@ -286,6 +286,45 @@ class PromptCompiler:
                 _bullet(task.allowed_files),
                 "# Validation failure",
                 details or "Unknown validation failure.",
+            ]
+        )
+
+    def repair_prompt_from_executor_idle(
+        self,
+        task: TaskConfig,
+        *,
+        idle_for_seconds: float | None,
+        combined_log_tail: str,
+        diff_stat: str,
+    ) -> str:
+        """Build a continuation prompt after an executor idle watchdog fires."""
+        idle_text = "unknown"
+        if idle_for_seconds is not None:
+            idle_text = f"{idle_for_seconds:.0f}"
+        return "\n".join(
+            [
+                "# AgentOps executor continuation task",
+                "The previous executor attempt was terminated because its log stopped growing.",
+                "Continue from the existing worktree. Do not restart from scratch.",
+                "Keep the scope narrow and address the original task plus any unfinished work.",
+                "",
+                "# Original task id",
+                task.id,
+                "# Allowed files",
+                _bullet(task.allowed_files),
+                "",
+                "# Idle timeout",
+                f"idle_for_seconds: {idle_text}",
+                "",
+                "# Current diff stat",
+                diff_stat.strip() or "(no diff yet)",
+                "",
+                "# Previous executor log tail",
+                combined_log_tail.strip() or "(no log output captured)",
+                "",
+                "# Completion requirements",
+                "Run the required validations, commit on the task branch if instructed,",
+                "and print a valid AGENTOPS_RESULT_JSON result block when done.",
             ]
         )
 

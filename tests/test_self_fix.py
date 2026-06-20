@@ -117,9 +117,9 @@ class SelfFixPromptTests(unittest.TestCase):
             version=1, roadmap_id="r", repo=RepoConfig(id="r", path=Path("/tmp")), tasks=(self._task(),)
         )
         text = PromptCompiler(PolicyEngine(roadmap)).self_fix_prompt(self._task(), verdict, max_lines=25)
-        # Budget is communicated upstream.
-        self.assertIn("~25 lines", text)
-        self.assertIn("AT MOST", text)
+        # Size guidance is communicated upstream, without making it a hard stop.
+        self.assertIn("roughly around 25 changed lines", text)
+        self.assertIn("you may apply it", text)
         # Allowed files are listed.
         self.assertIn("widget.py", text)
         # Skip mechanism is documented.
@@ -230,6 +230,49 @@ class SelfFixOrchestratorTests(unittest.TestCase):
             # The self-fix edit landed in the worktree.
             self.assertEqual(_workspaces_outtxt(root), "v2\n")
             events = [e["type"] for e in state.latest_events(50) if e["task_id"] == "T1"]
+            self.assertIn("task.self_fix_accepted", events)
+
+    def test_self_fix_size_over_guideline_can_still_be_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap = load_roadmap(_write_rc_roadmap(root, repo))
+            state = StateStore(root / "state.sqlite")
+
+            def apply(cwd: Path) -> str:
+                text = "".join(f"line {index}\n" for index in range(50))
+                (cwd / "out.txt").write_text(text, encoding="utf-8")
+                return "applied a scoped medium fix"
+
+            fake = _SelfFixFakeCodex(
+                [
+                    ScriptedVerdict(
+                        verdict="REQUEST_CHANGES",
+                        summary="needs more content",
+                        repair_prompt="write all required lines",
+                    ),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ],
+                self_fix_fn=apply,
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+            )
+            orch.run_roadmap(roadmap)
+
+            row = state.task_rows("sf")[0]
+            self.assertEqual(row["state"], "accepted")
+            self.assertEqual(row["current_attempt"], 1)
+            self.assertEqual(len(fake.self_fix_calls), 1)
+            self.assertEqual(len(fake.calls), 2)
+            events = [e["type"] for e in state.latest_events(50) if e["task_id"] == "T1"]
+            self.assertIn("task.self_fix_size_exceeded", events)
             self.assertIn("task.self_fix_accepted", events)
 
     def test_self_fix_skip_falls_back_to_executor(self) -> None:

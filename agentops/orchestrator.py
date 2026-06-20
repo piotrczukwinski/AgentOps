@@ -14,6 +14,7 @@ returns a structured JSON verdict.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,8 +23,8 @@ from typing import Any
 from .artifacts import ArtifactStore
 from .budget import BudgetManager
 from .git_ops import (
-    IntegrationBranchBlocked,
     CherryPickConflict,
+    IntegrationBranchBlocked,
     branch_exists,
     branch_for_task,
     collect_diff,
@@ -34,7 +35,6 @@ from .git_ops import (
     is_git_repo,
     is_protected_branch,
     merge_integration,
-    prune_worktrees,
     push,
     rev_parse,
     worktree_is_clean,
@@ -47,11 +47,10 @@ from .models import (
     RoadmapConfig,
     TaskConfig,
     TaskState,
-    TERMINAL_STATES,
 )
 from .policy import PolicyEngine
 from .prompting import PromptCompiler
-from .repo_lock import RunAlreadyLockedError, acquire_run_lock
+from .repo_lock import acquire_run_lock
 from .review import (
     CodexReviewService,
     HeuristicReviewer,
@@ -373,6 +372,13 @@ class Orchestrator:
             if resume and task_states.get(task.id) in RESUME_SKIP_STATES:
                 completed += 1
                 continue
+            if (
+                resume
+                and task_states.get(task.id) == TaskState.REVIEW_COMPLETED.value
+                and self._finalize_resumed_review(roadmap, task)
+            ):
+                completed += 1
+                continue
             task_budget = budget.can_start_task()
             if not task_budget.allowed:
                 self.state.transition_task(
@@ -665,7 +671,25 @@ class Orchestrator:
                     },
                 )
                 return
+            executor_idle_partial_diff = False
             if result.failure_category == EXECUTOR_IDLE_TIMEOUT:
+                combined_log_tail = ""
+                if result.combined_log_path is not None and result.combined_log_path.exists():
+                    try:
+                        combined_log_tail = result.combined_log_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )[-8000:]
+                    except OSError:
+                        combined_log_tail = ""
+                try:
+                    idle_diff = collect_diff(
+                        target_worktree,
+                        roadmap.repo.base_branch,
+                        base_sha=runtime.base_sha,
+                    )
+                    idle_diff_stat = idle_diff.stat
+                except Exception:  # noqa: BLE001 - recovery prompt is best-effort
+                    idle_diff_stat = ""
                 self._record_roadmap_event(
                     roadmap, "task.executor_idle_timeout", task.id,
                     extra={
@@ -679,29 +703,78 @@ class Orchestrator:
                         "attempt": attempt_no,
                     },
                 )
-                self.state.transition_task(
-                    roadmap.roadmap_id,
-                    task.id,
-                    TaskState.BLOCKED,
-                    {
-                        "reason": EXECUTOR_IDLE_TIMEOUT,
-                        "failure_category": EXECUTOR_IDLE_TIMEOUT,
-                        "idle_for_seconds": result.idle_for_seconds,
-                        "watchdog_log_size_bytes": result.watchdog_log_size_bytes,
-                        "combined_log": str(result.combined_log_path) if result.combined_log_path else None,
-                        "stdout_log": str(result.stdout_path),
-                        "stderr_log": str(result.stderr_path),
-                        "attempt": attempt_no,
-                        "hint": (
-                            "Executor stalled mid-run: combined log stopped growing for longer "
-                            "than the idle window. Inspect the executor logs with "
-                            "`agentops task-tail <task-id> --follow` or `agentops logs <task-id>`. "
-                            "If the executor is alive but the run is slow, raise "
-                            "--executor-idle-timeout."
-                        ),
-                    },
-                )
-                return
+                if idle_diff_stat.strip():
+                    executor_idle_partial_diff = True
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.executor_idle_partial_diff",
+                        task.id,
+                        extra={
+                            "attempt": attempt_no,
+                            "failure_category": EXECUTOR_IDLE_TIMEOUT,
+                            "diff_stat": idle_diff_stat,
+                        },
+                    )
+                elif attempt_no < max_attempts:
+                    runtime.repair_prompt = compiler.repair_prompt_from_executor_idle(
+                        task,
+                        idle_for_seconds=result.idle_for_seconds,
+                        combined_log_tail=combined_log_tail,
+                        diff_stat=idle_diff_stat,
+                    )
+                    repair_path = artifact_store.write_text(
+                        attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                    )
+                    self.state.record_artifact(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "repair_prompt",
+                        repair_path,
+                        artifact_store.sha256(repair_path),
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.REPAIR_PROMPT_READY,
+                        {
+                            "reason": EXECUTOR_IDLE_TIMEOUT,
+                            "failure_category": EXECUTOR_IDLE_TIMEOUT,
+                            "attempt": attempt_no,
+                            "next_attempt": attempt_no + 1,
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.executor_idle_retry",
+                        task.id,
+                        extra={"attempt": attempt_no, "next_attempt": attempt_no + 1},
+                    )
+                    continue
+                else:
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.BLOCKED,
+                        {
+                            "reason": EXECUTOR_IDLE_TIMEOUT,
+                            "failure_category": EXECUTOR_IDLE_TIMEOUT,
+                            "idle_for_seconds": result.idle_for_seconds,
+                            "watchdog_log_size_bytes": result.watchdog_log_size_bytes,
+                            "combined_log": str(result.combined_log_path) if result.combined_log_path else None,
+                            "stdout_log": str(result.stdout_path),
+                            "stderr_log": str(result.stderr_path),
+                            "attempt": attempt_no,
+                            "hint": (
+                                "Executor stalled mid-run: combined log stopped growing "
+                                "for longer than the idle window. Inspect the executor "
+                                "logs with `agentops task-tail <task-id> --follow` or "
+                                "`agentops logs <task-id>`. If the executor is alive but "
+                                "the run is slow, raise --executor-idle-timeout."
+                            ),
+                        },
+                    )
+                    return
 
             if task.execution_mode == "gitless_mirror" and runtime.mirror is not None:
                 copy_allowed_files_back(runtime.mirror, target_worktree, task.allowed_files)
@@ -763,7 +836,8 @@ class Orchestrator:
             #
             # AO-AUDIT-003 (B5): the guard is now ON BY DEFAULT for
             # ``kind == "implementation"`` tasks whose executor is an
-            # agent (``opencode``/``minimax``/``minimax-m3``) so a
+            # agent (``opencode``/``minimax``/``minimax-m3``/``claude``)
+            # so a
             # silent exit 0 with no AGENTOPS_RESULT_JSON marker is
             # never accepted as a real completion. Shell executors
             # are exempt because their result is the exit code, not
@@ -776,7 +850,7 @@ class Orchestrator:
             if (
                 task.require_executor_result is None
                 and task.kind == "implementation"
-                and task.executor in {"opencode", "minimax", "minimax-m3"}
+                and task.executor in {"opencode", "minimax", "minimax-m3", "claude", "claude-minimax"}
             ):
                 _result_guard_enabled = True
             if _result_guard_enabled and result.ok and result.stdout_path is not None:
@@ -863,7 +937,7 @@ class Orchestrator:
             )
 
             # Validation failure: deterministic repair first, then reviewer triage.
-            if not result.ok or not validation.ok:
+            if (not result.ok and not executor_idle_partial_diff) or not validation.ok:
                 if attempt_no < max_attempts:
                     runtime.repair_prompt = compiler.repair_prompt_from_validation(task, validation)
                     repair_path = artifact_store.write_text(
@@ -1391,10 +1465,8 @@ class Orchestrator:
         pre_snap = snapshot_working_files(target_worktree)
 
         def _fallback(reason: str, *, skipped: bool = False) -> SelfFixOutcome:
-            try:
+            with contextlib.suppress(Exception):
                 restore_working_files(target_worktree, pre_snap)
-            except Exception:  # noqa: BLE001 - cleanup must never mask the real reason
-                pass
             return SelfFixOutcome(accepted=False, reason=reason, skipped=skipped)
 
         try:
@@ -1413,13 +1485,11 @@ class Orchestrator:
             )
             return _fallback("self_fix_error")
 
-        try:
+        with contextlib.suppress(Exception):
             self.state.record_artifact(
                 roadmap.roadmap_id, task.id, attempt_id, "self_fix_result", result.stdout_path,
                 artifact_store.sha256(result.stdout_path),
             )
-        except Exception:  # noqa: BLE001
-            pass
 
         # 1. Skip marker: the reviewer decided the fix is too big / ambiguous.
         try:
@@ -1445,14 +1515,16 @@ class Orchestrator:
             )
             return _fallback("self_fix_out_of_scope")
 
-        # 3. Size backstop (the prompt self-limits; this catches misjudgement).
+        # 3. Size telemetry. The reviewer decides whether the repair is too
+        # broad and can opt out with SELF_FIX_SKIP before editing. Once the
+        # work has been paid for, line count alone should not discard an
+        # in-scope fix that still passes validation and re-review.
         delta = changed_line_count(post_diff.patch) - pre_lines
         if delta > max_lines:
             self.state.event(
-                roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_too_large",
+                roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_size_exceeded",
                 {"delta": delta, "max_lines": max_lines},
             )
-            return _fallback("self_fix_too_large")
 
         # No change at all and no skip marker: treat as a no-op fallback.
         if delta <= 0 and not post_diff.changed_files:
@@ -1642,14 +1714,29 @@ class Orchestrator:
                 commit_cwd = runtime.mirror
             target_sha = commit(commit_cwd, task.commit_message or f"agentops: {task.id}")
             if not target_sha:
-                # Nothing to merge.
-                self.state.transition_task(
-                    roadmap.roadmap_id,
-                    task.id,
-                    TaskState.ACCEPTED,
-                    {"branch": branch, "head_sha": None, "integration_branch": integration_branch, "no_changes": True},
-                )
-                return True
+                current_head = rev_parse(commit_cwd, "HEAD")
+                if runtime.base_sha and current_head != runtime.base_sha:
+                    # The executor may have committed its own changes.
+                    # In that case the worktree is clean, so ``commit()``
+                    # returns None, but there is still a task-branch commit
+                    # that must be merged into the integration branch.
+                    target_sha = current_head
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        None,
+                        "task.existing_commit_detected",
+                        {"head_sha": target_sha, "base_sha": runtime.base_sha},
+                    )
+                else:
+                    # Nothing to merge.
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.ACCEPTED,
+                        {"branch": branch, "head_sha": None, "integration_branch": integration_branch, "no_changes": True},
+                    )
+                    return True
 
         try:
             new_sha = merge_integration(
@@ -1679,7 +1766,7 @@ class Orchestrator:
             TaskState.MERGED,
             {
                 "branch": branch,
-                "head_sha": head_sha,
+                "head_sha": target_sha,
                 "integration_branch": integration_branch,
                 "integration_head_sha": new_sha,
                 "strategy": merge_policy.strategy,
@@ -1752,7 +1839,10 @@ class Orchestrator:
 
         if task.executor == "shell" and self._injected_shell_runner is not None:
             return self._injected_shell_runner
-        if task.executor in {"opencode", "minimax", "minimax-m3"} and self._injected_opencode_runner is not None:
+        if (
+            task.executor in {"opencode", "minimax", "minimax-m3", "claude", "claude-minimax"}
+            and self._injected_opencode_runner is not None
+        ):
             return self._injected_opencode_runner
         return runner_for(task)
 
@@ -1804,6 +1894,27 @@ class Orchestrator:
             task_id = row["id"]
             current = row["state"]
             if current in RESUME_INFLIGHT_STATES:
+                reviewed = self._latest_reviewed_attempt(roadmap.roadmap_id, task_id)
+                if reviewed and reviewed.get("verdict") == "ACCEPT":
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task_id,
+                        TaskState.REVIEW_COMPLETED,
+                        {
+                            "verdict": "ACCEPT",
+                            "reviewer": reviewed.get("reviewer"),
+                            "recovered_from": current,
+                            "reason": "resume_finalize",
+                        },
+                    )
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task_id,
+                        reviewed.get("attempt_id"),
+                        "task.recovered_for_finalize",
+                        {"recovered_from": current},
+                    )
+                    continue
                 self.state.transition_task(
                     roadmap.roadmap_id,
                     task_id,
@@ -1817,6 +1928,110 @@ class Orchestrator:
                     "task.recovered_for_resume",
                     {"recovered_from": current},
                 )
+
+    def _latest_reviewed_attempt(self, roadmap_id: str, task_id: str) -> dict[str, Any] | None:
+        with self.state.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  attempts.id AS attempt_id,
+                  attempts.workspace_path,
+                  attempts.branch,
+                  attempts.base_sha,
+                  reviews.reviewer,
+                  reviews.result_path,
+                  reviews.verdict,
+                  reviews.usage_json
+                FROM reviews
+                JOIN attempts ON attempts.id = reviews.attempt_id
+                WHERE reviews.roadmap_id=? AND reviews.task_id=? AND reviews.verdict IS NOT NULL
+                ORDER BY reviews.created_at DESC
+                LIMIT 1
+                """,
+                (roadmap_id, task_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def _verdict_from_reviewed_attempt(self, reviewed: dict[str, Any]) -> ReviewVerdict:
+        raw: dict[str, Any] = {}
+        result_path = reviewed.get("result_path")
+        if result_path:
+            path = Path(str(result_path))
+            if path.exists():
+                try:
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        raw = loaded
+                except (OSError, json.JSONDecodeError):
+                    raw = {}
+        if not raw:
+            try:
+                loaded = json.loads(str(reviewed.get("usage_json") or "{}"))
+                if isinstance(loaded, dict):
+                    raw = loaded
+            except json.JSONDecodeError:
+                raw = {}
+        return ReviewVerdict(
+            verdict=str(reviewed.get("verdict") or raw.get("verdict") or ""),
+            confidence=str(raw.get("confidence") or "low"),
+            summary=str(raw.get("summary") or ""),
+            blocking_issues=tuple(raw.get("blocking_issues") or ()),
+            repair_prompt=str(raw.get("repair_prompt") or ""),
+            safe_to_push=bool(raw.get("safe_to_push", False)),
+            safe_to_merge=bool(raw.get("safe_to_merge", False)),
+            raw=raw,
+        )
+
+    def _finalize_resumed_review(self, roadmap: RoadmapConfig, task: TaskConfig) -> bool:
+        reviewed = self._latest_reviewed_attempt(roadmap.roadmap_id, task.id)
+        if not reviewed or reviewed.get("verdict") != "ACCEPT":
+            return False
+        workspace_raw = reviewed.get("workspace_path")
+        branch = reviewed.get("branch")
+        if not workspace_raw or not branch:
+            return False
+        workspace = Path(str(workspace_raw))
+        if not workspace.exists():
+            return False
+
+        runtime = _TaskRuntime(
+            workspace=workspace,
+            branch=str(branch),
+            base_sha=str(reviewed.get("base_sha") or ""),
+        )
+        attempt_id = str(reviewed["attempt_id"])
+        artifact_root = self.options.artifacts_root or (roadmap.repo.path / ".agentops")
+        artifact_store = ArtifactStore(artifact_root)
+        verdict = self._verdict_from_reviewed_attempt(reviewed)
+        self.state.event(
+            roadmap.roadmap_id,
+            task.id,
+            attempt_id,
+            "task.resume_finalize_started",
+            {"verdict": verdict.verdict, "branch": branch},
+        )
+        finalized = self._finalize(
+            roadmap=roadmap,
+            task=task,
+            target_worktree=workspace,
+            branch=str(branch),
+            artifact_store=artifact_store,
+            attempt_dir=workspace,
+            attempt_id=attempt_id,
+            verdict=verdict,
+            runtime=runtime,
+        )
+        if finalized:
+            self.state.event(
+                roadmap.roadmap_id,
+                task.id,
+                attempt_id,
+                "task.resume_finalize_completed",
+                {"branch": branch},
+            )
+        return finalized
 
     def _record_roadmap_finished(self, roadmap: RoadmapConfig) -> None:
         rows = self.state.task_rows(roadmap.roadmap_id)

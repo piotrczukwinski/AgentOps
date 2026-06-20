@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import shutil
 import subprocess
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -359,6 +360,27 @@ def ensure_integration_branch(repo: Path, integration_branch: str, base_branch: 
         run_git(repo, ["branch", integration_branch, base_branch])
 
 
+@contextlib.contextmanager
+def _detached_worktree(repo: Path, ref: str):
+    """Create a temporary detached worktree for branch finalization.
+
+    Integration merges must not checkout branches in the operator's
+    main worktree. That worktree can legitimately contain unrelated
+    local edits while an AgentOps run is finalizing task branches.
+    """
+    with tempfile.TemporaryDirectory(prefix="agentops-merge-") as tmp:
+        worktree = Path(tmp) / "worktree"
+        run_git(repo, ["worktree", "add", "--detach", str(worktree), ref])
+        try:
+            yield worktree
+        finally:
+            run_git(repo, ["worktree", "remove", "--force", str(worktree)], check=False)
+
+
+def _advance_branch(repo: Path, branch: str, new_sha: str, old_sha: str) -> None:
+    run_git(repo, ["update-ref", f"refs/heads/{branch}", new_sha, old_sha])
+
+
 def fast_forward_merge(repo: Path, integration_branch: str, task_branch: str) -> None:
     """Fast-forward ``integration_branch`` to ``task_branch``.
 
@@ -372,20 +394,15 @@ def fast_forward_merge(repo: Path, integration_branch: str, task_branch: str) ->
         )
     if not branch_exists(repo, task_branch):
         raise RuntimeError(f"task branch {task_branch!r} does not exist in {repo}")
-    run_git(repo, ["checkout", "--quiet", integration_branch])
-    try:
-        result = run_git(repo, ["merge", "--ff-only", task_branch], check=False)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"fast-forward merge of {task_branch!r} into {integration_branch!r} failed: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
-            )
-    finally:
-        # Always return the repo to the original branch to keep subsequent
-        # operations predictable.
-        previous = run_git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False).stdout.strip()
-        if previous and previous != f"refs/heads/{integration_branch}":
-            run_git(repo, ["checkout", "--quiet", previous.removeprefix("refs/heads/")])
+    base_sha = rev_parse(repo, integration_branch)
+    target_sha = rev_parse(repo, task_branch)
+    result = run_git(repo, ["merge-base", "--is-ancestor", base_sha, target_sha], check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"fast-forward merge of {task_branch!r} into {integration_branch!r} failed: "
+            f"{integration_branch!r} is not an ancestor of {task_branch!r}"
+        )
+    _advance_branch(repo, integration_branch, target_sha, base_sha)
 
 
 def cherry_pick_into(repo: Path, integration_branch: str, sha: str) -> str:
@@ -402,20 +419,17 @@ def cherry_pick_into(repo: Path, integration_branch: str, sha: str) -> str:
         )
     if not sha:
         raise ValueError("cherry_pick_into requires a non-empty commit SHA")
-    previous = current_branch(repo) or run_git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False).stdout.strip().removeprefix("refs/heads/")
-    run_git(repo, ["checkout", "--quiet", integration_branch])
-    try:
-        result = run_git(repo, ["cherry-pick", "--no-edit", sha], check=False)
+    base_sha = rev_parse(repo, integration_branch)
+    with _detached_worktree(repo, base_sha) as worktree:
+        result = run_git(worktree, ["cherry-pick", "--no-edit", sha], check=False)
         if result.returncode != 0:
-            run_git(repo, ["cherry-pick", "--abort"], check=False)
+            run_git(worktree, ["cherry-pick", "--abort"], check=False)
             raise CherryPickConflict(
                 f"cherry-pick of {sha!r} into {integration_branch!r} failed (likely conflict)"
             )
-        new_sha = rev_parse(repo, "HEAD")
-        return new_sha
-    finally:
-        if previous and previous != integration_branch:
-            run_git(repo, ["checkout", "--quiet", previous])
+        new_sha = rev_parse(worktree, "HEAD")
+    _advance_branch(repo, integration_branch, new_sha, base_sha)
+    return new_sha
 
 
 def merge_integration(
@@ -444,19 +458,17 @@ def merge_integration(
         fast_forward_merge(repo, integration_branch, task_branch)
         return rev_parse(repo, integration_branch)
     if strategy == "no_ff":
-        previous = current_branch(repo) or ""
-        run_git(repo, ["checkout", "--quiet", integration_branch])
-        try:
-            result = run_git(repo, ["merge", "--no-ff", "--no-edit", task_branch], check=False)
+        base_sha = rev_parse(repo, integration_branch)
+        with _detached_worktree(repo, base_sha) as worktree:
+            result = run_git(worktree, ["merge", "--no-ff", "--no-edit", task_branch], check=False)
             if result.returncode != 0:
-                run_git(repo, ["merge", "--abort"], check=False)
+                run_git(worktree, ["merge", "--abort"], check=False)
                 raise RuntimeError(
                     f"no-ff merge of {task_branch!r} into {integration_branch!r} failed"
                 )
-            return rev_parse(repo, integration_branch)
-        finally:
-            if previous and previous != integration_branch:
-                run_git(repo, ["checkout", "--quiet", previous])
+            new_sha = rev_parse(worktree, "HEAD")
+        _advance_branch(repo, integration_branch, new_sha, base_sha)
+        return new_sha
 
     # Default: cherry-pick. Use the tip commit of the task branch.
     tip = rev_parse(repo, task_branch)

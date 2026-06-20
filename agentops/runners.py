@@ -48,6 +48,12 @@ def executor_env() -> dict[str, str]:
     return env
 
 
+def model_executor_env() -> dict[str, str]:
+    env = reviewer_env()
+    env["AGENTOPS_EXECUTOR"] = "1"
+    return env
+
+
 def reviewer_env() -> dict[str, str]:
     # Reviewer can keep model API keys, but must never receive GitHub write tokens.
     env = dict(os.environ)
@@ -147,6 +153,54 @@ class OpenCodeRunner(BaseRunner):
             env=executor_env(),
             startup_timeout=startup_timeout,
             idle_timeout=idle_timeout,
+        )
+
+
+class ClaudeRunner(BaseRunner):
+    def run(
+        self,
+        task: TaskConfig,
+        prompt: str,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        startup_timeout: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
+        prompt_file = artifact_dir / "executor.input.md"
+        prompt_file.write_text(prompt, encoding="utf-8")
+
+        command = [
+            "claude",
+            "--print",
+        ]
+        if yolo_enabled(task):
+            command.append("--dangerously-skip-permissions")
+        options = task.executor_options or {}
+        if isinstance(options, dict):
+            allowed_tools = options.get("allowed_tools") or options.get("allowedTools")
+            if allowed_tools:
+                if isinstance(allowed_tools, str):
+                    command.extend(["--allowedTools", allowed_tools])
+                else:
+                    command.extend(["--allowedTools", ",".join(str(item) for item in allowed_tools)])
+            if bool(options.get("claude_bare")):
+                command.append("--bare")
+            if bool(options.get("pass_model")) and task.model:
+                command.extend(["--model", task.model])
+
+        return run_argv_streaming(
+            command,
+            cwd=cwd,
+            artifact_dir=artifact_dir,
+            stdout_name="executor.stdout.log",
+            stderr_name="executor.stderr.log",
+            combined_name="executor.combined.log",
+            timeout_seconds=task.timeout_seconds,
+            env=model_executor_env(),
+            startup_timeout=startup_timeout,
+            idle_timeout=idle_timeout,
+            stdin_data=prompt,
         )
 
 
@@ -495,6 +549,8 @@ def runner_for(task: TaskConfig) -> BaseRunner:
         return ShellRunner()
     if task.executor in {"opencode", "minimax", "minimax-m3"}:
         return OpenCodeRunner()
+    if task.executor in {"claude", "claude-minimax"}:
+        return ClaudeRunner()
     raise ValueError(f"Unsupported executor {task.executor!r}")
 
 
@@ -796,10 +852,8 @@ def _terminate_process_tree(pid: int) -> None:
     try:
         os.killpg(os.getpgid(pid), 15)
     except (ProcessLookupError, PermissionError, OSError):
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.kill(pid, 15)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
 
 
 def _pump_stream(
@@ -830,10 +884,8 @@ def _pump_stream(
     except Exception:  # noqa: BLE001 - never let the pump crash
         return
     finally:
-        try:
+        with contextlib.suppress(Exception):
             stream.close()
-        except Exception:  # noqa: BLE001 - best-effort close
-            pass
 
 
 def _wait(proc: subprocess.Popen, timeout: float | None) -> None:
@@ -859,10 +911,8 @@ def _wait(proc: subprocess.Popen, timeout: float | None) -> None:
         try:
             proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            try:
+            with contextlib.suppress(Exception):
                 _terminate_process_tree(proc.pid)
-            except Exception:  # noqa: BLE001 - best-effort
-                pass
 
 
 def _run_with_watchdogs(
@@ -876,6 +926,7 @@ def _run_with_watchdogs(
     startup_timeout: float | None,
     idle_timeout: float | None,
     env: dict[str, str] | None,
+    stdin_data: str | None = None,
 ) -> RunnerResult:
     """Shared body for :func:`run_command_streaming` and :func:`run_argv_streaming`.
 
@@ -904,6 +955,7 @@ def _run_with_watchdogs(
             proc = subprocess.Popen(
                 popen_args,
                 cwd=str(cwd),
+                stdin=subprocess.PIPE if stdin_data is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
@@ -915,6 +967,11 @@ def _run_with_watchdogs(
                 # callers get the safe default.
                 start_new_session=True,
             )
+            if stdin_data is not None and proc.stdin is not None:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    proc.stdin.write(stdin_data.encode("utf-8"))
+                with contextlib.suppress(Exception):
+                    proc.stdin.close()
         except FileNotFoundError as exc:
             stderr_fh.write(f"[agentops] failed to launch executor: {exc}\n")
             stderr_fh.flush()
@@ -964,10 +1021,8 @@ def _run_with_watchdogs(
                 _wait(proc, timeout_seconds)
             except KeyboardInterrupt:  # noqa: PERF203 - CLI boundary
                 _terminate_process_tree(proc.pid)
-                try:
+                with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    pass
         finally:
             if idle_watchdog is not None:
                 idle_watchdog.stop()
@@ -981,17 +1036,13 @@ def _run_with_watchdogs(
             # about leaked file descriptors in tests.
             for handle in (proc.stdout, proc.stderr):
                 if handle is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         handle.close()
-                    except Exception:  # noqa: BLE001 - best-effort
-                        pass
             # Reap the child if it is still alive (it should not be,
             # but a defensive ``wait()`` avoids a zombie).
             if proc.poll() is None:
-                try:
+                with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    pass
             # Append a small banner so operator-tail / task-tail can see
             # the run finished marker even if the executor never flushed.
             try:
@@ -1181,6 +1232,7 @@ def run_command_streaming(
         startup_timeout=startup_timeout,
         idle_timeout=idle_timeout,
         env=env,
+        stdin_data=None,
     )
 
 
@@ -1196,6 +1248,7 @@ def run_argv_streaming(
     env: dict[str, str] | None = None,
     startup_timeout: float | None = None,
     idle_timeout: float | None = None,
+    stdin_data: str | None = None,
 ) -> RunnerResult:
     """Run an argv command and stream stdout/stderr to per-attempt log files.
 
@@ -1215,4 +1268,5 @@ def run_argv_streaming(
         startup_timeout=startup_timeout,
         idle_timeout=idle_timeout,
         env=env,
+        stdin_data=stdin_data,
     )
