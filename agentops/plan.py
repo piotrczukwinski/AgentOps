@@ -40,7 +40,15 @@ class PlanReport:
         }
 
 
-KNOWN_EXECUTORS = {"claude", "claude-minimax", "opencode", "minimax", "minimax-m3", "shell"}
+KNOWN_EXECUTORS = {
+    "claude",
+    "claude-minimax",
+    "codex",
+    "opencode",
+    "minimax",
+    "minimax-m3",
+    "shell",
+}
 KNOWN_EXECUTION_MODES = {"worktree_branch", "gitless_mirror"}
 KNOWN_REVIEW_MODES = {"auto", "required", "never", "milestone_only"}
 WRITE_KINDS = {"implementation", "docs", "guard", "test", "refactor", "fix", "config", "script"}
@@ -177,24 +185,20 @@ def _check_executor(task: TaskConfig, errors: list[PlanIssue]) -> None:
             f"Task {task.id} uses shell executor but executor_command is empty.",
             task_id=task.id,
         ))
+    binary: str | None = None
     if task.executor in {"opencode", "minimax", "minimax-m3"}:
         binary = "opencode"
-        if not _which(binary):
-            errors.append(PlanIssue(
-                "task.executor_binary_missing",
-                "error",
-                f"Task {task.id} requires {binary!r} on PATH for executor={task.executor!r}.",
-                task_id=task.id,
-            ))
-    if task.executor in {"claude", "claude-minimax"}:
+    elif task.executor in {"claude", "claude-minimax"}:
         binary = "claude"
-        if not _which(binary):
-            errors.append(PlanIssue(
-                "task.executor_binary_missing",
-                "error",
-                f"Task {task.id} requires {binary!r} on PATH for executor={task.executor!r}.",
-                task_id=task.id,
-            ))
+    elif task.executor == "codex":
+        binary = "codex"
+    if binary and not _which(binary):
+        errors.append(PlanIssue(
+            "task.executor_binary_missing",
+            "error",
+            f"Task {task.id} requires {binary!r} on PATH for executor={task.executor!r}.",
+            task_id=task.id,
+        ))
 
 
 def _check_execution_mode(task: TaskConfig, errors: list[PlanIssue]) -> None:

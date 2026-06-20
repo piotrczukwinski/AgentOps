@@ -17,6 +17,7 @@ from agentops.models import (
 )
 from agentops.runners import (
     ClaudeRunner,
+    CodexExecutorRunner,
     CodexRunner,
     OpenCodeRunner,
     ShellRunner,
@@ -720,6 +721,12 @@ class RunnerForTests(unittest.TestCase):
     def test_routes_minimax_aliases(self) -> None:
         for executor in ("minimax", "minimax-m3"):
             self.assertIsInstance(runner_for(TaskConfig(id="T", kind="x", prompt_path=Path("p"), executor=executor)), OpenCodeRunner)
+
+    def test_routes_codex_executor(self) -> None:
+        self.assertIsInstance(
+            runner_for(TaskConfig(id="T", kind="x", prompt_path=Path("p"), executor="codex")),
+            CodexExecutorRunner,
+        )
 
     def test_routes_shell(self) -> None:
         self.assertIsInstance(
