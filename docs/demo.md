@@ -6,6 +6,12 @@
 > add Codex or OpenCode only if the matching local binary is
 > already on `$PATH`.
 
+If you want to record or review the demo visually, see
+[`docs/demo-recording.md`](demo-recording.md) for the
+reproducible no-API-key recording script and the redaction
+checklist. The recording is optional; this document is the
+source of truth for the demo itself.
+
 ## What this demo proves
 
 * AgentOps installs cleanly on a stock Python 3.11+ venv.
