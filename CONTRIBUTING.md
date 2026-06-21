@@ -17,8 +17,8 @@ AgentOps targets Python **3.11** and **3.12** and ships with a
 standard `pyproject.toml`. No system dependencies are required.
 
 ```bash
-git clone https://github.com/piotrczukwinski/AgentOps.git
-cd AgentOps
+git clone https://github.com/example/repo ~/AgentOps
+cd ~/AgentOps
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .

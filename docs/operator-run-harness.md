@@ -158,7 +158,7 @@ contract: each attempt's `argv` last element is the merged prompt
 ```bash
 python -m agentops operator-status                       # list all runs
 python -m agentops operator-status --run-id <id>         # one run
-python -m agentops operator-status --format json         # JSON for the web/admin panel
+python -m agentops operator-status --format json         # JSON for the Admin / Operator panel
 python -m agentops operator-status --run-id <id> --format json
 ```
 
@@ -199,17 +199,17 @@ The text output also prints:
 * `idle_for_seconds` — how long the log has been idle,
 * `pid_alive` — the liveness of the recorded pid,
 * `suggested_action` — a one-line hint for the operator and the
-  web/admin panel,
+  Admin / Operator panel,
 * the absolute path of `combined.log` and whether `result.json` is
   present.
 
-### JSON output for the web/admin panel
+### JSON output for the Admin / Operator panel
 
 ```bash
 python -m agentops operator-status --run-id <id> --format json
 ```
 
-The `--format json` mode is the contract the future admin web panel
+The `--format json` mode is the contract the Admin / Operator panel
 consumes. The output is a single JSON object (when `--run-id` is
 given) or a JSON array of objects (when listing all runs) with the
 following fields:
@@ -245,8 +245,8 @@ following fields:
 | `runtime_status_note` | string \| null | Human-readable hint |
 | `runtime_status_alias` | string \| null | Legacy `exited`/`succeeded`/`failed` for backward compatibility |
 
-The web/admin panel can read the JSON output, render a status row,
-and use `suggested_action` to pick which action button to show.
+The Admin / Operator panel can read the JSON output, render a status
+row, and use `suggested_action` to pick which action button to show.
 
 ## `operator-stop`
 
@@ -699,7 +699,7 @@ recorded pid is still alive. The runtime overlay reports:
   gone. The legacy `exited` / `succeeded` / `failed` label is
   preserved in `runtime_status_alias` for backward compatibility.
   `suggested_action` is set to `operator-retry` so the operator and
-  the web/admin panel do not have to remember the playbook.
+  the Admin / Operator panel do not have to remember the playbook.
 * `exited_or_stale` when the persisted status is `retrying` or
   `retry_waiting` but the pid is gone.
 * `unknown` when the persisted status is `created` (or has no
@@ -707,8 +707,8 @@ recorded pid is still alive. The runtime overlay reports:
 
 The JSON output (`--format json`) also surfaces the active attempt
 number, the path and size of the active `combined.log`, its
-`last_log_at`, and the wall-clock `idle_for_seconds`. A future
-admin web panel can render a status row from this data and use
+`last_log_at`, and the wall-clock `idle_for_seconds`. The Admin /
+Operator panel renders a status row from this data and uses
 `suggested_action` to pick the right action button.
 
 ### Transient error classifier
@@ -849,7 +849,7 @@ to rewrite the terminal status from `transient_failed` to
   reason `idle_timeout`, the watchdog's `idle_for_seconds`,
   `last_log_at`, and `idle_log_size_bytes` are recorded in
   `status.json`, and `operator-status` exposes them via the JSON
-  output so the web/admin panel can render them.
+  output so the Admin / Operator panel can render them.
 
 The workspace is preserved on disk: the per-run `prompt.md` and
 `command.json` survive a reboot, and each attempt's logs are kept in
@@ -894,9 +894,9 @@ morning checklist that pairs with the local UI's
 `/api/operator-runs` and `/api/operator-runs/<run_id>/tail`
 endpoints.
 
-## Web / admin panel integration
+## Admin / Operator panel integration
 
-A future admin web panel can consume the operator run state without
+The Admin / Operator panel consumes the operator run state without
 re-implementing the runtime overlay or the transient classifier.
 The contract is the JSON output of `operator-status --format json`:
 

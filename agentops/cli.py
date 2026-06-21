@@ -385,7 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
             "pid is gone, the runtime is reported as 'stale_pid' (with the legacy "
             "'exited' label preserved in 'runtime_status_alias' for backward "
             "compatibility) so stale 'running' entries do not mislead the operator. "
-            "Use --format json to consume the same fields from a web/admin panel."
+            "Use --format json to consume the same fields from the Admin / Operator panel."
         ),
     )
     operator_status_cmd.add_argument("--dir", default=".", help="Working directory that owns .operator-runs/. Default: current directory.")
@@ -395,8 +395,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("text", "json"),
         default="text",
         help="Output format. 'text' (default) prints a one-line summary per run; "
-        "'json' prints a JSON object with the fields the web/admin panel can "
-        "consume. With --format json and no --run-id, the output is a JSON array.",
+        "'json' prints a JSON object with the fields the Admin / Operator panel "
+        "can consume. With --format json and no --run-id, the output is a JSON array.",
     )
     operator_status_cmd.add_argument(
         "--reconcile",

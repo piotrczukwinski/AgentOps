@@ -61,7 +61,7 @@ Instances of abusive, harassing, or otherwise unacceptable
 behavior may be reported by opening a private security advisory
 on GitHub:
 
-* `https://github.com/piotrczukwinski/AgentOps/security/advisories/new`
+* `https://github.com/example/repo/security/advisories/new`
 
 or by contacting the maintainer at the address listed in
 [`pyproject.toml`](pyproject.toml). All reports will be reviewed
