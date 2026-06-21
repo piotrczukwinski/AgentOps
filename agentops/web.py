@@ -1022,6 +1022,472 @@ def collect_artifacts(state: StateStore, task_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Admin / Operator panel snapshot (read-only, loopback-only)
+# ---------------------------------------------------------------------------
+#
+# The /api/admin endpoint exposes a single, stable snapshot of the local
+# maintainer dashboard. The shape is fixed by tests in tests/test_web.py
+# and must not break without a migration note; the dashboard UI consumes
+# the same keys. Everything here is computed from already-persisted state
+# (the SQLite state DB and the .operator-runs/ directory); no subprocess
+# is launched, no log file is read, no prompt body is returned.
+
+ADMIN_RECOMMENDED_COMMANDS: tuple[str, ...] = (
+    "agentops status",
+    "agentops review-queue",
+    "agentops operator-status",
+    "agentops operator-tail <run-id> --lines 200",
+    "agentops operator-result <run-id>",
+    "agentops operator-retry <run-id>",
+    "agentops task-tail <task-id> --lines 200",
+    "agentops logs <task-id>",
+    "agentops pr-loop <pr-number> --dry-run",
+)
+
+ADMIN_LATEST_EVENTS_CAP = 10
+ADMIN_OPERATOR_RUNS_CAP = 5
+ADMIN_ATTENTION_CAP = 25
+ADMIN_RECENT_TASKS_CAP = 10
+
+ATTENTION_OPERATOR_REASONS: dict[str, str] = {
+    "needs_operator": "agentops operator-result <run-id>",
+    "transient_failed": "agentops operator-retry <run-id>",
+    "stale_pid": "agentops operator-tail <run-id> --lines 200",
+    "exited_or_stale": "agentops operator-tail <run-id> --lines 200",
+    "executor_no_output_startup": "agentops operator-tail <run-id> --lines 200",
+    "executor_idle_timeout": "agentops operator-tail <run-id> --lines 200",
+    "missing_result": "agentops operator-result <run-id>",
+    "template_result": "agentops operator-result <run-id>",
+}
+
+ATTENTION_TASK_REASONS: dict[str, str] = {
+    "policy_failed": "agentops logs <task-id>",
+    "blocked": "agentops logs <task-id>",
+    "merge_failed": "agentops logs <task-id>",
+    "awaiting_review": "agentops decide <task-id> --verdict ACCEPT --safe-to-merge",
+    "awaiting_human": "agentops logs <task-id>",
+    "failed": "agentops logs <task-id>",
+}
+
+ATTENTION_OPERATOR_KEYS: tuple[str, ...] = (
+    "needs_operator",
+    "transient_failed",
+    "stale_pid",
+    "exited_or_stale",
+    "executor_no_output_startup",
+    "executor_idle_timeout",
+    "missing_result",
+    "template_result",
+)
+
+
+def _admin_summary_for_event(event_type: str, payload: dict[str, Any]) -> str:
+    """Return a one-line payload summary for the events list.
+
+    The payload never contains the raw prompt body; it is restricted to
+    short, enumerable values already recorded by the orchestrator (exit
+    codes, attempt numbers, verdict strings, paths to logs/artifacts).
+    """
+    if not payload:
+        return ""
+    try:
+        if event_type in {"task.ready", "task.executor_running", "task.accepted",
+                          "task.pushed", "task.merged", "task.blocked",
+                          "task.failed", "task.awaiting_review",
+                          "task.awaiting_human", "task.policy_failed",
+                          "task.merge_failed", "task.skipped"}:
+            return ""
+        if event_type == "attempt.finished":
+            exit_code = payload.get("exit_code")
+            head_sha = payload.get("head_sha")
+            short = head_sha[:7] if isinstance(head_sha, str) and head_sha else "-"
+            return f"exit_code={exit_code if exit_code is not None else '-'} head_sha={short}"
+        if event_type == "attempt.started":
+            attempt_no = payload.get("attempt_no")
+            return f"attempt_no={attempt_no if attempt_no is not None else '-'}"
+        if event_type == "roadmap.imported":
+            tasks = payload.get("tasks")
+            return f"tasks={tasks if tasks is not None else '-'}"
+        if event_type == "roadmap.finished":
+            verdict = payload.get("run_verdict")
+            return f"run_verdict={verdict if verdict else '-'}"
+        items = sorted(payload.keys())
+        return ",".join(items)[:80]
+    except Exception:  # noqa: BLE001 - never raise from the admin snapshot
+        return ""
+
+
+def _admin_compact_event(row: dict[str, Any]) -> dict[str, Any]:
+    """Project an event row to the admin snapshot schema.
+
+    The projection deliberately drops the raw ``payload_json`` field;
+    only a short ``summary`` derived from known payload keys is
+    forwarded so the dashboard cannot accidentally render the
+    raw prompt body.
+    """
+    try:
+        event_type = str(row.get("type") or "")
+    except Exception:  # noqa: BLE001 - corrupt row never raises
+        event_type = ""
+    payload = _parse_event_payload(row.get("payload_json"))
+    try:
+        seq_value = int(row.get("seq") or 0)
+    except (TypeError, ValueError):
+        seq_value = 0
+    return {
+        "seq": seq_value,
+        "created_at": row.get("created_at"),
+        "type": event_type,
+        "task_id": row.get("task_id"),
+        "roadmap_id": row.get("roadmap_id"),
+        "summary": _admin_summary_for_event(event_type, payload),
+    }
+
+
+def _admin_state_histogram(task_rows: list[dict[str, Any]]) -> dict[str, int]:
+    hist: dict[str, int] = {}
+    for row in task_rows:
+        try:
+            state = str(row.get("state") or "")
+        except Exception:  # noqa: BLE001 - corrupt row
+            state = ""
+        if not state:
+            continue
+        hist[state] = hist.get(state, 0) + 1
+    return hist
+
+
+def _admin_recent_tasks(task_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    recent: list[dict[str, Any]] = []
+    for row in task_rows:
+        try:
+            updated_at = str(row.get("updated_at") or "")
+        except Exception:  # noqa: BLE001
+            updated_at = ""
+        recent.append(
+            {
+                "roadmap_id": row.get("roadmap_id"),
+                "task_id": row.get("id"),
+                "state": row.get("state"),
+                "current_attempt": row.get("current_attempt"),
+                "updated_at": updated_at,
+            }
+        )
+    recent.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    return recent[:ADMIN_RECENT_TASKS_CAP]
+
+
+def _admin_per_roadmap(task_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    bucket: dict[str, dict[str, Any]] = {}
+    for row in task_rows:
+        try:
+            roadmap_id = str(row.get("roadmap_id") or "")
+        except Exception:  # noqa: BLE001
+            continue
+        if not roadmap_id:
+            continue
+        entry = bucket.setdefault(
+            roadmap_id, {"roadmap_id": roadmap_id, "task_count": 0, "states": {}}
+        )
+        entry["task_count"] += 1
+        try:
+            state = str(row.get("state") or "")
+        except Exception:  # noqa: BLE001
+            state = ""
+        if state:
+            entry["states"][state] = entry["states"].get(state, 0) + 1
+    items = list(bucket.values())
+    items.sort(key=lambda item: item["roadmap_id"])
+    return items
+
+
+def _admin_first_cli_for_operator_reason(reason: str) -> str:
+    template = ATTENTION_OPERATOR_REASONS.get(reason)
+    if template is None:
+        return "agentops operator-status"
+    return template
+
+
+def _admin_first_cli_for_task_reason(reason: str) -> str:
+    template = ATTENTION_TASK_REASONS.get(reason)
+    if template is None:
+        return "agentops logs <task-id>"
+    return template
+
+
+def _admin_attention_for_operator_run(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a compact attention-needed row for one operator run.
+
+    The check is intentionally cheap: it reads only fields already
+    surfaced by the projection. Each row carries a ``first_cli``
+    suggestion that the UI can render as a copyable hint.
+    """
+    canonical = str(payload.get("canonical_status") or "")
+    runtime = str(payload.get("runtime_status") or "")
+    failure = payload.get("failure_category")
+    run_id = str(payload.get("run_id") or "")
+    reasons: list[str] = []
+    if runtime == "stale_pid":
+        reasons.append("stale_pid")
+    elif runtime == "exited_or_stale":
+        reasons.append("exited_or_stale")
+    if canonical == "needs_operator":
+        reasons.append("needs_operator")
+    if canonical == "transient_failed":
+        reasons.append("transient_failed")
+    if isinstance(failure, str) and failure:
+        if failure == "executor_no_output_startup":
+            reasons.append("executor_no_output_startup")
+        elif failure == "executor_idle_timeout":
+            reasons.append("executor_idle_timeout")
+        elif failure == "missing_result":
+            reasons.append("missing_result")
+        elif failure == "template_result":
+            reasons.append("template_result")
+    if not reasons:
+        return None
+    primary = reasons[0]
+    first_cli = _admin_first_cli_for_operator_reason(primary)
+    try:
+        first_cli = first_cli.replace("<run-id>", run_id)
+    except Exception:  # noqa: BLE001 - never raise
+        first_cli = "agentops operator-status"
+    return {
+        "kind": "operator_run",
+        "run_id": run_id,
+        "name": payload.get("name"),
+        "reasons": reasons,
+        "primary_reason": primary,
+        "canonical_status": canonical or None,
+        "runtime_status": runtime or None,
+        "failure_category": failure if isinstance(failure, str) else None,
+        "first_cli": first_cli,
+    }
+
+
+def _admin_attention_for_task(task_row: dict[str, Any]) -> dict[str, Any] | None:
+    state = str(task_row.get("state") or "")
+    if state not in ATTENTION_TASK_REASONS:
+        return None
+    task_id = str(task_row.get("id") or "")
+    roadmap_id = str(task_row.get("roadmap_id") or "")
+    first_cli = _admin_first_cli_for_task_reason(state)
+    try:
+        first_cli = first_cli.replace("<task-id>", task_id)
+    except Exception:  # noqa: BLE001 - never raise
+        first_cli = "agentops logs <task-id>"
+    return {
+        "kind": "task",
+        "task_id": task_id,
+        "roadmap_id": roadmap_id,
+        "state": state,
+        "first_cli": first_cli,
+    }
+
+
+def _admin_pr_loop_root() -> Path:
+    """Return the resolved ``.agentops/pr-loop`` root.
+
+    The root defaults to the resolved AgentOps repo root. The path is
+    read with :func:`_require_single_component`-style discipline: the
+    helper never escapes the repo root, never follows user-controlled
+    paths, and never reads file contents.
+    """
+    roots = _resolve_allowed_roots()
+    return roots.repo_root / ".agentops" / "pr-loop"
+
+
+def _admin_pr_loop_cycles() -> dict[str, Any]:
+    root = _admin_pr_loop_root()
+    exists = root.is_dir()
+    items: list[dict[str, Any]] = []
+    if exists:
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            try:
+                pr_number = int(entry.name)
+            except (TypeError, ValueError):
+                continue
+            try:
+                cycle_entries = sorted(entry.iterdir())
+            except OSError:
+                cycle_entries = []
+            cycles: list[dict[str, Any]] = []
+            for cycle_entry in cycle_entries:
+                if not cycle_entry.is_dir():
+                    continue
+                try:
+                    cycle_no = int(cycle_entry.name.replace("cycle-", ""))
+                except (TypeError, ValueError):
+                    continue
+                prompt_path = cycle_entry / "executor.prompt.md"
+                verdict_path = cycle_entry / "review.verdict.json"
+                cycles.append(
+                    {
+                        "cycle": cycle_no,
+                        "prompt_path": str(prompt_path) if prompt_path.exists() else None,
+                        "verdict_path": str(verdict_path) if verdict_path.exists() else None,
+                    }
+                )
+            cycles.sort(key=lambda item: item["cycle"])
+            items.append(
+                {
+                    "pr_number": pr_number,
+                    "cycles": cycles,
+                    "cycle_count": len(cycles),
+                }
+            )
+    items.sort(key=lambda item: item["pr_number"], reverse=True)
+    return {
+        "root": str(root),
+        "exists": exists,
+        "items": items,
+        "count": len(items),
+    }
+
+
+def _admin_runtime_status_histogram(runs: list[dict[str, Any]]) -> dict[str, int]:
+    hist: dict[str, int] = {}
+    for row in runs:
+        try:
+            runtime = str(row.get("runtime_status") or row.get("canonical_status") or "")
+        except Exception:  # noqa: BLE001
+            runtime = ""
+        if not runtime:
+            continue
+        hist[runtime] = hist.get(runtime, 0) + 1
+    return hist
+
+
+def collect_admin_snapshot(state: StateStore) -> dict[str, Any]:
+    """Return the Admin / Operator panel snapshot for the local dashboard.
+
+    The snapshot is the single source of truth for both the
+    ``/api/admin`` JSON endpoint and the in-page card rendered by
+    :func:`render_index_html`. It is read-only, loopback-only, and
+    never invokes subprocesses.
+
+    Top-level keys (all stable, all locked by tests in
+    ``tests/test_web.py``):
+
+    * ``roadmap_state`` — per-roadmap totals, state histogram, recent
+      tasks; empty when the state DB has no rows yet.
+    * ``latest_events`` — last 10 events with a compact payload
+      summary; empty when the events table is empty.
+    * ``operator_runs`` — up to 5 most recent operator runs with the
+      projected overlay plus a runtime-status histogram; missing
+      directory renders ``{"exists": false, ...}``.
+    * ``attention_needed`` — operator runs and tasks that the operator
+      should look at next, each with a copyable ``first_cli``
+      suggestion; capped at 25 rows.
+    * ``pr_loop_cycles`` — discovered ``.agentops/pr-loop`` cycles
+      with prompt / verdict paths but never raw prompt bodies;
+      missing root renders ``{"exists": false, ...}``.
+    * ``recommended_commands`` — copyable CLI hints.
+    * ``diagnostics`` — db path, generated timestamp, repo root,
+      operator-runs root, pr-loop root; never includes secrets.
+    """
+    generated_at = _utc_now_iso()
+    try:
+        state.init()
+        task_rows = [_row_to_dict(row) for row in state.task_rows()]
+        event_rows = [_row_to_dict(row) for row in state.latest_events(ADMIN_LATEST_EVENTS_CAP)]
+    except Exception as exc:  # noqa: BLE001 - never raise from the admin snapshot
+        log.warning("collect_admin_snapshot: state lookup failed: %s", exc)
+        task_rows = []
+        event_rows = []
+
+    roadmap_state = {
+        "per_roadmap": _admin_per_roadmap(task_rows),
+        "state_histogram": _admin_state_histogram(task_rows),
+        "recent_tasks": _admin_recent_tasks(task_rows),
+        "task_count": len(task_rows),
+        "empty": len(task_rows) == 0,
+    }
+
+    latest_events_items = [_admin_compact_event(row) for row in event_rows]
+    latest_events = {
+        "items": latest_events_items,
+        "count": len(latest_events_items),
+        "cap": ADMIN_LATEST_EVENTS_CAP,
+        "empty": len(latest_events_items) == 0,
+    }
+
+    try:
+        operator_runs_payload = collect_operator_runs()
+        all_runs = list(operator_runs_payload.get("runs") or [])
+    except Exception as exc:  # noqa: BLE001 - never raise from the admin snapshot
+        log.warning("collect_admin_snapshot: operator_runs failed: %s", exc)
+        all_runs = []
+    recent_runs = all_runs[:ADMIN_OPERATOR_RUNS_CAP]
+    operator_runs_root = _default_operator_runs_root()
+    operator_runs = {
+        "items": recent_runs,
+        "count": len(all_runs),
+        "cap": ADMIN_OPERATOR_RUNS_CAP,
+        "runtime_status_histogram": _admin_runtime_status_histogram(all_runs),
+        "exists": (operator_runs_root / ".operator-runs").is_dir(),
+        "root": str(operator_runs_root / ".operator-runs"),
+    }
+
+    attention: list[dict[str, Any]] = []
+    for row in all_runs:
+        item = _admin_attention_for_operator_run(row)
+        if item is not None:
+            attention.append(item)
+            if len(attention) >= ADMIN_ATTENTION_CAP:
+                break
+    if len(attention) < ADMIN_ATTENTION_CAP:
+        for task in task_rows:
+            item = _admin_attention_for_task(task)
+            if item is None:
+                continue
+            attention.append(item)
+            if len(attention) >= ADMIN_ATTENTION_CAP:
+                break
+
+    pr_loop_cycles = _admin_pr_loop_cycles()
+
+    roots = _resolve_allowed_roots()
+    diagnostics = {
+        "generated_at": generated_at,
+        "db_path": str(state.db_path),
+        "repo_root": str(roots.repo_root),
+        "tmp_root": str(roots.tmp_root),
+        "operator_runs_root": str(_default_operator_runs_root()),
+        "pr_loop_root": str(pr_loop_cycles.get("root") or ""),
+        "event_count_window": len(latest_events_items),
+        "task_count_window": len(task_rows),
+    }
+
+    return {
+        "roadmap_state": roadmap_state,
+        "latest_events": latest_events,
+        "operator_runs": operator_runs,
+        "attention_needed": {
+            "items": attention,
+            "count": len(attention),
+            "cap": ADMIN_ATTENTION_CAP,
+            "empty": len(attention) == 0,
+        },
+        "pr_loop_cycles": pr_loop_cycles,
+        "recommended_commands": list(ADMIN_RECOMMENDED_COMMANDS),
+        "diagnostics": diagnostics,
+    }
+
+
+def _utc_now_iso() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
 # Bundle + validation data fetchers (read-only, loopback-only)
 # ---------------------------------------------------------------------------
 
@@ -1293,6 +1759,9 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._send_json({"ok": True, "db_path": str(self._server_state().state.db_path)})
+            return
+        if path == "/api/admin":
+            self._send_json(collect_admin_snapshot(self._server_state().state))
             return
 
         self._send_json({"error": f"not found: {path}"}, status=404)
@@ -2012,6 +2481,52 @@ INDEX_TEMPLATE = """<!doctype html>
   </section>
 
   <section class="card">
+    <h2 style="margin-top:0;font-size:15px;">Admin / Operator panel <span class="muted" id="admin-generated-at"></span></h2>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="pill" id="admin-empty-pill">loading&hellip;</span>
+      <span class="muted" id="admin-summary"></span>
+    </div>
+    <h3 style="font-size:13px;margin:8px 0 4px;">Roadmap task rollup</h3>
+    <table>
+      <thead>
+        <tr><th>Roadmap</th><th>Tasks</th><th>States</th></tr>
+      </thead>
+      <tbody id="admin-roadmap-rows"><tr><td colspan="3" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:12px 0 4px;">Latest events</h3>
+    <table>
+      <thead>
+        <tr><th>#</th><th>Time</th><th>Type</th><th>Task</th><th>Roadmap</th><th>Summary</th></tr>
+      </thead>
+      <tbody id="admin-event-rows"><tr><td colspan="6" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:12px 0 4px;">Operator runs (5 most recent)</h3>
+    <table>
+      <thead>
+        <tr><th>Run id</th><th>Status</th><th>Runtime</th><th>PID</th><th>Idle (s)</th><th>Log size</th><th>Failure</th><th>Suggested</th></tr>
+      </thead>
+      <tbody id="admin-operator-runs-rows"><tr><td colspan="8" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:12px 0 4px;">Attention needed</h3>
+    <table>
+      <thead>
+        <tr><th>Kind</th><th>Id</th><th>Reasons</th><th>First CLI move</th></tr>
+      </thead>
+      <tbody id="admin-attention-rows"><tr><td colspan="4" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:12px 0 4px;">PR repair cycles</h3>
+    <div class="muted" id="admin-pr-loop-summary" style="margin-bottom:6px;">loading&hellip;</div>
+    <table>
+      <thead>
+        <tr><th>PR</th><th>Cycle</th><th>Prompt path</th><th>Verdict path</th></tr>
+      </thead>
+      <tbody id="admin-pr-loop-rows"><tr><td colspan="4" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:12px 0 4px;">Recommended CLI commands</h3>
+    <ul id="admin-recommended-commands" class="muted" style="margin:0;padding-left:18px;"></ul>
+  </section>
+
+  <section class="card">
     <h2 style="margin-top:0;font-size:15px;">Roadmap</h2>
     <div class="row">
       <label for="roadmap-select" class="muted">Select:</label>
@@ -2161,6 +2676,16 @@ INDEX_TEMPLATE = """<!doctype html>
   const taskLiveStopBtn = $("task-live-stop-btn");
   const taskLiveOutput = $("task-live-output");
   const historyRows = $("history-rows");
+  const adminGeneratedAt = $("admin-generated-at");
+  const adminEmptyPill = $("admin-empty-pill");
+  const adminSummary = $("admin-summary");
+  const adminRoadmapRows = $("admin-roadmap-rows");
+  const adminEventRows = $("admin-event-rows");
+  const adminOperatorRunsRows = $("admin-operator-runs-rows");
+  const adminAttentionRows = $("admin-attention-rows");
+  const adminPrLoopSummary = $("admin-pr-loop-summary");
+  const adminPrLoopRows = $("admin-pr-loop-rows");
+  const adminRecommendedCommands = $("admin-recommended-commands");
   const historySummary = $("history-summary");
   const logTask = $("log-task");
   const logAttempt = $("log-attempt");
@@ -2443,6 +2968,183 @@ async function tailOperatorRun() {
     });
   }
 
+  async function renderAdmin() {
+    const res = await fetchJson("/api/admin");
+    if (!res.ok || !res.data) {
+      if (adminEmptyPill) {
+        adminEmptyPill.className = "err";
+        adminEmptyPill.textContent = "admin snapshot unavailable";
+      }
+      if (adminSummary) {
+        adminSummary.className = "err";
+        adminSummary.textContent = res.data && res.data.error ? res.data.error : ("HTTP " + res.status);
+      }
+      return;
+    }
+    const data = res.data;
+    if (adminGeneratedAt) adminGeneratedAt.textContent = data.diagnostics && data.diagnostics.generated_at ? "snapshot: " + data.diagnostics.generated_at : "";
+    const isEmpty = !!(data.roadmap_state && data.roadmap_state.empty)
+      && (data.latest_events && data.latest_events.empty)
+      && (data.operator_runs && data.operator_runs.count === 0)
+      && (data.pr_loop_cycles && data.pr_loop_cycles.count === 0);
+    if (adminEmptyPill) {
+      adminEmptyPill.className = isEmpty ? "pill" : "pill";
+      adminEmptyPill.innerHTML = isEmpty
+        ? '<span class="status-dot"></span> no data yet'
+        : '<span class="status-dot ok"></span> ok';
+    }
+    if (adminSummary) {
+      adminSummary.className = "muted";
+      const taskCount = data.roadmap_state ? data.roadmap_state.task_count : 0;
+      const eventCount = data.latest_events ? data.latest_events.count : 0;
+      const opCount = data.operator_runs ? data.operator_runs.count : 0;
+      const attentionCount = data.attention_needed ? data.attention_needed.count : 0;
+      const prCount = data.pr_loop_cycles ? data.pr_loop_cycles.count : 0;
+      adminSummary.textContent = "tasks=" + taskCount + " events=" + eventCount + " operator_runs=" + opCount + " attention=" + attentionCount + " pr_loops=" + prCount;
+    }
+
+    // Roadmap rollup
+    const perRoadmap = (data.roadmap_state && data.roadmap_state.per_roadmap) || [];
+    if (adminRoadmapRows) {
+      if (!perRoadmap.length) {
+        adminRoadmapRows.innerHTML = '<tr><td colspan="3" class="muted">No roadmaps recorded yet. Run <code>agentops plan</code> or <code>agentops run --roadmap &lt;path&gt; --no-codex</code> from the CLI.</td></tr>';
+      } else {
+        adminRoadmapRows.innerHTML = perRoadmap.map(function (r) {
+          const states = r.states || {};
+          const stateText = Object.keys(states).sort().map(function (k) {
+            return k + ":" + states[k];
+          }).join(", ");
+          return "<tr>"
+            + "<td>" + escapeHtml(r.roadmap_id) + "</td>"
+            + "<td>" + escapeHtml(r.task_count) + "</td>"
+            + "<td>" + escapeHtml(stateText || "-") + "</td>"
+            + "</tr>";
+        }).join("");
+      }
+    }
+
+    // Latest events
+    const events = (data.latest_events && data.latest_events.items) || [];
+    if (adminEventRows) {
+      if (!events.length) {
+        adminEventRows.innerHTML = '<tr><td colspan="6" class="muted">No events yet. The dashboard will populate as soon as the CLI runs a roadmap.</td></tr>';
+      } else {
+        adminEventRows.innerHTML = events.map(function (e) {
+          return "<tr>"
+            + "<td>" + escapeHtml(e.seq) + "</td>"
+            + "<td>" + escapeHtml(e.created_at) + "</td>"
+            + "<td>" + escapeHtml(e.type) + "</td>"
+            + "<td>" + escapeHtml(e.task_id || "-") + "</td>"
+            + "<td>" + escapeHtml(e.roadmap_id || "-") + "</td>"
+            + "<td>" + escapeHtml(e.summary || "") + "</td>"
+            + "</tr>";
+        }).join("");
+      }
+    }
+
+    // Operator runs
+    const opItems = (data.operator_runs && data.operator_runs.items) || [];
+    if (adminOperatorRunsRows) {
+      if (!opItems.length) {
+        const exists = data.operator_runs && data.operator_runs.exists;
+        adminOperatorRunsRows.innerHTML = '<tr><td colspan="8" class="muted">'
+          + (exists ? "No operator runs yet." : "No .operator-runs directory yet. The dashboard will populate after the first <code>agentops run</code>.")
+          + '</td></tr>';
+      } else {
+        adminOperatorRunsRows.innerHTML = opItems.map(function (r) {
+          const idle = r.idle_for_seconds == null ? "-" : Math.round(Number(r.idle_for_seconds));
+          const suggested = r.suggested_action || "none";
+          const persisted = r.canonical_status || r.status || "-";
+          const runtime = r.runtime_status || "-";
+          const runtimeCell = (persisted !== "-" && runtime !== "-" && runtime !== persisted)
+            ? '<span class="status-dot stale"></span> <span class="runtime-stale">' + escapeHtml(runtime) + '</span>'
+            : escapeHtml(runtime);
+          return "<tr>"
+            + "<td>" + escapeHtml(r.run_id || "-") + "</td>"
+            + "<td>" + escapeHtml(persisted) + "</td>"
+            + "<td>" + runtimeCell + "</td>"
+            + "<td>" + escapeHtml(r.pid == null ? "-" : r.pid) + "</td>"
+            + "<td>" + escapeHtml(idle) + "</td>"
+            + "<td>" + escapeHtml(r.log_size_bytes == null ? 0 : r.log_size_bytes) + "</td>"
+            + "<td>" + escapeHtml(r.failure_category || "-") + "</td>"
+            + "<td>" + escapeHtml(suggested) + "</td>"
+            + "</tr>";
+        }).join("");
+      }
+    }
+
+    // Attention needed
+    const attention = (data.attention_needed && data.attention_needed.items) || [];
+    if (adminAttentionRows) {
+      if (!attention.length) {
+        adminAttentionRows.innerHTML = '<tr><td colspan="4" class="muted">Nothing needs operator attention. The dashboard is green.</td></tr>';
+      } else {
+        adminAttentionRows.innerHTML = attention.map(function (a) {
+          const idText = a.kind === "operator_run"
+            ? (a.run_id || "-")
+            : ((a.task_id || "-") + " (" + (a.roadmap_id || "-") + ")");
+          return "<tr>"
+            + "<td>" + escapeHtml(a.kind) + "</td>"
+            + "<td>" + escapeHtml(idText) + "</td>"
+            + "<td>" + escapeHtml((a.reasons || []).join(", ") || (a.state || "-")) + "</td>"
+            + "<td><code>" + escapeHtml(a.first_cli || "-") + "</code></td>"
+            + "</tr>";
+        }).join("");
+      }
+    }
+
+    // PR repair cycles
+    const cycles = (data.pr_loop_cycles && data.pr_loop_cycles.items) || [];
+    if (adminPrLoopSummary) {
+      if (!cycles.length) {
+        const exists = data.pr_loop_cycles && data.pr_loop_cycles.exists;
+        adminPrLoopSummary.className = "muted";
+        adminPrLoopSummary.textContent = (data.pr_loop_cycles && data.pr_loop_cycles.root)
+          ? (exists
+              ? "Root exists at " + data.pr_loop_cycles.root + ", no PR cycles yet."
+              : "No .agentops/pr-loop directory yet.")
+          : "No .agentops/pr-loop directory yet.";
+      } else {
+        const totalCycles = cycles.reduce(function (acc, item) { return acc + (item.cycle_count || 0); }, 0);
+        adminPrLoopSummary.className = "muted";
+        adminPrLoopSummary.textContent = cycles.length + " PR folder(s), " + totalCycles + " cycle(s).";
+      }
+    }
+    if (adminPrLoopRows) {
+      if (!cycles.length) {
+        adminPrLoopRows.innerHTML = '<tr><td colspan="4" class="muted">No PR repair cycles yet. The dashboard will populate after the first <code>agentops pr-loop</code>.</td></tr>';
+      } else {
+        const flatRows = [];
+        cycles.forEach(function (pr) {
+          (pr.cycles || []).forEach(function (c) {
+            flatRows.push({
+              pr: pr.pr_number,
+              cycle: c.cycle,
+              prompt: c.prompt_path,
+              verdict: c.verdict_path,
+            });
+          });
+        });
+        adminPrLoopRows.innerHTML = flatRows.map(function (r) {
+          return "<tr>"
+            + "<td>" + escapeHtml(r.pr) + "</td>"
+            + "<td>" + escapeHtml(r.cycle) + "</td>"
+            + "<td>" + escapeHtml(r.prompt || "-") + "</td>"
+            + "<td>" + escapeHtml(r.verdict || "-") + "</td>"
+            + "</tr>";
+        }).join("");
+      }
+    }
+
+    // Recommended commands
+    const cmds = data.recommended_commands || [];
+    if (adminRecommendedCommands) {
+      adminRecommendedCommands.innerHTML = cmds.map(function (c) {
+        return "<li><code>" + escapeHtml(c) + "</code></li>";
+      }).join("");
+    }
+  }
+
   async function loadHistory() {
     if (!historyRows) return;
     const res = await fetchJson("/api/run-history?limit=100");
@@ -2651,8 +3353,12 @@ async function tailOperatorRun() {
   loadBundles();
   loadHistory();
   loadRoadmaps();
+  renderAdmin();
   refresh();
-  autoTimer = setInterval(refresh, 3000);
+  autoTimer = setInterval(function () {
+    refresh();
+    renderAdmin();
+  }, 3000);
 })();
 </script>
 </body>

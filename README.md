@@ -233,6 +233,20 @@ and per-task logs / artifacts. The "Run" button always passes
 [`docs/local-web-ui.md`](docs/local-web-ui.md) for the full
 description and the safety notes.
 
+The dashboard's top card is the **Admin / Operator panel**, a
+read-only, loopback-only maintainer cockpit backed by
+`GET /api/admin`. It renders a roadmap task rollup, the latest
+10 events, the 5 most recent operator runs, an
+attention-needed list (each row carrying a copyable CLI hint
+such as `agentops operator-tail <run-id> --lines 200`),
+discovered PR repair cycles, and a copyable list of
+recommended CLI commands. The panel auto-refreshes every
+3 seconds alongside the rest of the dashboard, and it is
+safe to load on a fresh checkout — missing state files
+render empty states instead of errors. The CLI remains the
+source of truth; the UI never executes shell and never
+enables Codex.
+
 ## Roadmap budget
 
 Roadmaps can declare a `budget` block that caps the run:

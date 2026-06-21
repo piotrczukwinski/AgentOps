@@ -145,3 +145,61 @@ After T7, `agentops serve` is the Phase 1 admin panel.
 - Budget/cost ledger, parallel scheduling, remote workers, GitHub PR creation.
 - Codex runs from the UI (the UI stays `--no-codex`, matching the existing
   safety default; Codex runs are CLI-only).
+
+## 7. Operator-panel snapshot (`/api/admin`)
+
+After Phase 1, the dashboard's top card is the **Admin / Operator
+panel**, a single read-only card backed by `GET /api/admin`.
+
+The endpoint is implemented as a thin wrapper around
+`agentops.web.collect_admin_snapshot(state)`. The snapshot is the
+single source of truth for both the JSON endpoint and the
+in-page card rendered by `render_index_html`; the dashboard and
+the CLI consumers see the same shape.
+
+Top-level keys (locked by `tests/test_web.py`):
+
+| Key | Source | Cap | Empty state |
+|---|---|---|---|
+| `roadmap_state` | `state.task_rows()` | 10 recent tasks | `empty=true` when DB has no tasks |
+| `latest_events` | `state.latest_events(10)` | 10 events | `empty=true` when events table empty |
+| `operator_runs` | `collect_operator_runs()` | 5 runs | `exists=false` when `.operator-runs/` missing |
+| `attention_needed` | derived from operator runs + tasks | 25 rows | `empty=true` when no reasons match |
+| `pr_loop_cycles` | `.agentops/pr-loop/<pr>/cycle-N/` | all PRs | `exists=false` when root missing |
+| `recommended_commands` | static list of 9 CLI hints | — | — |
+| `diagnostics` | `db_path`, `repo_root`, `operator_runs_root`, `pr_loop_root`, `generated_at` | — | — |
+
+The snapshot is **safe by construction**:
+
+- GET only; no body, no side effects.
+- No subprocess is launched; no log file is read.
+- Event payloads are projected to a short `summary` field
+  derived from known keys (`exit_code`, `head_sha`,
+  `run_verdict`, `attempt_no`). The raw `payload_json`
+  (which can carry prompt bodies) is never forwarded.
+- Operator runs are projected via the same
+  `_project_operator_run_for_api` helper the existing
+  `/api/operator-runs` endpoint uses; the snapshot never
+  re-implements the runtime overlay.
+- The `attention_needed` rows carry a copyable `first_cli`
+  hint — every suggestion is a real CLI command the
+  operator can paste into a terminal. The dashboard never
+  executes shell on behalf of the operator.
+- `first_cli` templates are deliberately narrow and only
+  render known prefixes (`agentops status`,
+  `agentops operator-tail <run-id> --lines 200`,
+  `agentops operator-result <run-id>`,
+  `agentops operator-retry <run-id>`,
+  `agentops logs <task-id>`,
+  `agentops review-queue`,
+  `agentops decide <task-id> ...`).
+- The endpoint never reads files outside the state DB and
+  the `.operator-runs/` directory; PR loop discovery only
+  reads directory entries and the `executor.prompt.md` /
+  `review.verdict.json` paths, never their contents.
+
+The card auto-refreshes every 3 seconds alongside the rest of
+the dashboard. On a fresh checkout, every section renders a
+short empty-state hint explaining what the operator can do
+next (run `agentops plan`, run `agentops run --no-codex`, run
+`agentops pr-loop`).

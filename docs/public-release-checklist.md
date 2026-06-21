@@ -94,6 +94,10 @@ output for each of the commands below.
       a private project name, or a personal email address.
 * [ ] The web UI does not enable the Codex reviewer. The
       dashboard's `Run` button always passes `--no-codex`.
+* [ ] The Admin / Operator panel (`GET /api/admin`) is
+      read-only, loopback-only, capped, and safe on a fresh
+      checkout. The card never executes shell and never
+      enables Codex.
 
 ## 4. CI checklist
 
