@@ -36,7 +36,9 @@ changes, crawler compliance-sensitive changes, security-sensitive
 refactors, large dependency upgrades, or anything that touches
 auth / billing / identity), run the executor inside a VM, a
 container, or a dedicated low-privilege user account that does
-**not** have repository write credentials in scope.
+**not** have repository write credentials in scope. For practical
+low-privilege / container recipes, see
+[`docs/sandboxing-recipes.md`](docs/sandboxing-recipes.md).
 
 ## What AgentOps does by default
 
