@@ -206,6 +206,25 @@ def build_parser() -> argparse.ArgumentParser:
     summary = sub.add_parser("export-summary", help="Print a markdown summary from SQLite state.")
     summary.add_argument("--roadmap-id", default=None)
 
+    usage_cmd = sub.add_parser(
+        "usage",
+        help="Print model usage totals and a recent-calls table from SQLite state.",
+        description=(
+            "Read the ``model_calls`` ledger from the local SQLite state "
+            "DB and print the totals, a per-purpose rollup, and the "
+            "most recent calls. Token usage is recorded only when the "
+            "executor or reviewer actually exposes it; missing values "
+            "render as ``unknown`` rather than zero. No subprocess is "
+            "launched and no file outside the state DB is read. Use "
+            "--json for machine-readable output (matches the "
+            "``/api/usage`` contract)."
+        ),
+    )
+    usage_cmd.add_argument("--json", action="store_true", help="Emit JSON instead of a text table.")
+    usage_cmd.add_argument("--limit", type=int, default=25, help="How many recent calls to print. Default: 25.")
+    usage_cmd.add_argument("--roadmap", default=None, help="Filter by roadmap id.")
+    usage_cmd.add_argument("--task", default=None, help="Filter by task id.")
+
     plan = sub.add_parser("plan", help="Lint a roadmap file without running it. Does not call models or create worktrees.")
     plan.add_argument("--roadmap", required=True, help="Path to roadmap JSON/YAML file.")
     plan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
@@ -765,6 +784,9 @@ def main(argv: list[str] | None = None) -> int:
             state.init()
             print(export_summary(state, args.roadmap_id))
             return 0
+
+        if args.command == "usage":
+            return _cmd_usage(state, args)
 
         if args.command == "plan":
             return _cmd_plan(args.roadmap, args.json)
@@ -1466,6 +1488,211 @@ def export_summary(state: StateStore, roadmap_id: str | None = None) -> str:
     for row in state.latest_events(30):
         lines.append(f"- `{row['created_at']}` `{row['type']}` roadmap=`{row['roadmap_id']}` task=`{row['task_id']}`")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# usage
+# ---------------------------------------------------------------------------
+
+
+def _usage_snapshot_for_cli(
+    state: StateStore,
+    *,
+    limit: int,
+    roadmap: str | None,
+    task: str | None,
+) -> dict[str, Any]:
+    """Build the JSON-shaped usage payload for the ``agentops usage`` CLI.
+
+    Kept separate from :func:`agentops.web.collect_usage_snapshot` so
+    the CLI does not have to import the web layer. The shape mirrors
+    the ``/api/usage`` contract so a CI script that calls either
+    surface sees the same fields.
+    """
+    from .usage import summarize_model_calls
+
+    state.init()
+    rows = [
+        {
+            "id": row["id"],
+            "roadmap_id": row["roadmap_id"],
+            "task_id": row["task_id"],
+            "attempt_id": row["attempt_id"],
+            "provider": row["provider"],
+            "model": row["model"],
+            "purpose": row["purpose"],
+            "input_tokens": row["input_tokens"],
+            "cached_tokens": row["cached_tokens"],
+            "output_tokens": row["output_tokens"],
+            "cost_estimate": row["cost_estimate"],
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+        }
+        for row in state.model_call_rows(roadmap_id=roadmap, task_id=task, limit=limit)
+    ]
+    summary = state.model_call_summary(roadmap_id=roadmap, task_id=task)
+    rollup = summarize_model_calls(rows)
+    known_calls = int(summary.get("known_calls") or 0)
+    if known_calls > 0:
+        totals = {
+            "known_calls": known_calls,
+            "unknown_calls": int(summary.get("unknown_calls") or 0),
+            "input_tokens": int(summary.get("input_tokens") or 0),
+            "cached_tokens": int(summary.get("cached_tokens") or 0),
+            "output_tokens": int(summary.get("output_tokens") or 0),
+            "total_tokens": rollup.get("total_tokens"),
+        }
+    else:
+        totals = {
+            "known_calls": 0,
+            "unknown_calls": int(summary.get("unknown_calls") or 0),
+            "input_tokens": None,
+            "cached_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+        }
+    return {
+        "generated_at": utc_now_iso(),
+        "filter": {"roadmap_id": roadmap, "task_id": task},
+        "limit": int(limit),
+        "totals": totals,
+        "by_purpose": list(rollup.get("by_purpose") or []),
+        "by_model": list(rollup.get("by_model") or []),
+        "latest_calls": rows,
+        "notes": [
+            "Unknown means the provider/CLI did not expose usage.",
+            "Missing token fields are not treated as zero.",
+            "No price estimate is invented here.",
+            "This is a local ledger, not telemetry.",
+        ],
+    }
+
+
+def utc_now_iso() -> str:
+    """Local helper for the CLI; mirrors :func:`agentops.state.utc_now`."""
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _print_usage_text(snapshot: dict[str, Any]) -> None:
+    """Pretty-print the usage snapshot as a human-readable table."""
+    print(f"AgentOps model usage  (snapshot: {snapshot.get('generated_at')})")
+    filter_block = snapshot.get("filter") or {}
+    if filter_block.get("roadmap_id") or filter_block.get("task_id"):
+        filters = ", ".join(
+            f"{key}={value}" for key, value in filter_block.items() if value
+        )
+        if filters:
+            print(f"  filter: {filters}")
+    totals = snapshot.get("totals") or {}
+    print()
+    print("Totals")
+    print(f"  known_calls   : {totals.get('known_calls', 0)}")
+    print(f"  unknown_calls : {totals.get('unknown_calls', 0)}")
+    print(f"  input_tokens  : {_fmt_token(totals.get('input_tokens'))}")
+    print(f"  cached_tokens : {_fmt_token(totals.get('cached_tokens'))}")
+    print(f"  output_tokens : {_fmt_token(totals.get('output_tokens'))}")
+    print(f"  total_tokens  : {_fmt_token(totals.get('total_tokens'))}")
+    purposes = snapshot.get("by_purpose") or []
+    if purposes:
+        print()
+        print("By purpose")
+        print(f"  {'purpose':12s} {'calls':>6s} {'known':>6s} {'unknown':>8s} "
+              f"{'input':>10s} {'cached':>10s} {'output':>10s}")
+        for row in purposes:
+            print(
+                f"  {row['purpose']:12s} {row['calls']:>6d} {row['known_calls']:>6d} "
+                f"{row['unknown_calls']:>8d} {_fmt_token(row.get('input_tokens')):>10s} "
+                f"{_fmt_token(row.get('cached_tokens')):>10s} {_fmt_token(row.get('output_tokens')):>10s}"
+            )
+    models = snapshot.get("by_model") or []
+    if models:
+        print()
+        print("By model")
+        print(f"  {'provider':12s} {'model':32s} {'purpose':10s} {'calls':>6s} "
+              f"{'input':>10s} {'cached':>10s} {'output':>10s}")
+        for row in models:
+            model_label = str(row.get("model") or "-")[:32]
+            print(
+                f"  {row['provider']:12s} {model_label:32s} {row['purpose']:10s} "
+                f"{row['calls']:>6d} {_fmt_token(row.get('input_tokens')):>10s} "
+                f"{_fmt_token(row.get('cached_tokens')):>10s} {_fmt_token(row.get('output_tokens')):>10s}"
+            )
+    latest = snapshot.get("latest_calls") or []
+    if latest:
+        print()
+        print(f"Latest calls (showing {len(latest)})")
+        print(
+            f"  {'started_at':19s} {'purpose':10s} {'provider':10s} "
+            f"{'model':24s} {'input':>10s} {'cached':>10s} {'output':>10s} status"
+        )
+        for row in latest:
+            print(
+                f"  {str(row.get('started_at') or '-')[:19]:19s} "
+                f"{str(row.get('purpose') or '-'):10s} "
+                f"{str(row.get('provider') or '-'):10s} "
+                f"{str(row.get('model') or '-')[:24]:24s} "
+                f"{_fmt_token(row.get('input_tokens')):>10s} "
+                f"{_fmt_token(row.get('cached_tokens')):>10s} "
+                f"{_fmt_token(row.get('output_tokens')):>10s} "
+                f"{_usage_status_label(row)}"
+            )
+    print()
+    print("Notes:")
+    for note in snapshot.get("notes") or []:
+        print(f"  - {note}")
+
+
+def _fmt_token(value: Any) -> str:
+    """Format a token count for the CLI text output.
+
+    ``None`` becomes ``"unknown"`` so the column is always meaningful;
+    integers render as decimal. Booleans are rejected because they
+    would otherwise render as ``1`` / ``0``.
+    """
+    if value is None:
+        return "unknown"
+    if isinstance(value, bool):
+        return "unknown"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        try:
+            return str(int(value))
+        except ValueError:
+            return "unknown"
+    return "unknown"
+
+
+def _usage_status_label(row: dict[str, Any]) -> str:
+    """Return ``"known"`` / ``"unknown"`` for a model_calls row."""
+    for key in ("input_tokens", "cached_tokens", "output_tokens"):
+        if row.get(key) is not None:
+            return "known"
+    return "unknown"
+
+
+def _cmd_usage(state: StateStore, args: argparse.Namespace) -> int:
+    """Entry point for ``agentops usage``.
+
+    Emits the same shape as ``/api/usage`` when ``--json`` is set so
+    downstream consumers can switch between the CLI and the web API
+    without a shape conversion.
+    """
+    limit_raw = getattr(args, "limit", 25)
+    try:
+        limit = int(limit_raw)
+    except (TypeError, ValueError):
+        limit = 25
+    if not isinstance(limit, bool) and limit <= 0:
+        limit = 25
+    roadmap = getattr(args, "roadmap", None) or None
+    task = getattr(args, "task", None) or None
+    snapshot = _usage_snapshot_for_cli(state, limit=limit, roadmap=roadmap, task=task)
+    if getattr(args, "json", False):
+        print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True, indent=2))
+    else:
+        _print_usage_text(snapshot)
+    return 0
 
 
 # ---------------------------------------------------------------------------

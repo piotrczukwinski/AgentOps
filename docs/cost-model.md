@@ -1,9 +1,21 @@
 # Cost Model
 
-AgentOps does not currently implement a token-pricing ledger. The
-cost model is conceptual: use cheaper deterministic or executor
-work for mechanical supervision, and reserve the strong model for
-bounded review.
+AgentOps now ships a **model usage ledger** that records what every
+executor / reviewer call actually exposed. The ledger is honest:
+missing values stay `unknown`, no price is invented, and the
+dashboard never implies measured usage where the provider did not
+publish any. See [`docs/usage-ledger.md`](usage-ledger.md) for the
+full contract: what is recorded, what is left as `null`, what the
+`AGENTOPS_USAGE_JSON` marker is for, and how the dashboard / API /
+CLI surface it.
+
+This document now plays a narrower role: the conceptual cost model
+that motivates the two-agent strategy and explains why the ledger is
+useful *without* claiming a universal savings multiplier.
+
+The conceptual cost model still applies: use cheaper deterministic or
+executor work for mechanical supervision, and reserve the strong
+model for bounded review.
 
 ## What usually burns strong-model budget
 

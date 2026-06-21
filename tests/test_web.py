@@ -11,6 +11,7 @@ import time
 import unittest
 from http.client import HTTPConnection
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from agentops import bundles, web
@@ -1577,6 +1578,7 @@ class AdminSnapshotShapeTests(unittest.TestCase):
         "pr_loop_cycles",
         "recommended_commands",
         "diagnostics",
+        "usage_summary",
     }
 
     def _server(self, store):
@@ -2044,3 +2046,201 @@ class AdminSnapshotSeedTests(unittest.TestCase):
         self.assertIn("generated_at", data["diagnostics"])
         # The snapshot exposes the recommended CLI hints.
         self.assertIn("agentops status", " ".join(data["recommended_commands"]))
+
+
+class UsageLedgerTests(unittest.TestCase):
+    """End-to-end shape tests for the model-usage ledger.
+
+    These tests seed the SQLite ``model_calls`` table through the
+    :class:`StateStore` methods and verify the dashboard snapshot,
+    the admin summary block, and the ``/api/usage`` HTTP surface.
+    The HTTP test uses the same in-process server harness the existing
+    ``/api/admin`` tests use, so the wire format is verified end to
+    end without spawning a real Codex / OpenCode binary.
+    """
+
+    def _seed(self, store: StateStore) -> None:
+        store.record_model_call(
+            roadmap_id="r",
+            task_id="T1",
+            attempt_id="A1",
+            provider="opencode",
+            model="minimax/MiniMax-M3",
+            purpose="executor",
+            input_tokens=120,
+            cached_tokens=15,
+            output_tokens=22,
+            cost_estimate=0.00012,
+        )
+        store.record_model_call(
+            roadmap_id="r",
+            task_id="T1",
+            attempt_id="A1",
+            provider="codex",
+            model="codex-default",
+            purpose="review",
+            input_tokens=80,
+            cached_tokens=0,
+            output_tokens=30,
+        )
+        store.record_model_call(
+            roadmap_id="r",
+            task_id="T1",
+            attempt_id="A1",
+            provider="heuristic",
+            model="heuristic",
+            purpose="review",
+        )
+
+    def test_collect_usage_snapshot_empty_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            snapshot = web.collect_usage_snapshot(store)
+            self.assertEqual(snapshot["totals"]["known_calls"], 0)
+            self.assertEqual(snapshot["totals"]["unknown_calls"], 0)
+            # Totals report ``None`` for token fields when no call
+            # exposed any usage; the dashboard renders them as
+            # ``unknown`` instead of the misleading ``0``.
+            self.assertIsNone(snapshot["totals"]["input_tokens"])
+            self.assertIsNone(snapshot["totals"]["cached_tokens"])
+            self.assertIsNone(snapshot["totals"]["output_tokens"])
+            self.assertIsNone(snapshot["totals"]["total_tokens"])
+            self.assertEqual(snapshot["by_purpose"], [])
+            self.assertEqual(snapshot["by_model"], [])
+            self.assertEqual(snapshot["latest_calls"], [])
+            self.assertIn(
+                "Missing token fields are not treated as zero.",
+                snapshot["notes"],
+            )
+
+    def test_collect_usage_snapshot_known_and_unknown_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            snapshot = web.collect_usage_snapshot(store)
+            totals = snapshot["totals"]
+            self.assertEqual(totals["known_calls"], 2)
+            self.assertEqual(totals["unknown_calls"], 1)
+            self.assertEqual(totals["input_tokens"], 200)
+            self.assertEqual(totals["cached_tokens"], 15)
+            self.assertEqual(totals["output_tokens"], 52)
+            purposes = {row["purpose"]: row for row in snapshot["by_purpose"]}
+            self.assertEqual(purposes["executor"]["calls"], 1)
+            self.assertEqual(purposes["executor"]["known_calls"], 1)
+            self.assertEqual(purposes["review"]["calls"], 2)
+            self.assertEqual(purposes["review"]["known_calls"], 1)
+            self.assertEqual(purposes["review"]["unknown_calls"], 1)
+            self.assertEqual(len(snapshot["by_model"]), 3)
+            # Latest calls: newest first, all three rows present.
+            self.assertEqual(len(snapshot["latest_calls"]), 3)
+
+    def test_admin_snapshot_includes_usage_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            data = web.collect_admin_snapshot(store)
+            summary = data["usage_summary"]
+            self.assertIn("totals", summary)
+            self.assertIn("by_purpose", summary)
+            self.assertIn("by_model", summary)
+            self.assertEqual(summary["totals"]["known_calls"], 2)
+            self.assertEqual(summary["totals"]["unknown_calls"], 1)
+
+    def _server(self, store: StateStore) -> tuple[int, Any, threading.Thread]:
+        port = _free_port()
+        server = web.make_server("127.0.0.1", port, state=store)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return port, server, thread
+
+    def _stop(self, server: Any, thread: threading.Thread) -> None:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    def _http_get(self, port: int, path: str) -> tuple[int, dict[str, Any]]:
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8")
+        finally:
+            conn.close()
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            data = {"error": "invalid JSON"}
+        return resp.status, data
+
+    def test_api_usage_endpoint_returns_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(port, "/api/usage?limit=10")
+            finally:
+                self._stop(server, thread)
+            self.assertEqual(status, 200)
+            self.assertIn("totals", data)
+            self.assertEqual(data["totals"]["known_calls"], 2)
+            self.assertEqual(len(data["latest_calls"]), 3)
+            for call in data["latest_calls"]:
+                # Sensitive fields MUST NOT leak.
+                self.assertNotIn("prompt_body", call)
+                self.assertNotIn("executor_log", call)
+
+    def test_api_usage_filter_by_roadmap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            store.record_model_call(
+                roadmap_id="other",
+                task_id="T9",
+                attempt_id="A9",
+                provider="opencode",
+                model="minimax/MiniMax-M3",
+                purpose="executor",
+                input_tokens=1,
+                cached_tokens=0,
+                output_tokens=1,
+            )
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(port, "/api/usage?roadmap=r")
+            finally:
+                self._stop(server, thread)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["filter"]["roadmap_id"], "r")
+            self.assertEqual(len(data["latest_calls"]), 3)
+            self.assertEqual(data["totals"]["known_calls"], 2)
+
+    def test_api_usage_endpoint_empty_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(port, "/api/usage")
+            finally:
+                self._stop(server, thread)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["totals"]["known_calls"], 0)
+            self.assertEqual(data["totals"]["unknown_calls"], 0)
+            self.assertEqual(data["latest_calls"], [])
+
+    def test_render_index_html_has_usage_section(self) -> None:
+        html = web.render_index_html()
+        self.assertIn("Model usage", html)
+        self.assertIn("/api/usage", html)
+        self.assertIn("usage-purpose-rows", html)
+        self.assertIn("usage-model-rows", html)
+        self.assertIn("usage-latest-rows", html)
+        self.assertIn("renderUsage", html)
+        # Unknown must be rendered explicitly so the dashboard never
+        # implies a measured zero.
+        self.assertIn('"unknown"', html)

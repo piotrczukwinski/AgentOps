@@ -168,6 +168,7 @@ Top-level keys (locked by `tests/test_web.py`):
 | `pr_loop_cycles` | `.agentops/pr-loop/<pr>/cycle-N/` | all PRs | `exists=false` when root missing |
 | `recommended_commands` | static list of 9 CLI hints | — | — |
 | `diagnostics` | `db_path`, `repo_root`, `operator_runs_root`, `pr_loop_root`, `generated_at` | — | — |
+| `usage_summary` | `state.model_call_rows()` rollup | full ledger | `totals.known_calls=0` when no calls recorded |
 
 The snapshot is **safe by construction**:
 
@@ -203,3 +204,33 @@ the dashboard. On a fresh checkout, every section renders a
 short empty-state hint explaining what the operator can do
 next (run `agentops plan`, run `agentops run --no-codex`, run
 `agentops pr-loop`).
+
+## 8. Model usage ledger
+
+After the Admin panel, the dashboard renders a second
+**Model usage** card. It is sourced from the `model_calls`
+SQLite table (already part of the schema) and exposes what
+every executor / reviewer call actually cost in tokens. See
+[`docs/usage-ledger.md`](usage-ledger.md) for the full contract.
+
+The card is safe by construction:
+
+- GET only; no body, no side effects.
+- No subprocess is launched; no log file is read; no prompt
+  body is rendered.
+- `latest_calls` is bounded by `--limit` (CLI) / `?limit=` (API)
+  and projects only identifiers + tokens + timestamps.
+- Missing token values render as `unknown` so the dashboard
+  never implies a measured zero.
+- Heuristic reviewer calls are tagged `provider="heuristic"`,
+  `model="heuristic"` so they cannot be mistaken for a paid
+  Codex call.
+
+A compact `usage_summary` is also embedded in the
+`/api/admin` snapshot (see §7) so the operator panel can show
+the usage headline without fetching another endpoint.
+
+A dedicated `GET /api/usage` endpoint exposes the same data
+with optional `?roadmap=` and `?task=` filters; the CLI
+equivalent is `agentops usage [--json] [--limit N]
+[--roadmap ROADMAP_ID] [--task TASK_ID]`.

@@ -256,13 +256,27 @@ read-only, loopback-only maintainer cockpit backed by
 10 events, the 5 most recent operator runs, an
 attention-needed list (each row carrying a copyable CLI hint
 such as `agentops operator-tail <run-id> --lines 200`),
-discovered PR repair cycles, and a copyable list of
-recommended CLI commands. The panel auto-refreshes every
-3 seconds alongside the rest of the dashboard, and it is
-safe to load on a fresh checkout — missing state files
-render empty states instead of errors. The CLI remains the
-source of truth; the UI never executes shell and never
-enables Codex.
+discovered PR repair cycles, a copyable list of recommended
+CLI commands, and a compact `usage_summary` block that
+shows known / unknown model call counts and the latest
+token totals. The panel auto-refreshes every 3 seconds
+alongside the rest of the dashboard, and it is safe to load
+on a fresh checkout — missing state files render empty
+states instead of errors. The CLI remains the source of
+truth; the UI never executes shell and never enables Codex.
+
+Below the Admin panel sits a second **Model usage** card
+backed by `GET /api/usage`. It shows what every executor /
+reviewer call actually cost in tokens (or `unknown` when the
+provider did not expose any), grouped by purpose and by
+`(provider, model)`. Token values come from the Codex JSONL
+`turn.completed.usage` block when Codex is called, and from
+the explicit `AGENTOPS_USAGE_JSON` marker when an executor
+opts into publishing them. Missing values are rendered as
+`unknown`, not `0`; no price estimate is invented. The CLI
+equivalent is `agentops usage [--json]`. See
+[`docs/usage-ledger.md`](docs/usage-ledger.md) for the full
+contract.
 
 ## Roadmap budget
 
@@ -304,8 +318,11 @@ an overnight run cannot burn unlimited resources.
   review JSON the operator already has and turns it into a
   bounded repair prompt.
 * **No full budget pricing ledger.** The roadmap budget
-  *counts* tasks, attempts, and review calls; it does not
-  price tokens.
+  *counts* tasks, attempts, and review calls; the model usage
+  ledger *records* token usage when the provider exposes it,
+  but it never invents a price estimate. See
+  [`docs/usage-ledger.md`](docs/usage-ledger.md) for what is
+  recorded and what stays `unknown`.
 * **Local-only web UI.** The dashboard binds to
   `127.0.0.1:8765` by default. It is not multi-user and not
   designed for remote access.
@@ -354,6 +371,7 @@ agentops/
   runners.py         shell, OpenCode, and Codex subprocess runners
   self_fix.py        bounded self-fix helpers
   state.py           SQLite schema and event log
+  usage.py           model usage normalization + summarization
   validation.py      validation command runner
   web.py             local HTTP server and dashboard
 
@@ -373,6 +391,7 @@ docs/
   public-release-checklist.md
   codex-for-oss-application.md
   public-release-audit.md
+  usage-ledger.md
   demo.md
   case-studies/
     agentops-self-maintenance.md
@@ -427,6 +446,12 @@ tests/
   dashboard, its safety notes, and the recommended workflow.
 * [`docs/admin-panel-architecture.md`](docs/admin-panel-architecture.md)
   — the Admin / Operator panel contract (`GET /api/admin`).
+* [`docs/usage-ledger.md`](docs/usage-ledger.md) — the model
+  usage ledger contract (`GET /api/usage`,
+  `agentops usage`, the `Model usage` dashboard card): what is
+  recorded, what stays `unknown`, what the
+  `AGENTOPS_USAGE_JSON` marker is for, and the explicit
+  safety properties the ledger preserves.
 
 ### CLI and reference
 
@@ -467,12 +492,29 @@ tests/
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the local setup,
-test, lint, and PR conventions. See
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for the community
-standards. See [`SECURITY.md`](SECURITY.md) for how to report
-a vulnerability. See [`AGENTS.md`](AGENTS.md) for the
-agent-facing contributor guide and the safety hard rules.
+AgentOps welcomes small, well-scoped PRs. The reading order for
+a first-time contributor is in
+[`CONTRIBUTING.md`](CONTRIBUTING.md) "Where to start", and the
+module-by-module map of the codebase is in
+[`docs/architecture-map.md`](docs/architecture-map.md). For a
+list of areas that need help this week, see
+[`docs/contributor-roadmap.md`](docs/contributor-roadmap.md).
+
+* [`CONTRIBUTING.md`](CONTRIBUTING.md) — local setup, tests,
+  lint, smoke test, PR conventions, small-PR policy.
+* [`AGENTS.md`](AGENTS.md) — agent-facing contributor guide and
+  the safety hard rules.
+* [`docs/architecture-map.md`](docs/architecture-map.md) —
+  module-by-module map of `agentops/`, with the tests and docs
+  that pin each module's behaviour.
+* [`docs/contributor-roadmap.md`](docs/contributor-roadmap.md) —
+  where the project is, where it is going, and the
+  "good first issue" sized slices.
+* [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — community
+  standards.
+* [`SECURITY.md`](SECURITY.md) — how to report a vulnerability
+  **privately**. Security issues do not go through the public
+  issue tracker.
 
 ## License
 
