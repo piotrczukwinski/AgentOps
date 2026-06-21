@@ -96,8 +96,12 @@ agentops usage --json
 agentops run --roadmap examples/roadmaps/demo-shell.json --no-codex --max-tasks 1
 agentops status
 
-# Private-term grep must come back clean.
-git grep -nE '/home/czuki|BusinessAgent|biuro|antidetect|AgentOps Internal|piotr@local.agentops|business-agent|STAB|admin-web|web-admin|GIT_TERMAL_PROMPT'
+# Private-term grep must come back clean. The exact pattern is
+# defined in AGENTS.md ("No private paths or private project names")
+# and CONTRIBUTING.md "No private paths or private project names".
+# Copy the pattern from there into a shell variable on your machine
+# (do not paste it into a tracked file), then run:
+#   git grep -nE "$PRIVATE_PATTERN" || true
 git diff --check
 ```
 

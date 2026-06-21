@@ -31,7 +31,7 @@ all PRs.
 1. Pick the smallest row that fits a single PR.
 2. Open (or comment on) the issue. For rows that do not have
    one yet, use the
-   [`good_first_issue`](.github/ISSUE_TEMPLATE/good_first_issue.md)
+   [`good_first_issue`](../.github/ISSUE_TEMPLATE/good_first_issue.md)
    template.
 3. Wait for the maintainer to scope the slice with you.
 4. Open a draft PR with a failing test, then land the fix and
@@ -55,7 +55,7 @@ single review pass and no maintainer-only follow-up.
   a cold read, fix a typo, or add a cross-link between two
   existing pages.
 * **Recommended issue:** open one using the
-  [`docs_improvement`](.github/ISSUE_TEMPLATE/docs_improvement.md)
+  [`docs_improvement`](../.github/ISSUE_TEMPLATE/docs_improvement.md)
   template.
 * **Files:** `README.md`, `CONTRIBUTING.md`, or any file under
   `docs/`. Pure markdown changes; no runtime code.
@@ -68,12 +68,12 @@ single review pass and no maintainer-only follow-up.
 * **Description:** record or generate a short, no-API-key
   screenshot / GIF of the local CLI in action, or improve the
   recording recipe in
-  [`docs/demo-recording.md`](docs/demo-recording.md).
+  [`docs/demo-recording.md`](demo-recording.md).
 * **Recommended issue:** open one using the
   `good_first_issue` template.
 * **Files:** `docs/img/` (new asset), a one-line link in
   [`README.md`](../README.md) "Demo screenshot / GIF", and an
-  update to [`docs/demo-recording.md`](docs/demo-recording.md)
+  update to [`docs/demo-recording.md`](demo-recording.md)
   if the recipe changes.
 * **Tests:** none required. CI does not run on image binaries;
   the asset is reviewed manually.
@@ -227,7 +227,7 @@ passes.
 ### Sandboxing recipe examples
 
 * **Description:** additional recipes in
-  [`docs/sandboxing-recipes.md`](docs/sandboxing-recipes.md)
+  [`docs/sandboxing-recipes.md`](sandboxing-recipes.md)
   for running executors under a VM, a container, or a
   dedicated low-privilege user account.
 * **Recommended issue:** open one using the
@@ -243,7 +243,7 @@ passes.
 These rows touch the durable state machine, the safety
 boundaries, the executor plumbing, or the review gate. Open an
 issue first using the
-[`feature_request`](.github/ISSUE_TEMPLATE/feature_request.md)
+[`feature_request`](../.github/ISSUE_TEMPLATE/feature_request.md)
 template, describe the slice, and wait for the maintainer to
 scope it with you before opening a draft PR.
 
@@ -293,7 +293,7 @@ scope it with you before opening a draft PR.
   `feature_request` template.
 * **Files:** `agentops/web.py`, `tests/test_web.py`,
   [`docs/local-web-ui.md`](local-web-ui.md),
-  [`docs/usage-ledger.md`](docs/usage-ledger.md).
+  [`docs/usage-ledger.md`](usage-ledger.md).
 * **Tests:** a `tests/test_web.py` case that asserts the card
   renders `unknown` on a fixture with missing rows.
 * **Risk:** high. The web UI is a safety boundary; do not add
