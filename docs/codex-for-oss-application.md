@@ -119,3 +119,31 @@ the form's hard limit, if any)
   kernel/container sandbox, and **not** a security boundary.
   The safety model in `docs/security.md` and `SECURITY.md` is
   honest about these limits.
+
+## 7. Demo for reviewers
+
+A maintainer-facing demo of AgentOps takes about 60 seconds:
+
+```bash
+git clone https://github.com/piotrczukwinski/AgentOps.git
+cd AgentOps
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e '.[yaml,dev]'
+
+# CLI smoke (no API key needed)
+agentops --help
+agentops doctor
+agentops plan --roadmap examples/roadmaps/demo-shell.json
+
+# Local-only web UI: Admin / Operator panel + per-task / per-run view
+python -m agentops serve
+# open http://127.0.0.1:8765
+```
+
+The dashboard's top card is the **Admin / Operator panel**
+backed by `GET /api/admin`. On a fresh checkout it renders a
+short empty-state hint explaining what to run next
+(`agentops plan` / `agentops run --roadmap … --no-codex` /
+`agentops pr-loop`). The panel is read-only, loopback-only,
+and never enables the Codex reviewer. The CLI is the source
+of truth; the UI is a maintainer cockpit.

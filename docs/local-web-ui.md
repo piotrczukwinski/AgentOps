@@ -90,6 +90,7 @@ python -m agentops serve --port 9000
 | GET    | `/api/runs`                | Active run subprocesses started from this UI. |
 | GET    | `/api/operator-runs`        | List operator runs visible from this UI (read-only). |
 | GET    | `/api/operator-runs/<run_id>/tail?lines=100` | Return the latest attempt's combined.log tail for `<run_id>`. |
+| GET    | `/api/admin`               | Stable, read-only, capped snapshot for the Admin / Operator panel card. |
 | GET    | `/api/logs?task_id=...`    | Task row, artifacts, recent events. |
 | GET    | `/api/artifacts?task_id=...` | Artifact rows for a task. |
 | POST   | `/api/plan`                | `{"roadmap": "..."}` → runs `agentops plan` lint. |
@@ -119,6 +120,46 @@ default, and never mutate the on-disk state. There is no
 endpoint. The dashboard's "Operator runs" card polls the
 list every 3 seconds; the "Tail" button on each row loads
 the matching tail endpoint.
+
+## Admin / Operator panel (read-only)
+
+The dashboard's top card is the **Admin / Operator panel**,
+backed by a single read-only endpoint:
+
+* `GET /api/admin` — stable JSON snapshot of the local
+  maintainer / operator state. The card polls it every
+  3 seconds alongside the rest of the dashboard.
+
+The snapshot has these top-level keys (each is locked by a
+test in `tests/test_web.py` so the dashboard contract cannot
+regress):
+
+| Key | What it contains | Cap |
+|---|---|---|
+| `roadmap_state` | per-roadmap totals, state histogram, recent tasks | 10 recent tasks |
+| `latest_events` | last events from the SQLite state DB | 10 events |
+| `operator_runs` | most recent operator runs + runtime-status histogram | 5 runs |
+| `attention_needed` | operator runs + tasks that need the operator next, each with a copyable `first_cli` suggestion | 25 rows |
+| `pr_loop_cycles` | discovered `.agentops/pr-loop/<pr>/cycle-N/` (paths only, no prompt body) | all PRs |
+| `recommended_commands` | copyable CLI hints | 9 |
+| `diagnostics` | `db_path`, `repo_root`, `operator_runs_root`, `pr_loop_root`, `generated_at` | — |
+
+The snapshot is intentionally **safe by construction**:
+
+* GET only, no body parsing, no side effects.
+* No subprocess is launched; no log file is read.
+* No raw prompt body, no full log, no secret-bearing
+  payload is included — events are projected to a one-line
+  `summary`.
+* Empty / missing state renders empty-state metadata
+  (`"empty": true`, `"exists": false`) instead of a 500.
+* No authentication or session state is added; the
+  endpoint remains loopback-only.
+
+The CLI remains the source of truth. Every `first_cli`
+hint in `attention_needed` is a real CLI command the
+operator can copy into a terminal; the card never tries
+to execute shell.
 
 See `docs/night-run-report.md` for the morning checklist
 that pairs with these endpoints.

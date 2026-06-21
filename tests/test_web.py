@@ -1553,3 +1553,494 @@ class HistoryApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("error", data)
+
+
+# ---------------------------------------------------------------------------
+# /api/admin — public-facing maintainer/operator snapshot
+# ---------------------------------------------------------------------------
+
+
+class AdminSnapshotShapeTests(unittest.TestCase):
+    """Stable JSON shape contract for ``/api/admin``.
+
+    The admin snapshot is the public surface of the operator panel.
+    These tests lock down the top-level keys, the caps, and the
+    empty-state metadata so future refactors cannot break the UI or
+    the CLI consumers of the same snapshot.
+    """
+
+    REQUIRED_TOP_LEVEL_KEYS = {
+        "roadmap_state",
+        "latest_events",
+        "operator_runs",
+        "attention_needed",
+        "pr_loop_cycles",
+        "recommended_commands",
+        "diagnostics",
+    }
+
+    def _server(self, store):
+        port = _free_port()
+        server = web.make_server("127.0.0.1", port, state=store)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return port, server, thread
+
+    def _stop(self, server, thread):
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    def _http_get(self, port, path):
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read()
+            return resp.status, json.loads(body.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def test_admin_endpoint_returns_stable_shape_for_fresh_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        self.assertEqual(status, 200)
+        self.assertEqual(set(data.keys()), self.REQUIRED_TOP_LEVEL_KEYS)
+
+    def test_admin_roadmap_state_empty_for_fresh_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTOPS_OPERATOR_RUNS_ROOT": str(Path(tmp) / "empty")},
+                    clear=False,
+                ):
+                    _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        rs = data["roadmap_state"]
+        self.assertTrue(rs["empty"])
+        self.assertEqual(rs["task_count"], 0)
+        self.assertEqual(rs["per_roadmap"], [])
+        self.assertEqual(rs["recent_tasks"], [])
+        self.assertEqual(rs["state_histogram"], {})
+
+    def test_admin_latest_events_capped_and_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        events = data["latest_events"]
+        self.assertEqual(events["cap"], 10)
+        self.assertEqual(events["count"], 0)
+        self.assertTrue(events["empty"])
+        self.assertEqual(events["items"], [])
+
+    def test_admin_operator_runs_empty_when_no_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTOPS_OPERATOR_RUNS_ROOT": str(Path(tmp) / "empty")},
+                    clear=False,
+                ):
+                    _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        op = data["operator_runs"]
+        self.assertFalse(op["exists"])
+        self.assertEqual(op["count"], 0)
+        self.assertEqual(op["items"], [])
+        self.assertEqual(op["cap"], 5)
+        self.assertEqual(op["runtime_status_histogram"], {})
+
+    def test_admin_attention_empty_for_clean_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTOPS_OPERATOR_RUNS_ROOT": str(Path(tmp) / "empty")},
+                    clear=False,
+                ):
+                    _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        att = data["attention_needed"]
+        self.assertTrue(att["empty"])
+        self.assertEqual(att["count"], 0)
+        self.assertEqual(att["items"], [])
+        self.assertEqual(att["cap"], 25)
+
+    def test_admin_pr_loop_cycles_empty_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.object(web, "_resolve_allowed_roots", return_value=web._AllowedRoots(
+                    repo_root=Path(tmp) / "agentops", tmp_root=Path(tmp) / "scratch",
+                )):
+                    _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        pl = data["pr_loop_cycles"]
+        self.assertFalse(pl["exists"])
+        self.assertEqual(pl["count"], 0)
+        self.assertEqual(pl["items"], [])
+        # root is still surfaced so the operator can run the CLI to inspect.
+        self.assertTrue(pl["root"].endswith(".agentops/pr-loop"))
+
+    def test_admin_diagnostics_excludes_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "GITHUB_TOKEN": "ghp_shouldneverappear",
+                        "OPENAI_API_KEY": "sk-shouldneverappear",
+                    },
+                    clear=False,
+                ):
+                    _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        diag = data["diagnostics"]
+        serialized = json.dumps(diag, sort_keys=True)
+        for forbidden in (
+            "ghp_shouldneverappear",
+            "sk-shouldneverappear",
+            "AGENTOPS_WEB_TOKEN",
+        ):
+            self.assertNotIn(forbidden, serialized)
+        self.assertIn("generated_at", diag)
+        self.assertIn("db_path", diag)
+        self.assertIn("repo_root", diag)
+
+    def test_admin_recommended_commands_are_copyable_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        cmds = data["recommended_commands"]
+        self.assertIsInstance(cmds, list)
+        self.assertGreater(len(cmds), 0)
+        joined = " ".join(cmds)
+        for required in (
+            "agentops status",
+            "agentops review-queue",
+            "agentops operator-status",
+            "agentops operator-tail",
+            "agentops operator-result",
+            "agentops operator-retry",
+            "agentops logs",
+            "agentops pr-loop",
+        ):
+            self.assertIn(required, joined)
+
+    def test_admin_does_not_include_raw_prompt_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            store.event("rmap", None, None, "roadmap.imported", {"tasks": 1})
+            store.event("rmap", "T1", None, "task.ready", {"prompt_body": "SECRET_PROMPT"})
+            store.event("rmap", "T1", "A1", "attempt.finished", {"exit_code": 0, "head_sha": "deadbeef12345678"})
+            port, server, thread = self._server(store)
+            try:
+                _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        serialized = json.dumps(data, sort_keys=True)
+        self.assertNotIn("SECRET_PROMPT", serialized)
+        self.assertNotIn("prompt_body", serialized)
+        # Latest events are capped at 10.
+        self.assertLessEqual(data["latest_events"]["count"], 10)
+
+    def test_admin_latest_events_capped_at_10(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            for i in range(30):
+                store.event("rmap", f"T{i:02d}", None, "task.ready", {"i": i})
+            port, server, thread = self._server(store)
+            try:
+                _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        self.assertEqual(data["latest_events"]["cap"], 10)
+        self.assertEqual(len(data["latest_events"]["items"]), 10)
+
+    def test_admin_attention_includes_stale_pid_operator_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            runs_root = tmp_path / "runs"
+            run_dir = runs_root / ".operator-runs" / "stale-run-001"
+            run_dir.mkdir(parents=True)
+            (run_dir / "combined.log").write_text("line\n", encoding="utf-8")
+            (run_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "stale-run-001",
+                        "name": "stale",
+                        "status": "running",
+                        "pid": 0,
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "failure_category": "stale_pid",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(runs_root)}, clear=False
+                ):
+                    _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        att = data["attention_needed"]
+        self.assertFalse(att["empty"])
+        row = next(
+            (
+                item for item in att["items"]
+                if item.get("kind") == "operator_run" and item.get("run_id") == "stale-run-001"
+            ),
+            None,
+        )
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertIn("stale_pid", row["reasons"])
+        self.assertIn("agentops operator-tail stale-run-001 --lines 200", row["first_cli"])
+
+    def test_admin_attention_includes_awaiting_review_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = _init_repo(tmp_path)
+            roadmap_path = _write_minimal_roadmap(tmp_path, repo)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            from agentops.config import load_roadmap
+            roadmap = load_roadmap(roadmap_path)
+            store.import_roadmap(roadmap)
+            from agentops.models import TaskState
+            store.transition_task("r", "T1", TaskState.READY)
+            store.transition_task("r", "T1", TaskState.AWAITING_REVIEW)
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                    clear=False,
+                ):
+                    _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        att = data["attention_needed"]
+        row = next(
+            (
+                item for item in att["items"]
+                if item.get("kind") == "task" and item.get("task_id") == "T1"
+            ),
+            None,
+        )
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["state"], "awaiting_review")
+        self.assertIn("agentops decide T1", row["first_cli"])
+
+    def test_admin_operator_runs_capped_at_5(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            runs_root = tmp_path / "runs"
+            for i in range(8):
+                run_id = f"run-{i:02d}"
+                run_dir = runs_root / ".operator-runs" / run_id
+                run_dir.mkdir(parents=True)
+                (run_dir / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": run_id,
+                            "name": run_id,
+                            "status": "exited",
+                            "exit_code": 0,
+                            "started_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(runs_root)}, clear=False
+                ):
+                    _status, data = self._http_get(port, "/api/admin")
+            finally:
+                self._stop(server, thread)
+        op = data["operator_runs"]
+        self.assertEqual(op["cap"], 5)
+        self.assertLessEqual(len(op["items"]), 5)
+        self.assertGreaterEqual(op["count"], 8)
+
+    def test_admin_html_renders_admin_card(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    conn.request("GET", "/")
+                    resp = conn.getresponse()
+                    body = resp.read().decode("utf-8")
+                finally:
+                    conn.close()
+            finally:
+                self._stop(server, thread)
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Admin / Operator panel", body)
+        self.assertIn('id="admin-roadmap-rows"', body)
+        self.assertIn('id="admin-event-rows"', body)
+        self.assertIn('id="admin-operator-runs-rows"', body)
+        self.assertIn('id="admin-attention-rows"', body)
+        self.assertIn('id="admin-pr-loop-rows"', body)
+        self.assertIn('id="admin-recommended-commands"', body)
+        self.assertIn("/api/admin", body)
+        # The page must not advertise a generic shell/exec endpoint.
+        for forbidden in ("/api/exec", "/api/shell", "/api/command", "/api/run_command"):
+            self.assertNotIn(forbidden, body)
+
+    def test_admin_html_includes_empty_state_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    conn.request("GET", "/")
+                    resp = conn.getresponse()
+                    body = resp.read().decode("utf-8")
+                finally:
+                    conn.close()
+            finally:
+                self._stop(server, thread)
+        self.assertIn("No roadmaps recorded yet", body)
+        self.assertIn("No events yet", body)
+        self.assertIn("Nothing needs operator attention", body)
+        self.assertIn("No PR repair cycles yet", body)
+
+    def test_admin_html_calls_api_admin_in_javascript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    conn.request("GET", "/")
+                    resp = conn.getresponse()
+                    body = resp.read().decode("utf-8")
+                finally:
+                    conn.close()
+            finally:
+                self._stop(server, thread)
+        self.assertIn('"/api/admin"', body)
+        # renderAdmin must be invoked from the periodic refresh so the card
+        # stays in sync with the rest of the dashboard.
+        self.assertIn("renderAdmin()", body)
+
+    def test_no_exec_or_shell_endpoint_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            port, server, thread = self._server(store)
+            try:
+                for forbidden in ("/api/exec", "/api/shell", "/api/command", "/api/run_command"):
+                    status, _ = self._http_get(port, forbidden)
+                    self.assertEqual(status, 404)
+            finally:
+                self._stop(server, thread)
+
+
+class AdminSnapshotSeedTests(unittest.TestCase):
+    """End-to-end shape test: seed a state DB and a runs directory and
+    verify that the admin snapshot renders the expected rollups.
+    """
+
+    def test_seeded_snapshot_rolls_up_state_histogram(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = _init_repo(tmp_path)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            from agentops.config import load_roadmap
+            from agentops.models import TaskState
+            roadmap_a = load_roadmap(_write_minimal_roadmap(tmp_path, repo))
+            roadmap_b_path = tmp_path / "rmap-b.json"
+            prompt_b = tmp_path / "prompt-b.md"
+            prompt_b.write_text("hi", encoding="utf-8")
+            roadmap_b_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "rmap-b",
+                        "repo": {"id": "x", "path": str(repo)},
+                        "tasks": [
+                            {
+                                "id": "T2",
+                                "kind": "guard",
+                                "prompt": str(prompt_b),
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "branch_prefix": "agentops",
+                                "allowed_files": ["b.txt"],
+                                "review": {"codex": "never"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            roadmap_b = load_roadmap(roadmap_b_path)
+            store.import_roadmap(roadmap_a)
+            store.import_roadmap(roadmap_b)
+            store.transition_task("r", "T1", TaskState.READY)
+            store.transition_task("r", "T1", TaskState.EXECUTOR_RUNNING)
+            store.transition_task("rmap-b", "T2", TaskState.READY)
+            store.transition_task("rmap-b", "T2", TaskState.AWAITING_REVIEW)
+            # Add events.
+            store.event("r", "T1", None, "task.executor_running", {"attempt": 1})
+            store.event("r", "T1", None, "attempt.finished", {"exit_code": 0})
+            data = web.collect_admin_snapshot(store)
+        rs = data["roadmap_state"]
+        self.assertFalse(rs["empty"])
+        self.assertGreaterEqual(rs["task_count"], 2)
+        self.assertEqual(rs["state_histogram"].get("awaiting_review", 0), 1)
+        self.assertEqual(rs["state_histogram"].get("executor_running", 0), 1)
+        per_roadmap = {row["roadmap_id"]: row for row in rs["per_roadmap"]}
+        self.assertIn("r", per_roadmap)
+        self.assertIn("rmap-b", per_roadmap)
+        self.assertGreaterEqual(len(rs["recent_tasks"]), 1)
+        # Events: capped at 10.
+        self.assertLessEqual(len(data["latest_events"]["items"]), 10)
+        # Diagnostics has a generated_at timestamp.
+        self.assertIn("generated_at", data["diagnostics"])
+        # The snapshot exposes the recommended CLI hints.
+        self.assertIn("agentops status", " ".join(data["recommended_commands"]))
