@@ -599,7 +599,7 @@ the streaming combined log:
   the task `BLOCKED` with
   `failure_category: executor_no_output_startup` and a dedicated
   `task.executor_no_output_startup` event. Designed to catch the
-  "executor hung on startup" case the STAB-001 incident exposed.
+  "executor hung on startup" case the observability-incident-001 exposed.
 * `--executor-idle-timeout SECONDS` — if the combined log has
   already grown at least once and then stops growing for this
   many seconds while the executor process is alive, the runner
@@ -749,8 +749,8 @@ checklist. The executor is required to print
 
 The prompt also forbids: pushing to `main` or any protected branch,
 force-pushing, rebasing, weakening or removing existing tests or
-gates, modifying `BusinessAgent` (unless the blocking issue is
-explicitly about BusinessAgent), and merging the PR. The
+gates, modifying the target repository (unless the blocking issue is
+explicitly about that same target repository), and merging the PR. The
 `--max-cycles` guard (default 3) stops the loop from spinning
 forever; once it fires the operator decides the next move.
 
@@ -839,8 +839,8 @@ verdict was wrong) delete the cycle directory before the next run.
   scheduled.
 * The loop never force-pushes, never rebases, never merges the PR,
   and never weakens existing tests or gates.
-* The loop never modifies `BusinessAgent` (the prompt forbids it
-  unless the blocking issue is explicitly about BusinessAgent).
+* The loop never modifies the target repository (the prompt forbids it
+  unless the blocking issue is explicitly about that same target repository).
 * The final merge is always operator-controlled. `safe_to_merge` is
   decision metadata only; the operator decides whether to merge the PR.
 

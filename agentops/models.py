@@ -78,6 +78,15 @@ class ReviewConfig:
     # ``review.reasoning_effort`` alias) ->
     # ``AGENTOPS_CODEX_MODEL_REASONING_EFFORT`` env var -> ``None``.
     model_reasoning_effort: str | None = None
+    # Self-fix: on REQUEST_CHANGES, give the reviewer a bounded write-pass
+    # to apply a small/medium fix directly in the worktree instead of
+    # re-running the executor. The reviewer decides whether to self-fix
+    # or skip; ``self_fix_max_lines`` is guidance and telemetry, not the
+    # hard safety guard. Allowed files, validations, and re-review are.
+    # Default on so trivial REQUEST_CHANGES do not burn a full executor
+    # re-run. Tasks/roadmaps can opt out with ``review.self_fix: false``.
+    self_fix: bool = True
+    self_fix_max_lines: int = 30
 
 
 @dataclass(frozen=True)
@@ -127,7 +136,7 @@ class TaskConfig:
     review: ReviewConfig = field(default_factory=ReviewConfig)
     executor_command: str | None = None
     executor_options: dict[str, Any] = field(default_factory=dict)
-    require_executor_result: bool = False
+    require_executor_result: bool | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

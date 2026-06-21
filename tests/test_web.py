@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
@@ -12,7 +13,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from unittest import mock
 
-from agentops import web
+from agentops import bundles, web
 from agentops.cli import build_parser
 from agentops.state import StateStore
 
@@ -110,6 +111,75 @@ class WebRenderTests(unittest.TestCase):
         self.assertIn("/api/artifacts", html)
         # The page must not contain a generic shell or curl command helper.
         self.assertNotIn("shell", html.lower().split("style")[1].split("</style>")[0])
+
+
+class FrontendBundlesTests(unittest.TestCase):
+    """T6 frontend contracts: bundles + run-launcher flags render into HTML.
+
+    These are pure HTML-string assertions (no browser); they match the
+    existing :class:`WebRenderTests` pattern.
+    """
+
+    def test_render_has_bundle_and_run_anchors(self) -> None:
+        html = web.render_index_html()
+        # New anchors required for the Bundles page and Run Launcher.
+        self.assertIn("/api/bundles", html)
+        self.assertIn("/api/runs", html)
+        self.assertIn("bundle-upload-btn", html)
+        self.assertIn("bundle-validate-btn", html)
+        self.assertIn("Run with Codex review", html)
+        self.assertIn("run-autonomous", html)
+        # The title and legacy endpoints must still be present.
+        self.assertIn("AgentOps Local UI", html)
+        self.assertIn("/api/status", html)
+        self.assertIn("/api/plan", html)
+        self.assertIn("/api/run", html)
+
+    def test_render_has_operator_runs_stream_anchor(self) -> None:
+        html = web.render_index_html()
+        # T7 will wire a real live stream button; for T6 we only require the
+        # word "stream" to be reachable in the rendered template so the
+        # follow-up task can replace the placeholder with a real button.
+        self.assertIn("stream", html)
+
+
+class FrontendMonitorHistoryTests(unittest.TestCase):
+    """T7 frontend contracts: Monitor (live SSE) + History browser render.
+
+    These are pure HTML-string assertions (no browser) following the same
+    pattern as :class:`WebRenderTests` and :class:`FrontendBundlesTests`.
+    """
+
+    def test_render_has_monitor_and_history_anchors(self) -> None:
+        html = web.render_index_html()
+        # New anchors required for the Monitor (live SSE) + History sections.
+        self.assertIn("operator-run-select", html)
+        self.assertIn("monitor-start-btn", html)
+        self.assertIn("EventSource", html)
+        self.assertIn("history-rows", html)
+        self.assertIn("log-view-btn", html)
+        self.assertIn("/api/run-history", html)
+        self.assertIn("/api/run-logs", html)
+
+    def test_render_keeps_legacy_anchors(self) -> None:
+        # T7 regression guard: every anchor added by T1..T6 must still
+        # render so the page is forward-compatible with the merged stack.
+        html = web.render_index_html()
+        self.assertIn("AgentOps Local UI", html)
+        self.assertIn("/api/status", html)
+        self.assertIn("/api/plan", html)
+        self.assertIn("/api/run", html)
+        self.assertIn("/api/bundles", html)
+
+    def test_render_escapes_javascript_newlines(self) -> None:
+        # Python triple-quoted templates must emit JS "\\n" escapes, not raw
+        # newline characters inside string literals, otherwise the whole
+        # dashboard script fails to parse and no buttons are wired.
+        html = web.render_index_html()
+        self.assertIn('+ "\\n";', html)
+        self.assertIn('[truncated, showing tail]\\n', html)
+        self.assertNotIn('+ "\n";', html)
+        self.assertNotIn('[truncated, showing tail]\n', html)
 
 
 class WebSafetyTests(unittest.TestCase):
@@ -302,19 +372,29 @@ class WebApiTests(unittest.TestCase):
         self.assertFalse(data["started"])
         self.assertIn("outside allowed roots", data["error"])
 
-    def test_run_endpoint_rejects_codex_on(self) -> None:
-        status, data = self._post("/api/run", {"roadmap": str(self.roadmap), "no_codex": False})
-        self.assertEqual(status, 400)
-        self.assertFalse(data["started"])
+    def test_run_endpoint_allows_codex_review(self) -> None:
+        fake_proc = mock.Mock(pid=1234)
+        with mock.patch("agentops.web.subprocess.Popen", return_value=fake_proc) as popen:
+            status, data = self._post(
+                "/api/run",
+                {"roadmap": str(self.roadmap), "no_codex": False, "reviewer": "codex"},
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["started"])
+        argv = popen.call_args.args[0]
+        db_idx = argv.index("--db")
+        self.assertEqual(Path(argv[db_idx + 1]), self.db.resolve())
+        self.assertNotIn("--no-codex", argv)
+        self.assertIn("--reviewer", argv)
+        self.assertEqual(argv[argv.index("--reviewer") + 1], "codex")
 
     def test_run_endpoint_does_not_use_shell(self) -> None:
-        # The argv must be a list (no shell) and must not contain any string
-        # of "no_codex" except the literal flag. We also assert no codex flag
-        # is present in the constructed command.
+        # The argv must be a list (no shell) and can enable Codex review by
+        # omitting --no-codex unless the caller explicitly asks for it.
         argv = web.build_run_command(str(self.roadmap), python_executable="python")
         self.assertIsInstance(argv, list)
         self.assertNotIn("--codex", argv)
-        self.assertIn("--no-codex", argv)
+        self.assertNotIn("--no-codex", argv)
         # argv must not contain any user-injected shell metacharacters as a
         # single argument.
         for arg in argv:
@@ -499,13 +579,28 @@ class WebEnvSafetyTests(unittest.TestCase):
             "USER": "tester",
         }
         with mock.patch.dict(os.environ, env, clear=True):
-            safe = web._safe_subprocess_env()
+            safe = web._safe_subprocess_env(no_codex=True)
         self.assertNotIn("GITHUB_TOKEN", safe)
         self.assertNotIn("OPENAI_API_KEY", safe)
         self.assertNotIn("AGENTOPS_WEB_TOKEN", safe)
         self.assertEqual(safe["AGENTOPS_NO_CODEX"], "1")
         self.assertEqual(safe["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(safe["GIT_ASKPASS"], "/bin/false")
+
+    def test_safe_subprocess_env_allows_model_keys_for_codex(self) -> None:
+        env = {
+            "PATH": "/usr/bin",
+            "GITHUB_TOKEN": "secret",
+            "OPENAI_API_KEY": "model-secret",
+            "ANTHROPIC_API_KEY": "model-secret",
+            "AGENTOPS_NO_CODEX": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            safe = web._safe_subprocess_env(no_codex=False)
+        self.assertNotIn("GITHUB_TOKEN", safe)
+        self.assertEqual(safe["OPENAI_API_KEY"], "model-secret")
+        self.assertEqual(safe["ANTHROPIC_API_KEY"], "model-secret")
+        self.assertNotIn("AGENTOPS_NO_CODEX", safe)
 
 
 if __name__ == "__main__":
@@ -601,18 +696,55 @@ class OperatorRunsEndpointTests(unittest.TestCase):
         for key in (
             "run_id",
             "name",
+            "status",
             "canonical_status",
             "runtime_status",
+            "runtime_status_alias",
+            "runtime_status_note",
             "pid",
             "pid_alive",
             "active_attempt",
             "active_combined_log",
             "log_size_bytes",
             "idle_for_seconds",
+            "failure_category",
             "result_json_present",
             "suggested_action",
         ):
             self.assertIn(key, sample)
+
+    def test_operator_runs_endpoint_surfaces_stale_pid_overlay(self):
+        # AO-AUDIT C9: a run whose persisted status.json says "running"
+        # but whose pid is gone must surface as stale_pid in the web UI
+        # without the operator having to run `operator-status --reconcile`.
+        with mock.patch.dict(os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False):
+            run = self.repo / ".operator-runs" / "20260617T000200Z-stale-deadbeef"
+            run.mkdir(parents=True, exist_ok=True)
+            (run / "combined.log").write_text("line\n", encoding="utf-8")
+            (run / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "20260617T000200Z-stale-deadbeef",
+                        "name": "stale",
+                        "status": "running",
+                        "pid": 0,
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "failure_category": "stale_pid",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status, data = self._get("/api/operator-runs")
+        self.assertEqual(status, 200)
+        row = next(r for r in data["runs"] if r["run_id"] == "20260617T000200Z-stale-deadbeef")
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["canonical_status"], "running")
+        self.assertEqual(row["runtime_status"], "stale_pid")
+        self.assertEqual(row["runtime_status_alias"], "exited")
+        self.assertIn("pid not alive", row["runtime_status_note"] or "")
+        self.assertFalse(row["pid_alive"])
+        self.assertEqual(row["failure_category"], "stale_pid")
+        self.assertEqual(row["suggested_action"], "operator-retry")
 
     def test_operator_runs_tail_returns_latest_log(self):
         with mock.patch.dict(os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False):
@@ -623,6 +755,21 @@ class OperatorRunsEndpointTests(unittest.TestCase):
         self.assertEqual(data["lines"], 2)
         self.assertIn("c", data["text"])
         self.assertIn("d", data["text"])
+        # AO-AUDIT C9: the per-run tail endpoint also surfaces the
+        # runtime overlay so the detail view shows stale_pid /
+        # failure_category without a separate status endpoint.
+        run = data.get("run")
+        self.assertIsInstance(run, dict)
+        self.assertEqual(run["run_id"], "20260617T000000Z-fake-cccccccc")
+        for key in (
+            "runtime_status",
+            "runtime_status_alias",
+            "runtime_status_note",
+            "failure_category",
+            "idle_for_seconds",
+            "suggested_action",
+        ):
+            self.assertIn(key, run)
 
     def test_operator_runs_tail_rejects_traversal(self):
         status, _ = self._get("/api/operator-runs/..%2F..%2Fetc%2Fpasswd/tail?lines=10")
@@ -651,6 +798,10 @@ class OperatorRunsEndpointTests(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         self.assertIn("Operator runs (monitor)", body)
         self.assertIn("/api/operator-runs", body)
+        # AO-AUDIT C9: the operator-runs table surfaces the persisted
+        # status, the runtime overlay, and failure_category columns.
+        self.assertIn("runtime-stale", body)
+        self.assertIn("status-dot stale", body)
         for forbidden in ("/api/exec", "/api/shell", "/api/command", "/api/run_command"):
             self.assertNotIn(forbidden, body)
 
@@ -659,3 +810,746 @@ class OperatorRunsEndpointTests(unittest.TestCase):
             status, data = self._get(forbidden)
             self.assertEqual(status, 404)
             self.assertIn("not found", data["error"].lower())
+
+
+# ---------------------------------------------------------------------------
+# Bundle + validation + run-launcher API (AO-ADMIN-T3-WEB-BUNDLE-RUN-API)
+# ---------------------------------------------------------------------------
+
+
+class BundleApiTests(unittest.TestCase):
+    """Unit tests for the bundle, validation, and run-flag API additions.
+
+    These tests call the module-level data fetchers and ``build_run_command``
+    directly (no HTTP server). The HTTP-shape tests for upload/validate live
+    in the existing :class:`WebApiTests` set when the server is wired up.
+    """
+
+    def test_build_run_command_with_flags(self) -> None:
+        real_repo = Path(__file__).resolve().parent.parent
+        roadmap = real_repo / "examples" / "roadmaps" / "demo-shell.json"
+        argv = web.build_run_command(
+            str(roadmap),
+            no_codex=True,
+            autonomous=True,
+            reviewer="heuristic",
+            max_tasks=2,
+        )
+        self.assertIn("--autonomous", argv)
+        reviewer_idx = argv.index("--reviewer")
+        self.assertEqual(argv[reviewer_idx + 1], "heuristic")
+        max_tasks_idx = argv.index("--max-tasks")
+        self.assertEqual(argv[max_tasks_idx + 1], "2")
+        self.assertIn("--no-codex", argv)
+
+    def test_build_run_command_defaults(self) -> None:
+        real_repo = Path(__file__).resolve().parent.parent
+        roadmap = real_repo / "examples" / "roadmaps" / "demo-shell.json"
+        argv = web.build_run_command(str(roadmap))
+        self.assertNotIn("--no-codex", argv)
+        self.assertNotIn("--autonomous", argv)
+        self.assertNotIn("--reviewer", argv)
+        self.assertNotIn("--max-tasks", argv)
+
+    def test_collect_bundles_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            self.assertFalse((tmp_path / "bundles").exists())
+            result = web.collect_bundles(repo_root=tmp_path)
+            self.assertEqual(result, {"bundles": []})
+            self.assertTrue((tmp_path / "bundles").is_dir())
+
+    def test_collect_bundles_lists_unpacked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle_dir = tmp_path / "bundles" / "demo"
+            bundle_dir.mkdir(parents=True)
+            (bundle_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "name": "demo",
+                        "version": "1.0.0",
+                        "roadmap": "roadmap.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (bundle_dir / "roadmap.json").write_text("{}", encoding="utf-8")
+            result = web.collect_bundles(repo_root=tmp_path)
+            self.assertEqual(len(result["bundles"]), 1)
+            entry = result["bundles"][0]
+            self.assertEqual(entry["name"], "demo")
+            self.assertEqual(entry["version"], "1.0.0")
+            self.assertEqual(entry["roadmap_path"], str(bundle_dir / "roadmap.json"))
+            self.assertEqual(entry["dir"], str(bundle_dir))
+
+    def test_collect_bundle_validation_rejects_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            web.collect_bundle_validation("../x", repo_root=Path(tmp))
+
+    def test_unpack_bundle_endpoint_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as src_tmp:
+            src = Path(src_tmp) / "srcbundle"
+            src.mkdir()
+            (src / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "name": "demo",
+                        "version": "1.0.0",
+                        "roadmap": "roadmap.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (src / "roadmap.json").write_text("{}", encoding="utf-8")
+            zip_path = Path(src_tmp) / "demo.zip"
+            bundles.pack_bundle(src, zip_path)
+            with tempfile.TemporaryDirectory() as dest_tmp:
+                dest_root = Path(dest_tmp)
+                bundles_dir = dest_root / "bundles"
+                bundles_dir.mkdir()
+            unpacked = bundles.unpack_bundle(zip_path, bundles_dir)
+            self.assertEqual(unpacked.manifest.name, "demo")
+            self.assertEqual(unpacked.manifest.version, "1.0.0")
+
+
+# ---------------------------------------------------------------------------
+# SSE live-log streaming endpoints (AO-ADMIN-T4-WEB-SSE-STREAMS)
+# ---------------------------------------------------------------------------
+
+
+class SseStreamTests(unittest.TestCase):
+    """Unit + smoke tests for the SSE live-log streaming endpoints.
+
+    The pure-helper tests exercise the framing format, the single-component
+    path validator, and the per-task log resolver without an HTTP server.
+    The endpoint tests use the real :class:`ThreadingHTTPServer` +
+    :class:`http.client.HTTPConnection` pair to confirm the wire format and
+    the path-traversal rejection over a real socket.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Spin up one server for the endpoint tests; the pure-helper tests
+        # ignore it. A class-level fixture keeps the pure tests fast while
+        # still letting the end-to-end tests use the same pattern as the
+        # rest of this file.
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name)
+        cls.repo = _init_repo(cls.tmp)
+        cls.db = cls.tmp / "state.sqlite"
+        cls.store = StateStore(cls.db)
+        cls.store.init()
+        cls.port = _free_port()
+        cls.server = web.make_server("127.0.0.1", cls.port, state=cls.store)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                conn = HTTPConnection("127.0.0.1", cls.port, timeout=1)
+                conn.connect()
+                conn.close()
+                return
+            except OSError:
+                time.sleep(0.05)
+        raise RuntimeError("SSE test server did not start")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls._tmp.cleanup()
+
+    # --- pure-helper tests -------------------------------------------------
+
+    def test_format_sse_frame_log_event(self) -> None:
+        out = web.format_sse_frame("log", {"run_id": "r1", "text": "hello\nworld"})
+        # Event line comes first, then one data: line per source line, then
+        # the SSE blank line terminator.
+        self.assertTrue(out.startswith("event: log\n"))
+        self.assertIn("data: {\"run_id\": \"r1\", \"text\": \"hello\\nworld\"}\n", out)
+        self.assertTrue(out.endswith("\n\n"))
+
+    def test_format_sse_frame_string_payload(self) -> None:
+        out = web.format_sse_frame("done", "ok")
+        self.assertEqual(out, "event: done\ndata: ok\n\n")
+
+    def test_format_sse_frame_no_event(self) -> None:
+        out = web.format_sse_frame("", "raw message")
+        self.assertTrue(out.startswith("data: raw message\n"))
+        self.assertTrue(out.endswith("\n\n"))
+        self.assertNotIn("event:", out)
+
+    def test_format_sse_frame_multiline_payload(self) -> None:
+        out = web.format_sse_frame("log", "line1\nline2\nline3")
+        # Each source line becomes its own data: line; no raw newlines leak.
+        self.assertIn("data: line1\n", out)
+        self.assertIn("data: line2\n", out)
+        self.assertIn("data: line3\n", out)
+        self.assertTrue(out.endswith("\n\n"))
+        # A raw newline must NEVER appear inside a data: line; the SSE wire
+        # format requires the data to be split.
+        for bad in ("data: line1\nline2", "data: line2\nline3"):
+            self.assertNotIn(bad, out)
+
+    def test_require_single_component_accepts_simple(self) -> None:
+        self.assertEqual(web._require_single_component("foo"), "foo")
+        self.assertEqual(web._require_single_component("foo-bar_1.0"), "foo-bar_1.0")
+
+    def test_require_single_component_rejects_traversal(self) -> None:
+        with self.assertRaises(ValueError):
+            web._require_single_component("../x")
+        with self.assertRaises(ValueError):
+            web._require_single_component("foo/../bar")
+        with self.assertRaises(ValueError):
+            web._require_single_component("a/b")
+        with self.assertRaises(ValueError):
+            web._require_single_component("a\\b")
+        with self.assertRaises(ValueError):
+            web._require_single_component("")
+        with self.assertRaises(ValueError):
+            web._require_single_component("   ")
+
+    def test_resolve_task_combined_log_picks_highest_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            t1 = runs / "rmap" / "T1"
+            (t1 / "1").mkdir(parents=True)
+            (t1 / "1" / "executor.combined.log").write_text("first\n", encoding="utf-8")
+            (t1 / "3").mkdir(parents=True)
+            (t1 / "3" / "executor.combined.log").write_text("third\n", encoding="utf-8")
+            # Out-of-order creation: the resolver must sort by attempt
+            # number, not by mtime.
+            (t1 / "2").mkdir(parents=True)
+            (t1 / "2" / "executor.combined.log").write_text("second\n", encoding="utf-8")
+            result = web.resolve_task_combined_log(runs, "rmap", "T1")
+            self.assertEqual(result, t1 / "3" / "executor.combined.log")
+
+    def test_resolve_task_combined_log_skips_attempts_without_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            t1 = runs / "rmap" / "T1"
+            (t1 / "1").mkdir(parents=True)
+            (t1 / "1" / "executor.combined.log").write_text("first\n", encoding="utf-8")
+            (t1 / "2").mkdir(parents=True)
+            # Attempt 2 has no log file; the resolver must fall back to 1.
+            result = web.resolve_task_combined_log(runs, "rmap", "T1")
+            self.assertEqual(result, t1 / "1" / "executor.combined.log")
+
+    def test_resolve_task_combined_log_returns_none_when_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            # Runs root does not even exist yet.
+            self.assertIsNone(web.resolve_task_combined_log(runs, "rmap", "T1"))
+            # Runs root exists but the per-task dir is missing.
+            runs.mkdir()
+            self.assertIsNone(web.resolve_task_combined_log(runs, "rmap", "T1"))
+            # Task dir exists but no attempts.
+            (runs / "rmap" / "T1").mkdir(parents=True)
+            self.assertIsNone(web.resolve_task_combined_log(runs, "rmap", "T1"))
+            # Task dir has a non-numeric entry only.
+            bogus = runs / "rmap" / "T1" / "notanumber"
+            bogus.mkdir()
+            self.assertIsNone(web.resolve_task_combined_log(runs, "rmap", "T1"))
+
+    def test_resolve_task_combined_log_handles_missing_root(self) -> None:
+        # The runs root does not exist; the resolver must not raise.
+        self.assertIsNone(web.resolve_task_combined_log(Path("/no/such/path"), "r", "t"))
+
+    def test_resolve_task_combined_log_any_roadmap_picks_highest_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            old = runs / "old-roadmap" / "T1" / "5"
+            old.mkdir(parents=True)
+            (old / "executor.combined.log").write_text("old\n", encoding="utf-8")
+            latest = runs / "new-roadmap" / "T1" / "6"
+            latest.mkdir(parents=True)
+            (latest / "executor.combined.log").write_text("latest\n", encoding="utf-8")
+            ignored = runs / "../bad" / "T1" / "99"
+            ignored.mkdir(parents=True)
+
+            result = web.resolve_task_combined_log_any_roadmap(runs, "T1")
+
+            self.assertIsNotNone(result)
+            roadmap, log_path = result or ("", Path())
+            self.assertEqual(roadmap, "new-roadmap")
+            self.assertEqual(log_path, latest / "executor.combined.log")
+
+    def test_default_agentops_runs_root_under_repo(self) -> None:
+        real_repo = Path(__file__).resolve().parent.parent
+        with mock.patch.object(
+            web, "_resolve_allowed_roots", return_value=web._AllowedRoots(
+                repo_root=real_repo, tmp_root=Path("/tmp")
+            )
+        ):
+            self.assertEqual(
+                web._default_agentops_runs_root(), real_repo / ".agentops" / "runs"
+            )
+
+    # --- endpoint tests ----------------------------------------------------
+
+    def _get_raw(self, path: str, *, timeout: float = 5.0) -> bytes:
+        # Use a raw socket because ``http.client.HTTPResponse.read`` reads
+        # through a ``BufferedReader`` that tries to fill its 8 KiB buffer
+        # before returning; for a small SSE response that would block
+        # forever. ``socket.makefile`` with a small read buffer streams
+        # the response as it arrives.
+        import socket as _socket
+        with _socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as s:
+            s.sendall(
+                f"GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode("ascii")
+            )
+            chunks: list[bytes] = []
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    chunk = s.recv(4096)
+                except (TimeoutError, OSError):
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"event: done" in b"".join(chunks):
+                    break
+        data = b"".join(chunks)
+        # Split off headers; the test only asserts on the body.
+        _, _, body = data.partition(b"\r\n\r\n")
+        return body
+
+    def test_operator_stream_endpoint_rejects_traversal(self) -> None:
+        # Path-traversal run ids are rejected with 400 (no SSE upgrade).
+        with mock.patch.dict(
+            os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False
+        ):
+            conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+            try:
+                conn.request(
+                    "GET", "/api/operator-runs/..%2F..%2Fetc%2Fpasswd/stream"
+                )
+                resp = conn.getresponse()
+                # Read the small JSON error body.
+                body = resp.read()
+            finally:
+                conn.close()
+        self.assertEqual(resp.status, 400)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("error", payload)
+        self.assertIn("single path component", payload["error"])
+
+    def test_operator_stream_endpoint_sends_initial_tail_and_done(self) -> None:
+        # End-to-end smoke: a complete, static log must produce one
+        # ``event: log`` frame containing the last 200 lines, then a
+        # ``event: done`` frame once the loop decides the run is closed.
+        with mock.patch.dict(
+            os.environ, {"AGENTOPS_OPERATOR_RUNS_ROOT": str(self.repo)}, clear=False
+        ):
+            _seed_operator_run(
+                self.repo,
+                "20260617T000000Z-fake-stream-1",
+                combined_log="alpha\nbeta\ngamma\n",
+            )
+            body = self._get_raw(
+                "/api/operator-runs/20260617T000000Z-fake-stream-1/stream"
+                "?max_seconds=1&idle_seconds=1",
+                timeout=8.0,
+            )
+        text = body.decode("utf-8", errors="replace")
+        # The body must contain the SSE frames; the HTTP headers (which
+        # carry ``text/event-stream``) are stripped by ``_get_raw``.
+        self.assertIn("event: log", text)
+        self.assertIn("data: {\"run_id\":", text)
+        self.assertIn("alpha", text)
+        self.assertIn("beta", text)
+        self.assertIn("gamma", text)
+        self.assertIn("event: done", text)
+        self.assertIn("\"reason\":", text)
+        # pid_alive is forwarded by the operator-run endpoint.
+        self.assertIn("\"pid_alive\":", text)
+
+    def test_task_stream_endpoint_resolves_log_without_roadmap(self) -> None:
+        runs = self.repo / ".agentops" / "runs"
+        log_dir = runs / "roadmap-a" / "T1" / "2"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "executor.combined.log").write_text(
+            "task-alpha\ntask-beta\n", encoding="utf-8"
+        )
+
+        with mock.patch.object(
+            web, "_resolve_allowed_roots", return_value=web._AllowedRoots(
+                repo_root=self.repo, tmp_root=Path("/tmp")
+            )
+        ):
+            body = self._get_raw(
+                "/api/tasks/T1/stream?max_seconds=1&idle_seconds=1",
+                timeout=8.0,
+            )
+
+        text = body.decode("utf-8", errors="replace")
+        self.assertIn("event: log", text)
+        self.assertIn("task-alpha", text)
+        self.assertIn("task-beta", text)
+        self.assertIn("event: done", text)
+
+    def test_stream_log_loop_flushes_final_buffer_before_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "executor.combined.log"
+            log_path.write_text("", encoding="utf-8")
+            handler = web.AgentOpsRequestHandler.__new__(web.AgentOpsRequestHandler)
+            handler.wfile = io.BytesIO()
+
+            def append_partial() -> None:
+                time.sleep(0.1)
+                log_path.write_text("partial-final", encoding="utf-8")
+
+            writer = threading.Thread(target=append_partial)
+            writer.start()
+            try:
+                handler._stream_log_loop(
+                    log_path=log_path,
+                    id_field="task_id",
+                    id_value="T1",
+                    max_seconds=1,
+                    idle_seconds=5,
+                    from_end=True,
+                    tail_lines=200,
+                    is_alive=None,
+                    include_pid_alive=False,
+                )
+            finally:
+                writer.join(timeout=5)
+
+            text = handler.wfile.getvalue().decode("utf-8")
+            self.assertIn("event: log", text)
+            self.assertIn("partial-final", text)
+            self.assertLess(text.index("partial-final"), text.index("event: done"))
+
+
+class HistoryApiTests(unittest.TestCase):
+    """Tests for the T5 run-history, task-attempts, and run-log APIs."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        # The repo_root for read_run_log tests is a *plain* directory; we
+        # do not need a real git repo because the log read never invokes
+        # git, just resolves a path under .agentops/runs.
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        self.store = StateStore(self.tmp / "state.sqlite")
+
+    # --- read_run_log -------------------------------------------------------
+
+    def test_read_run_log_rejects_traversal(self) -> None:
+        with self.assertRaises(ValueError):
+            web.read_run_log("..", "t", "1", "executor.combined.log", repo_root=self.repo)
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "..", "1", "executor.combined.log", repo_root=self.repo)
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "..", "executor.combined.log", repo_root=self.repo)
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "1", "../x", repo_root=self.repo)
+        # Path-separator inside a component also rejected.
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "1", "sub/dir.log", repo_root=self.repo)
+        # Unknown kind rejected even if every other component is fine.
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "1", "secret.log", repo_root=self.repo)
+        with self.assertRaises(ValueError):
+            web.read_run_log("rmap", "t", "1", "", repo_root=self.repo)
+
+    def test_read_run_log_missing_and_present(self) -> None:
+        log_path = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "1"
+        log_path.mkdir(parents=True)
+        (log_path / "executor.combined.log").write_text("hello world", encoding="utf-8")
+
+        present = web.read_run_log(
+            "rmap", "T1", "1", "executor.combined.log", repo_root=self.repo
+        )
+        self.assertTrue(present["found"])
+        self.assertIn("hello world", present["text"])
+        self.assertFalse(present["truncated"])
+        self.assertEqual(present["size"], len("hello world"))
+
+        missing = web.read_run_log(
+            "rmap", "T1", "1", "executor.stderr.log", repo_root=self.repo
+        )
+        self.assertFalse(missing["found"])
+        self.assertTrue(missing["path"].endswith("executor.stderr.log"))
+
+        no_dir = web.read_run_log(
+            "rmap", "T1", "9", "executor.combined.log", repo_root=self.repo
+        )
+        self.assertFalse(no_dir["found"])
+
+    def test_read_run_log_truncates_large_file(self) -> None:
+        log_dir = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "1"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "executor.combined.log"
+        log_file.write_bytes(b"x" * 300_000)
+
+        result = web.read_run_log(
+            "rmap",
+            "T1",
+            "1",
+            "executor.combined.log",
+            max_bytes=1000,
+            repo_root=self.repo,
+        )
+        self.assertTrue(result["found"])
+        self.assertTrue(result["truncated"])
+        self.assertLessEqual(len(result["text"]), 1000)
+        # The returned text is the tail, so the byte at index -1 must be 'x'.
+        self.assertTrue(result["text"].endswith("x"))
+
+    def test_read_run_log_refuses_path_outside_runs_root(self) -> None:
+        # A symlink inside the runs root that resolves outside the runs
+        # root must NOT be served: the contained check should trip.
+        # We create a directory that is a symlink to a file outside.
+        runs_root = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "1"
+        runs_root.mkdir(parents=True)
+        outside = self.tmp / "outside.txt"
+        outside.write_text("outside-data", encoding="utf-8")
+        try:
+            (runs_root / "executor.combined.log").symlink_to(outside)
+            symlink_path = runs_root / "executor.combined.log"
+            self.assertTrue(symlink_path.is_symlink())
+            # The file is resolvable but resolves OUTSIDE the runs root, so
+            # the helper must refuse to read it.
+            with self.assertRaises(ValueError):
+                web.read_run_log(
+                    "rmap", "T1", "1", "executor.combined.log", repo_root=self.repo
+                )
+        except (OSError, NotImplementedError):
+            # Some filesystems (Windows) do not support symlinks; skip.
+            self.skipTest("symlink unsupported on this filesystem")
+
+    def test_read_run_log_refuses_symlink_to_other_attempt(self) -> None:
+        attempt_one = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "1"
+        attempt_two = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "2"
+        attempt_one.mkdir(parents=True)
+        attempt_two.mkdir(parents=True)
+        target = attempt_two / "executor.combined.log"
+        target.write_text("attempt-two-secret", encoding="utf-8")
+        try:
+            (attempt_one / "executor.combined.log").symlink_to(target)
+            with self.assertRaises(ValueError):
+                web.read_run_log(
+                    "rmap", "T1", "1", "executor.combined.log", repo_root=self.repo
+                )
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink unsupported on this filesystem")
+
+    # --- collect_run_history ------------------------------------------------
+
+    def test_collect_run_history_from_state(self) -> None:
+        self.store.init()
+        self.store.event(
+            "rmap-history", "T-history", "1", "roadmap.finished", {"run_verdict": "passed"}
+        )
+        result = web.collect_run_history(self.store)
+        runs = result["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["roadmap_id"], "rmap-history")
+        self.assertEqual(runs[0]["run_verdict"], "passed")
+        self.assertIsInstance(runs[0]["seq"], int)
+
+    def test_collect_run_history_ignores_other_event_types(self) -> None:
+        self.store.init()
+        self.store.event("rmap-1", "T1", "1", "attempt.started", {"attempt_no": 1})
+        self.store.event("rmap-1", "T1", "1", "roadmap.finished", {"run_verdict": "ok"})
+        runs = web.collect_run_history(self.store)["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["run_verdict"], "ok")
+
+    def test_collect_run_history_handles_corrupt_payload(self) -> None:
+        # Inject a corrupt payload directly: not a JSON object, not a JSON
+        # string. The helper must return an empty dict for run_verdict
+        # and still include the row, never raising.
+        self.store.init()
+        self.store.event("rmap-x", "T-x", "1", "roadmap.finished", {"run_verdict": "ok"})
+        # Direct DB poke so the payload_json column holds a non-JSON string.
+        with self.store.connect() as conn:
+            conn.execute(
+                "UPDATE events SET payload_json=? WHERE type='roadmap.finished'",
+                ("not-json-{",),
+            )
+        runs = web.collect_run_history(self.store)["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertIsNone(runs[0]["run_verdict"])
+
+    # --- collect_task_attempts ---------------------------------------------
+
+    def test_collect_task_attempts_unknown(self) -> None:
+        self.store.init()
+        result = web.collect_task_attempts(self.store, "NOPE")
+        self.assertFalse(result["found"])
+        self.assertEqual(result["task_id"], "NOPE")
+        self.assertEqual(result["attempts"], [])
+
+    def test_collect_task_attempts_known(self) -> None:
+        # Use the public StateStore API to record an attempt, then make
+        # sure the helper surfaces it.
+        from agentops.models import (
+            RepoConfig,
+            ReviewConfig,
+            RoadmapConfig,
+            TaskConfig,
+            TaskState,
+        )
+
+        self.store.init()
+        repo = RepoConfig(
+            id="r", path=Path("/tmp"), base_branch="main", integration_branch="int"
+        )
+        # Build a minimal task + roadmap to satisfy the schema and
+        # ``create_attempt``.
+        task = TaskConfig(
+            id="T1",
+            kind="guard",
+            risk=1,
+            priority=10,
+            prompt_path=Path("/tmp/p.md"),
+            branch_prefix="agentops",
+            allowed_files=[],
+            review=ReviewConfig(codex="never"),
+        )
+        self.store.import_roadmap(
+            RoadmapConfig(
+                version=1,
+                roadmap_id="r-collect",
+                repo=repo,
+                tasks=[task],
+            )
+        )
+        self.store.transition_task("r-collect", "T1", TaskState.EXECUTOR_RUNNING)
+        self.store.create_attempt(
+            "r-collect", task, 1, self.tmp / "ws", "branch-x", "base-sha"
+        )
+
+        result = web.collect_task_attempts(self.store, "T1")
+        self.assertTrue(result["found"])
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["attempt_no"], 1)
+        self.assertIsNotNone(result["task"])
+
+    def test_collect_task_attempts_empty_task_id(self) -> None:
+        self.store.init()
+        result = web.collect_task_attempts(self.store, "")
+        self.assertFalse(result["found"])
+        self.assertEqual(result["attempts"], [])
+
+    # --- endpoint integration ----------------------------------------------
+
+    def _start_server(self) -> int:
+        port = _free_port()
+        server = web.make_server("127.0.0.1", port, state=self.store)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(lambda: thread.join(timeout=5))
+        # Wait for the server to be ready.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=1)
+                conn.connect()
+                conn.close()
+                return port
+            except OSError:
+                time.sleep(0.05)
+        self.fail("server did not start")
+
+    def _get(self, port: int, path: str) -> tuple[int, dict]:
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read()
+            return resp.status, json.loads(body.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def test_run_history_endpoint_empty(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(port, "/api/run-history")
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"runs": []})
+
+    def test_run_history_endpoint_returns_runs(self) -> None:
+        self.store.init()
+        self.store.event(
+            "r-end", "T1", "1", "roadmap.finished", {"run_verdict": "ok"}
+        )
+        port = self._start_server()
+        status, data = self._get(port, "/api/run-history?limit=10")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["runs"]), 1)
+        self.assertEqual(data["runs"][0]["roadmap_id"], "r-end")
+        self.assertEqual(data["runs"][0]["run_verdict"], "ok")
+
+    def test_task_attempts_endpoint_rejects_traversal(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(port, "/api/tasks/..%2Fbad/attempts")
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_task_attempts_endpoint_unknown(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(port, "/api/tasks/UNKNOWN/attempts")
+        self.assertEqual(status, 200)
+        self.assertFalse(data["found"])
+
+    def test_run_logs_endpoint_serves_text(self) -> None:
+        self.store.init()
+        log_dir = self.repo / ".agentops" / "runs" / "rmap" / "T1" / "1"
+        log_dir.mkdir(parents=True)
+        (log_dir / "executor.combined.log").write_text("payload-line", encoding="utf-8")
+        with mock.patch.object(
+            web, "_resolve_allowed_roots", return_value=web._AllowedRoots(
+                repo_root=self.repo, tmp_root=self.tmp
+            )
+        ):
+            port = self._start_server()
+            status, data = self._get(
+                port,
+                "/api/run-logs?roadmap=rmap&task=T1&attempt=1&kind=executor.combined.log",
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["found"])
+        self.assertIn("payload-line", data["text"])
+
+    def test_run_logs_endpoint_missing_param(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(
+            port, "/api/run-logs?roadmap=rmap&task=T1&attempt=1"
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("kind is required", data["error"])
+
+    def test_run_logs_endpoint_rejects_unknown_kind(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(
+            port,
+            "/api/run-logs?roadmap=rmap&task=T1&attempt=1&kind=etc-passwd",
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_run_logs_endpoint_rejects_traversal(self) -> None:
+        self.store.init()
+        port = self._start_server()
+        status, data = self._get(
+            port,
+            "/api/run-logs?roadmap=..&task=T1&attempt=1&kind=executor.combined.log",
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)

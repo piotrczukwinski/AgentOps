@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import shutil
 import subprocess
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -53,8 +55,63 @@ def create_worktree(repo: Path, workspaces_root: Path, branch: str, base_ref: st
     workspace = workspaces_root / safe_name(branch)
     if workspace.exists():
         shutil.rmtree(workspace)
+    # Prune stale worktree metadata before adding. A previous run that
+    # crashed (or was killed) may have left the workspace directory
+    # removed by ``rmtree`` above but the git worktree metadata still
+    # recorded in ``.git/worktrees/``. ``git worktree prune`` cleans
+    # those up so ``git worktree add -B`` does not fail with
+    # "is already used by worktree at <stale path>". This is the
+    # AO-AUDIT-008 fix: a resumed run must not inherit stale worktree
+    # state from a crashed prior attempt.
+    run_git(repo, ["worktree", "prune"], check=False)
     run_git(repo, ["worktree", "add", "-B", branch, str(workspace), base_ref])
     return workspace
+
+
+def worktree_is_clean(worktree: Path) -> bool:
+    """Return True when the worktree has no uncommitted changes.
+
+    Used by the orchestrator's ``_assert_worktree_clean`` guard
+    (AO-AUDIT-008) to refuse starting a fresh attempt on a worktree
+    that was left dirty by a prior interrupted run. A clean worktree
+    is a prerequisite for a reproducible attempt.
+    """
+    result = run_git(worktree, ["status", "--porcelain"], check=False)
+    if result.returncode != 0:
+        return False
+    return result.stdout.strip() == ""
+
+
+def prune_worktrees(repo: Path, *, workspaces_root: Path | None = None) -> int:
+    """Prune stale git worktree metadata and remove orphaned workspace dirs.
+
+    Returns the number of stale worktrees pruned. Safe to call at any
+    time; does not touch live worktrees. This is the maintenance
+    primitive behind ``agentops prune`` and the ``run --resume``
+    reconciliation path (AO-AUDIT-008).
+    """
+    # First ask git to prune its own metadata for worktrees whose
+    # directories no longer exist.
+    run_git(repo, ["worktree", "prune"], check=False)
+    # Then walk the workspaces root and remove any directories that
+    # are not registered as live worktrees.
+    if workspaces_root is None:
+        return 0
+    if not workspaces_root.exists():
+        return 0
+    live = set()
+    result = run_git(repo, ["worktree", "list", "--porcelain"], check=False)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith("worktree "):
+                live.add(line[len("worktree ") :])
+    pruned = 0
+    for entry in workspaces_root.iterdir():
+        if entry.is_dir() and str(entry) not in live:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(entry)
+                pruned += 1
+    return pruned
 
 
 def create_gitless_mirror(source_worktree: Path, mirror_root: Path) -> Path:
@@ -147,9 +204,22 @@ def collect_diff(
             name_status_lines.append(f"{status}\t{path}")
 
     # Pick the diff comparison point. ``git diff <base_sha>`` includes
-    # both staged and unstaged changes since ``base_sha``; without a
-    # base SHA we fall back to the legacy working-tree-vs-index form.
+    # committed, staged, and unstaged changes since ``base_sha``;
+    # without a base SHA we fall back to the legacy
+    # working-tree-vs-index form.
     if base_sha:
+        tracked_name_status = run_git(
+            repo, ["diff", "--name-status", base_sha, "--"], check=False
+        ).stdout
+        for line in tracked_name_status.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            status = parts[0] or "M"
+            path = parts[-1]
+            if path:
+                changed_files.append(path)
+                name_status_lines.append(f"{status}\t{path}")
         stat_tracked = run_git(
             repo, ["diff", "--stat", base_sha, "--"], check=False
         ).stdout
@@ -252,6 +322,16 @@ class IntegrationBranchBlocked(RuntimeError):
     """Raised when an integration branch is in the protected set."""
 
 
+class CherryPickConflict(GitError):
+    """Raised when a cherry-pick into the integration branch hits a conflict.
+
+    A distinct exception type so the orchestrator's merge handler
+    (AO-AUDIT-010) can catch *only* real merge failures and re-raise
+    unrelated ``RuntimeError`` instances instead of swallowing them as
+    ``merge_failed``.
+    """
+
+
 def is_protected_branch(name: str, protected: tuple[str, ...] = DEFAULT_PROTECTED_BRANCHES) -> bool:
     import fnmatch
 
@@ -280,6 +360,27 @@ def ensure_integration_branch(repo: Path, integration_branch: str, base_branch: 
         run_git(repo, ["branch", integration_branch, base_branch])
 
 
+@contextlib.contextmanager
+def _detached_worktree(repo: Path, ref: str):
+    """Create a temporary detached worktree for branch finalization.
+
+    Integration merges must not checkout branches in the operator's
+    main worktree. That worktree can legitimately contain unrelated
+    local edits while an AgentOps run is finalizing task branches.
+    """
+    with tempfile.TemporaryDirectory(prefix="agentops-merge-") as tmp:
+        worktree = Path(tmp) / "worktree"
+        run_git(repo, ["worktree", "add", "--detach", str(worktree), ref])
+        try:
+            yield worktree
+        finally:
+            run_git(repo, ["worktree", "remove", "--force", str(worktree)], check=False)
+
+
+def _advance_branch(repo: Path, branch: str, new_sha: str, old_sha: str) -> None:
+    run_git(repo, ["update-ref", f"refs/heads/{branch}", new_sha, old_sha])
+
+
 def fast_forward_merge(repo: Path, integration_branch: str, task_branch: str) -> None:
     """Fast-forward ``integration_branch`` to ``task_branch``.
 
@@ -293,48 +394,42 @@ def fast_forward_merge(repo: Path, integration_branch: str, task_branch: str) ->
         )
     if not branch_exists(repo, task_branch):
         raise RuntimeError(f"task branch {task_branch!r} does not exist in {repo}")
-    run_git(repo, ["checkout", "--quiet", integration_branch])
-    try:
-        result = run_git(repo, ["merge", "--ff-only", task_branch], check=False)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"fast-forward merge of {task_branch!r} into {integration_branch!r} failed: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
-            )
-    finally:
-        # Always return the repo to the original branch to keep subsequent
-        # operations predictable.
-        previous = run_git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False).stdout.strip()
-        if previous and previous != f"refs/heads/{integration_branch}":
-            run_git(repo, ["checkout", "--quiet", previous.removeprefix("refs/heads/")])
+    base_sha = rev_parse(repo, integration_branch)
+    target_sha = rev_parse(repo, task_branch)
+    result = run_git(repo, ["merge-base", "--is-ancestor", base_sha, target_sha], check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"fast-forward merge of {task_branch!r} into {integration_branch!r} failed: "
+            f"{integration_branch!r} is not an ancestor of {task_branch!r}"
+        )
+    _advance_branch(repo, integration_branch, target_sha, base_sha)
 
 
 def cherry_pick_into(repo: Path, integration_branch: str, sha: str) -> str:
     """Cherry-pick ``sha`` into ``integration_branch``.
 
-    Returns the new commit SHA on the integration branch. Raises on
-    conflict so the orchestrator can mark the task ``merge_failed``.
+    Returns the new commit SHA on the integration branch. Raises
+    :class:`CherryPickConflict` on conflict (AO-AUDIT-010: a distinct
+    exception so the orchestrator does not swallow unrelated
+    ``RuntimeError`` instances as merge failures).
     """
     if is_protected_branch(integration_branch):
         raise IntegrationBranchBlocked(
             f"integration_branch {integration_branch!r} is in the protected set"
         )
     if not sha:
-        raise RuntimeError("cherry_pick_into requires a non-empty commit SHA")
-    previous = current_branch(repo) or run_git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False).stdout.strip().removeprefix("refs/heads/")
-    run_git(repo, ["checkout", "--quiet", integration_branch])
-    try:
-        result = run_git(repo, ["cherry-pick", "--no-edit", sha], check=False)
+        raise ValueError("cherry_pick_into requires a non-empty commit SHA")
+    base_sha = rev_parse(repo, integration_branch)
+    with _detached_worktree(repo, base_sha) as worktree:
+        result = run_git(worktree, ["cherry-pick", "--no-edit", sha], check=False)
         if result.returncode != 0:
-            run_git(repo, ["cherry-pick", "--abort"], check=False)
-            raise RuntimeError(
+            run_git(worktree, ["cherry-pick", "--abort"], check=False)
+            raise CherryPickConflict(
                 f"cherry-pick of {sha!r} into {integration_branch!r} failed (likely conflict)"
             )
-        new_sha = rev_parse(repo, "HEAD")
-        return new_sha
-    finally:
-        if previous and previous != integration_branch:
-            run_git(repo, ["checkout", "--quiet", previous])
+        new_sha = rev_parse(worktree, "HEAD")
+    _advance_branch(repo, integration_branch, new_sha, base_sha)
+    return new_sha
 
 
 def merge_integration(
@@ -363,19 +458,17 @@ def merge_integration(
         fast_forward_merge(repo, integration_branch, task_branch)
         return rev_parse(repo, integration_branch)
     if strategy == "no_ff":
-        previous = current_branch(repo) or ""
-        run_git(repo, ["checkout", "--quiet", integration_branch])
-        try:
-            result = run_git(repo, ["merge", "--no-ff", "--no-edit", task_branch], check=False)
+        base_sha = rev_parse(repo, integration_branch)
+        with _detached_worktree(repo, base_sha) as worktree:
+            result = run_git(worktree, ["merge", "--no-ff", "--no-edit", task_branch], check=False)
             if result.returncode != 0:
-                run_git(repo, ["merge", "--abort"], check=False)
+                run_git(worktree, ["merge", "--abort"], check=False)
                 raise RuntimeError(
                     f"no-ff merge of {task_branch!r} into {integration_branch!r} failed"
                 )
-            return rev_parse(repo, integration_branch)
-        finally:
-            if previous and previous != integration_branch:
-                run_git(repo, ["checkout", "--quiet", previous])
+            new_sha = rev_parse(worktree, "HEAD")
+        _advance_branch(repo, integration_branch, new_sha, base_sha)
+        return new_sha
 
     # Default: cherry-pick. Use the tip commit of the task branch.
     tip = rev_parse(repo, task_branch)

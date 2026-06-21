@@ -155,6 +155,30 @@ class CollectDiffTests(unittest.TestCase):
             self.assertEqual(diff.patch, "")
             self.assertEqual(diff.stat, "")
 
+    def test_base_sha_picks_up_committed_changes_in_changed_files(self) -> None:
+        """A repair executor may commit its changes before returning.
+
+        ``git diff <base_sha>`` still contains the patch, but
+        ``git status --porcelain`` is empty after the commit. The
+        cumulative snapshot must therefore populate ``changed_files``
+        from ``git diff --name-status <base_sha>`` too; otherwise the
+        policy layer sees an empty file list and blocks a valid repair.
+        """
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._init_repo(tmp)
+            base_sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+            (repo / "README.md").write_text("committed update\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "update readme")
+
+            from agentops.git_ops import collect_diff
+
+            diff = collect_diff(repo, "HEAD", base_sha=base_sha)
+            self.assertIn("README.md", diff.changed_files)
+            self.assertIn("committed update", diff.patch)
+            self.assertIn("README.md", diff.stat)
+
 
 class BranchForTaskTests(unittest.TestCase):
     def test_branch_name_uses_prefix(self) -> None:

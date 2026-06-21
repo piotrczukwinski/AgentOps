@@ -24,10 +24,10 @@ These tests pin the new policy:
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from agentops.config import DEFAULT_MAX_REPAIR_ATTEMPTS, load_roadmap
 from agentops.git_ops import collect_diff
@@ -35,7 +35,6 @@ from agentops.models import (
     DiffSnapshot,
     PolicyResult,
     RepoConfig,
-    ReviewConfig,
     ReviewVerdict,
     RoadmapConfig,
     RunnerResult,
@@ -48,14 +47,12 @@ from agentops.policy import PolicyEngine
 from agentops.prompting import PromptCompiler
 from agentops.runners import BaseRunner, utc_now
 from agentops.state import StateStore
-
 from tests.test_gated_roadmap import (
     FakeCodexService,
     ScriptedVerdict,
     _init_repo,
     git,
 )
-
 
 # ---------------------------------------------------------------------------
 # Repair loop: REQUEST_CHANGES -> ACCEPT
@@ -657,6 +654,160 @@ class RepairPromptFallbackTests(unittest.TestCase):
 
 
 class IntegrationBranchContinuationTests(unittest.TestCase):
+    def test_integration_merge_does_not_checkout_dirty_main_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            base_branch = git(repo, "branch", "--show-current").strip()
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "dirty-main-merge",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": base_branch},
+                        "integration_branch": "integration/agentops-dirty-main",
+                        "merge_policy": {"auto_merge": True, "strategy": "cherry_pick"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('v1\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            git(repo, "checkout", "-b", "operator-work")
+            (repo / "README.md").write_text("operator branch\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "operator branch")
+            (repo / "README.md").write_text("dirty operator edit\n", encoding="utf-8")
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake = FakeCodexService([ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True)])
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+            )
+            orch.run_roadmap(roadmap)
+
+            rows = {r["id"]: r for r in state.task_rows("dirty-main-merge")}
+            self.assertEqual(rows["T1"]["state"], TaskState.MERGED.value)
+            self.assertEqual(git(repo, "branch", "--show-current").strip(), "operator-work")
+            self.assertEqual((repo / "README.md").read_text(encoding="utf-8"), "dirty operator edit\n")
+            self.assertEqual(git(repo, "show", "integration/agentops-dirty-main:out.txt"), "v1\n")
+
+    def test_executor_self_committed_changes_are_merged(self) -> None:
+        """A clean worktree after review can still contain task changes.
+
+        Some executors commit during their own run. ``commit()`` then
+        returns None during finalize because there are no uncommitted
+        changes, but HEAD has moved from the attempt base. The
+        orchestrator must merge that existing task-branch commit instead
+        of treating the task as ``no_changes``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "executor-self-commit",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "integration_branch": "integration/agentops-self-commit",
+                        "merge_policy": {"auto_merge": True, "strategy": "cherry_pick"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class SelfCommittingRunner(BaseRunner):
+                name = "self-commit"
+
+                def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[no-untyped-def]
+                    artifact = Path(str(artifact_dir))
+                    artifact.mkdir(parents=True, exist_ok=True)
+                    stdout_path = artifact / "executor.stdout.log"
+                    stderr_path = artifact / "executor.stderr.log"
+                    combined_path = artifact / "executor.combined.log"
+                    worktree = Path(str(cwd))
+                    (worktree / "out.txt").write_text("committed by executor\n", encoding="utf-8")
+                    git(worktree, "add", "out.txt")
+                    git(worktree, "commit", "-m", "executor self commit")
+                    stdout_path.write_text("executor committed out.txt\n", encoding="utf-8")
+                    stderr_path.write_text("", encoding="utf-8")
+                    combined_path.write_text(stdout_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    return RunnerResult(
+                        exit_code=0,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        started_at=utc_now(),
+                        ended_at=utc_now(),
+                        combined_log_path=combined_path,
+                        failure_category=None,
+                    )
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake = FakeCodexService([ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True)])
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                shell_runner=SelfCommittingRunner(),
+                review_service=fake,
+            )
+            orch.run_roadmap(roadmap)
+
+            rows = {r["id"]: r for r in state.task_rows("executor-self-commit")}
+            self.assertEqual(rows["T1"]["state"], TaskState.MERGED.value)
+            git(repo, "checkout", "--quiet", "integration/agentops-self-commit")
+            self.assertEqual((repo / "out.txt").read_text(encoding="utf-8"), "committed by executor\n")
+            with state.connect() as conn:
+                event_types = [
+                    row["type"]
+                    for row in conn.execute(
+                        "SELECT type FROM events WHERE roadmap_id=? ORDER BY seq",
+                        ("executor-self-commit",),
+                    )
+                ]
+            self.assertIn("task.existing_commit_detected", event_types)
+            self.assertIn("task.merged_to_integration", event_types)
+
     def test_second_task_branches_from_integration_branch(self) -> None:
         """When the integration branch exists, subsequent tasks must
         base their worktree on the integration branch, not on the
@@ -753,7 +904,6 @@ class IntegrationBranchContinuationTests(unittest.TestCase):
             current = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
             if current != "integration/agentops-test":
                 # Try to find a non-integration branch to return to.
-                base_ref = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
                 # The seed branch in this test is whatever ``git init``
                 # created. Try the obvious defaults.
                 for candidate in ("master", "main"):

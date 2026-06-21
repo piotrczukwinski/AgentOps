@@ -33,7 +33,7 @@ Codex is expensive when it watches logs, repeatedly refreshes context, or superv
 | Docs/report | MiniMax | no | milestone only | no |
 | Test/guard script | MiniMax | no | auto if risk >= threshold | no |
 | Narrow runtime fix | MiniMax | maybe | required | maybe |
-| Antidetect/data/source behavior | MiniMax in gitless mirror | required | required | likely |
+| Browser automation hardening / network automation / crawler compliance-sensitive changes | MiniMax in gitless mirror | required | required | likely |
 | DB/migrations/status mutation | review-only first | required | required | required |
 | Blocker triage | Codex | yes | n/a | maybe |
 

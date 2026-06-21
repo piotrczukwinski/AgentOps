@@ -8,7 +8,29 @@ version = "0.1.0"
 description = "Local CLI-first control plane for orchestrating coding agents with deterministic policy, validation, and review gates."
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "AgentOps Internal" }]
+license = { file = "LICENSE" }
+authors = [{ name = "Piotr Czukwiński" }]
+keywords = [
+    "coding-agents",
+    "codex",
+    "agentops",
+    "maintainer-tools",
+    "automation",
+    "cli",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Utilities",
+]
 dependencies = []
 
 [project.optional-dependencies]

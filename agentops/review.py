@@ -221,6 +221,7 @@ class CodexReviewService:
         timeout_seconds: int,
         model: str | None = None,
         model_reasoning_effort: str | None = None,
+        idle_timeout: float | None = None,
     ) -> tuple[ReviewVerdict, Path]:
         output_path = artifact_dir / "review.result.json"
         result = self.runner.run_review(
@@ -233,6 +234,7 @@ class CodexReviewService:
             binary=self.binary,
             model=model,
             model_reasoning_effort=model_reasoning_effort,
+            idle_timeout=idle_timeout,
         )
         if not result.ok:
             return (
@@ -273,6 +275,33 @@ class CodexReviewService:
                 raw=raw,
             )
         return verdict, output_path if output_path.exists() else result.stdout_path
+
+    def self_fix(
+        self,
+        prompt_path: Path,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        timeout_seconds: int = 1800,
+        model: str | None = None,
+        model_reasoning_effort: str | None = None,
+        idle_timeout: float | None = None,
+    ):
+        """Run a bounded Codex self-fix write-pass. Thin wrapper over the runner.
+
+        Returns the :class:`RunnerResult`; the orchestrator reads the stdout
+        for the skip marker and measures the resulting diff. The pass runs
+        in ``workspace-write`` sandbox scoped to ``cwd``.
+        """
+        return self.runner.run_self_fix(
+            prompt_path,
+            cwd,
+            artifact_dir,
+            timeout_seconds=timeout_seconds,
+            model=model,
+            model_reasoning_effort=model_reasoning_effort,
+            idle_timeout=idle_timeout,
+        )
 
 
 # ---------------------------------------------------------------------------

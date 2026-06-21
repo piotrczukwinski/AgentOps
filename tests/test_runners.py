@@ -16,12 +16,16 @@ from agentops.models import (
     TaskConfig,
 )
 from agentops.runners import (
+    ClaudeRunner,
+    CodexExecutorRunner,
+    CodexRunner,
     OpenCodeRunner,
     ShellRunner,
     _IdleWatchdog,
     _run_with_watchdogs,
     _StartupWatchdog,
     executor_env,
+    model_executor_env,
     reviewer_env,
     run_argv_streaming,
     runner_for,
@@ -132,6 +136,34 @@ class _FakeStream:
 
 def _stream_proc(*, stdout: bytes = b"", stderr: bytes = b"", exit_code: int = 0, argv=None) -> _FakeProc:
     return _FakeProc(argv=argv, stdout_bytes=stdout, stderr_bytes=stderr, exit_code=exit_code)
+
+
+class CodexRunnerStreamingTests(unittest.TestCase):
+    def test_idle_watchdog_process_starts_in_new_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            artifact_dir = Path(tmp) / "artifacts"
+            artifact_dir.mkdir()
+            prompt_path = artifact_dir / "review.prompt.md"
+            prompt_path.write_text("review", encoding="utf-8")
+            captured: dict[str, object] = {}
+
+            def fake_popen(args, **kwargs):  # type: ignore[no-untyped-def]
+                captured["start_new_session"] = kwargs.get("start_new_session")
+                return _FakeProc(argv=args, stdout_bytes=b"{}", returncode=0)
+
+            with mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen):
+                result = CodexRunner().run_review(
+                    prompt_path,
+                    cwd=workspace,
+                    artifact_dir=artifact_dir,
+                    binary="codex",
+                    idle_timeout=1.0,
+                )
+
+            self.assertTrue(result.ok)
+            self.assertIs(captured["start_new_session"], True)
 
 
 class _BlockingFakeProc(_FakeProc):
@@ -269,6 +301,14 @@ class ExecutorEnvTests(unittest.TestCase):
         # Reviewer may keep model API keys, but not GitHub write tokens.
         self.assertEqual(env.get("GIT_TERMINAL_PROMPT"), "0")
 
+    def test_model_executor_env_keeps_model_keys_but_strips_git_tokens(self) -> None:
+        env = model_executor_env()
+        for name in ["GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PAT", "GIT_TOKEN"]:
+            self.assertNotIn(name, env)
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "supersecret-value-1234567890")
+        self.assertEqual(env.get("OPENAI_API_KEY"), "supersecret-value-1234567890")
+        self.assertEqual(env.get("AGENTOPS_EXECUTOR"), "1")
+
 
 class OpenCodeRunnerStreamingTests(unittest.TestCase):
     def _task(self, executor: str = "opencode", model: str = "minimax/MiniMax-M3") -> TaskConfig:
@@ -377,14 +417,16 @@ class OpenCodeRunnerStreamingTests(unittest.TestCase):
                 proc.poll = lambda: 124  # type: ignore[assignment]
                 return proc
 
-            with mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen):
-                with mock.patch("agentops.runners._terminate_process_tree") as term:
-                    result = OpenCodeRunner().run(
-                        self._task(),
-                        prompt="x",
-                        cwd=workspace,
-                        artifact_dir=artifact_dir,
-                    )
+            with (
+                mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen),
+                mock.patch("agentops.runners._terminate_process_tree") as term,
+            ):
+                result = OpenCodeRunner().run(
+                    self._task(),
+                    prompt="x",
+                    cwd=workspace,
+                    artifact_dir=artifact_dir,
+                )
             self.assertEqual(result.exit_code, 124)
             self.assertTrue(result.timed_out)
             self.assertFalse(result.ok)
@@ -488,6 +530,99 @@ class OpenCodeRunnerStreamingTests(unittest.TestCase):
             self.assertNotIn("--dangerously-skip-permissions", captured["args"])
 
 
+class ClaudeRunnerStreamingTests(unittest.TestCase):
+    def _task(self, **overrides) -> TaskConfig:
+        base = {
+            "id": "T-CLAUDE",
+            "kind": "demo",
+            "prompt_path": Path("prompt.md"),
+            "executor": "claude",
+            "model": "minimax/MiniMax-M3",
+            "allowed_files": ("out.txt",),
+            "timeout_seconds": 60,
+            "executor_options": {"dangerously_skip_permissions": True},
+        }
+        base.update(overrides)
+        return TaskConfig(**base)
+
+    def test_command_uses_noninteractive_claude_without_model_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            artifact_dir = Path(tmp) / "artifacts"
+            artifact_dir.mkdir()
+            captured: dict[str, object] = {}
+
+            def fake_popen(args, **kwargs):  # type: ignore[no-untyped-def]
+                captured["args"] = args
+                captured["cwd"] = kwargs.get("cwd")
+                captured["env"] = kwargs.get("env")
+                captured["shell"] = kwargs.get("shell", False)
+                captured["stdin"] = kwargs.get("stdin")
+                return _stream_proc(argv=args, stdout=b"AGENTOPS_RESULT_JSON: {\"status\":\"done\"}\n")
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ANTHROPIC_API_KEY": "supersecret-value-1234567890",
+                        "OPENAI_API_KEY": "supersecret-value-1234567890",
+                        "GH_TOKEN": "git-write-token",
+                    },
+                    clear=False,
+                ),
+                mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen),
+            ):
+                result = ClaudeRunner().run(
+                    self._task(),
+                    prompt="do the thing",
+                    cwd=workspace,
+                    artifact_dir=artifact_dir,
+                )
+
+            self.assertTrue(result.ok)
+            cmd = captured["args"]
+            self.assertIsInstance(cmd, list)
+            self.assertEqual(cmd[:2], ["claude", "--print"])
+            self.assertIn("--dangerously-skip-permissions", cmd)
+            self.assertNotIn("--model", cmd)
+            self.assertNotIn("do the thing", cmd)
+            self.assertEqual(
+                (artifact_dir / "executor.input.md").read_text(encoding="utf-8"),
+                "do the thing",
+            )
+            self.assertEqual(captured["cwd"], str(workspace))
+            self.assertIs(captured["shell"], False)
+            self.assertIs(captured["stdin"], subprocess.PIPE)
+            env = captured["env"]
+            self.assertIsInstance(env, dict)
+            self.assertNotIn("GH_TOKEN", env)
+            self.assertNotIn("GITHUB_TOKEN", env)
+            self.assertEqual(env.get("ANTHROPIC_API_KEY"), "supersecret-value-1234567890")
+            self.assertEqual(env.get("OPENAI_API_KEY"), "supersecret-value-1234567890")
+            self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_model_can_be_passed_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            artifact_dir = Path(tmp) / "artifacts"
+            artifact_dir.mkdir()
+            captured: dict[str, object] = {}
+
+            def fake_popen(args, **kwargs):  # type: ignore[no-untyped-def]
+                captured["args"] = args
+                return _stream_proc(argv=args, stdout=b"ok\n")
+
+            task = self._task(executor_options={"pass_model": True})
+            with mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen):
+                ClaudeRunner().run(task, prompt="x", cwd=workspace, artifact_dir=artifact_dir)
+
+            cmd = captured["args"]
+            self.assertIn("--model", cmd)
+            self.assertEqual(cmd[cmd.index("--model") + 1], "minimax/MiniMax-M3")
+
+
 class ShellRunnerStreamingTests(unittest.TestCase):
     def test_shell_runner_runs_executor_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -548,6 +683,36 @@ class ShellRunnerStreamingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ShellRunner().run(task, "prompt", workspace, artifact_dir)
 
+    def test_shell_runner_uses_sanitized_executor_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            artifact_dir = Path(tmp) / "artifacts"
+            artifact_dir.mkdir()
+            task = TaskConfig(
+                id="T-SHELL-ENV",
+                kind="demo",
+                prompt_path=Path("prompt.md"),
+                executor="shell",
+                executor_command="true",
+                timeout_seconds=60,
+            )
+            captured: dict[str, object] = {}
+
+            def fake_popen(args, **kwargs):  # type: ignore[no-untyped-def]
+                captured["env"] = kwargs.get("env")
+                return _stream_proc(argv=args, stdout=b"ok\n", exit_code=0)
+
+            with mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen):
+                ShellRunner().run(task, "prompt", workspace, artifact_dir)
+
+            env = captured["env"]
+            self.assertIsInstance(env, dict)
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+            self.assertNotIn("OPENAI_API_KEY", env)
+            self.assertNotIn("GH_TOKEN", env)
+            self.assertEqual(env["AGENTOPS_EXECUTOR"], "1")
+
 
 class RunnerForTests(unittest.TestCase):
     def test_routes_opencode(self) -> None:
@@ -557,11 +722,24 @@ class RunnerForTests(unittest.TestCase):
         for executor in ("minimax", "minimax-m3"):
             self.assertIsInstance(runner_for(TaskConfig(id="T", kind="x", prompt_path=Path("p"), executor=executor)), OpenCodeRunner)
 
+    def test_routes_codex_executor(self) -> None:
+        self.assertIsInstance(
+            runner_for(TaskConfig(id="T", kind="x", prompt_path=Path("p"), executor="codex")),
+            CodexExecutorRunner,
+        )
+
     def test_routes_shell(self) -> None:
         self.assertIsInstance(
             runner_for(TaskConfig(id="T", kind="x", prompt_path=Path("p"), executor="shell", executor_command="true")),
             ShellRunner,
         )
+
+    def test_routes_claude_aliases(self) -> None:
+        for executor in ("claude", "claude-minimax"):
+            self.assertIsInstance(
+                runner_for(TaskConfig(id="T", kind="x", prompt_path=Path("p"), executor=executor)),
+                ClaudeRunner,
+            )
 
     def test_unknown_executor_raises(self) -> None:
         with self.assertRaises(ValueError):
@@ -721,20 +899,22 @@ class StartupWatchdogTests(unittest.TestCase):
                 if proc is not None:
                     proc.release.set()
 
-            with mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen):
-                with mock.patch("agentops.runners._terminate_process_tree", side_effect=fake_terminate) as term:
-                    with mock.patch("agentops.runners._pid_alive", return_value=True):
-                        result = _run_with_watchdogs(
-                            popen_args=["sleep", "1"],
-                            cwd=workspace,
-                            stdout_path=stdout_path,
-                            stderr_path=stderr_path,
-                            combined_path=combined_path,
-                            timeout_seconds=10,
-                            startup_timeout=0.3,
-                            idle_timeout=None,
-                            env=None,
-                        )
+            with (
+                mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen),
+                mock.patch("agentops.runners._terminate_process_tree", side_effect=fake_terminate) as term,
+                mock.patch("agentops.runners._pid_alive", return_value=True),
+            ):
+                result = _run_with_watchdogs(
+                    popen_args=["sleep", "1"],
+                    cwd=workspace,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    combined_path=combined_path,
+                    timeout_seconds=10,
+                    startup_timeout=0.3,
+                    idle_timeout=None,
+                    env=None,
+                )
             self.assertEqual(result.failure_category, EXECUTOR_NO_OUTPUT_STARTUP)
             self.assertFalse(result.ok)
             self.assertIsNotNone(result.combined_log_path)
@@ -778,20 +958,22 @@ class IdleWatchdogTests(unittest.TestCase):
                 if proc is not None:
                     proc.release.set()
 
-            with mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen):
-                with mock.patch("agentops.runners._terminate_process_tree", side_effect=fake_terminate) as term:
-                    with mock.patch("agentops.runners._pid_alive", return_value=True):
-                        result = _run_with_watchdogs(
-                            popen_args=["sleep", "1"],
-                            cwd=workspace,
-                            stdout_path=stdout_path,
-                            stderr_path=stderr_path,
-                            combined_path=combined_path,
-                            timeout_seconds=10,
-                            startup_timeout=None,
-                            idle_timeout=0.3,
-                            env=None,
-                        )
+            with (
+                mock.patch("agentops.runners.subprocess.Popen", side_effect=fake_popen),
+                mock.patch("agentops.runners._terminate_process_tree", side_effect=fake_terminate) as term,
+                mock.patch("agentops.runners._pid_alive", return_value=True),
+            ):
+                result = _run_with_watchdogs(
+                    popen_args=["sleep", "1"],
+                    cwd=workspace,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    combined_path=combined_path,
+                    timeout_seconds=10,
+                    startup_timeout=None,
+                    idle_timeout=0.3,
+                    env=None,
+                )
             self.assertEqual(result.failure_category, EXECUTOR_IDLE_TIMEOUT)
             self.assertFalse(result.ok)
             self.assertIsNotNone(result.idle_for_seconds)

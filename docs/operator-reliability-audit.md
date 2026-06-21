@@ -427,9 +427,9 @@ the contract.
 * Add a "Building prompts safely" section to
   `docs/operator-runbook.md`.
 
-## 9. Per-task executor observability (AO-AUDIT-011 / STAB-001)
+## 9. Per-task executor observability (AO-AUDIT-011 / observability-incident-001)
 
-The STAB-001 incident — a multi-task AgentOps roadmap stalled in
+The observability-incident-001 — a multi-task AgentOps roadmap stalled in
 `executor_running` while the opencode process was alive for 30+
 minutes — exposed four gaps in the inner-task executor's
 observability that this audit now lists as a dedicated row block.
@@ -446,7 +446,7 @@ stuck, slow, or finished.
 | `task_executor_idle_timeout` | the executor produced one line and then stalled (e.g. mid-tool-call) without exiting | `--executor-idle-timeout` watchdog (in `agentops/runners.py::_IdleWatchdog`) | terminates the process group when the combined log has not grown for the configured window; `failure_category: executor_idle_timeout`; event `task.executor_idle_timeout`; task transitions to `BLOCKED`; export-summary greppable | unchanged | `tests/test_runners.py::IdleWatchdogTests::test_idle_timeout_fires_after_one_line` and `tests/test_executor_watchdog.py::WatchdogBlockTests::test_idle_timeout_blocks_task_and_emits_event` | BLOCKED; both tests pin the contract | P0 (already fixed) | none |
 | `task_tail_missing_log` | `agentops task-tail <task-id>` invoked before the executor has started; the operator expects a tail, gets a crash | `agentops task-tail` (after AO-AUDIT-011) | prints a diagnostic block with current task state, expected log path, available artifact files, and a suggested action; non-zero exit | unchanged | `tests/test_task_tail.py::TaskTailPrintMissingTests::test_prints_diagnostic_message` and `test_prints_available_files` | BLOCKED; tests pin the contract | P1 (already fixed) | none |
 
-The four rows above are the AO-AUDIT-011 / STAB-001 PR. The PR
+The four rows above are the AO-AUDIT-011 / observability-incident-001 PR. The PR
 adds three things to the gated runner:
 
 1. **Streaming executor logs.** Every `agentops run` task attempt
@@ -492,7 +492,7 @@ Operators have been trained to use
 `agentops operator-run --follow` /
 `agentops operator-tail <run-id>` for the *outer* operator
 prompt (a long prompt the operator ran by hand, e.g. the prompt
-that drives a BusinessAgent batch). When that outer prompt is
+that drives a long-running open-source maintainer batch). When that outer prompt is
 "execute a roadmap that does X, Y, Z", AgentOps then spawns
 *internal* task executors (one per task in the roadmap) and
 each of those is observed through `agentops task-tail`:
@@ -502,10 +502,10 @@ each of those is observed through `agentops task-tail`:
 | Outer operator prompt | `agentops operator-run --follow` / `agentops operator-tail <run-id>` | `.operator-runs/<run-id>/combined.log` | The `opencode run` process the operator launched by hand |
 | Internal task executor | `agentops task-tail <task-id>` | `.agentops/runs/<roadmap>/<task>/<attempt>/executor.combined.log` | The `opencode run` process the gated runner spawned for one task |
 
-A `STAB-001-OPERATOR-ACCEPTANCE-MATRIX` task that is stuck in
+A `EX-001-OPERATOR-ACCEPTANCE-MATRIX` task that is stuck in
 `executor_running` is **not** visible to `operator-tail`; it is
 only visible to `agentops task-tail`. The mission brief for
-STAB-001 (the harness for the inner task executor was missing)
+observability-incident-001 / observability-incident-001 (the harness for the inner task executor was missing)
 is fixed by this PR; the outer prompt's observability layer is
 the operator-run harness documented at the top of this audit.
 

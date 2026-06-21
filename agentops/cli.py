@@ -5,6 +5,7 @@ import json
 import shutil
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,31 @@ def build_parser() -> argparse.ArgumentParser:
             "Default: no idle timeout."
         ),
     )
+    run.add_argument(
+        "--codex-idle-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Codex review call idle watchdog (seconds). When set, the codex "
+            "runner streams review.stdout.jsonl in real time and terminates the "
+            "codex process group if the file has not grown for this many "
+            "seconds. Prevents a wedged codex call from blocking the whole "
+            "roadmap. Default: no codex idle timeout (only --timeout applies)."
+        ),
+    )
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume a previously-interrupted run from the persisted task state. "
+            "Tasks that already reached an accepted / terminal state (accepted, "
+            "pushed, merged, skipped, blocked, merge_failed, awaiting_review, "
+            "awaiting_human, failed) are skipped; tasks left in an in-flight "
+            "state by a crash (executor_running, preflight, validating, "
+            "codex_reviewing, ...) are reset to ready and re-run. Use this after "
+            "a reboot or a SIGKILL to pick up the roadmap where it left off."
+        ),
+    )
 
     status = sub.add_parser("status", help="Show task states.")
     status.add_argument("--roadmap-id", default=None, help="Filter by roadmap id.")
@@ -133,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
             "``raw opencode | tee`` emergency fallbacks."
         ),
     )
-    task_tail_cmd.add_argument("task_id", help="Task id to tail (e.g. STAB-001-OPERATOR-ACCEPTANCE-MATRIX).")
+    task_tail_cmd.add_argument("task_id", help="Task id to tail (e.g. EX-001-OPERATOR-ACCEPTANCE-MATRIX).")
     task_tail_cmd.add_argument(
         "--roadmap",
         default=None,
@@ -185,6 +211,71 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
 
     sub.add_parser("doctor", help="Check local dependencies.")
+
+    audit = sub.add_parser(
+        "audit-summaries",
+        help="Sweep past roadmap.finished events for run_verdict / task-state inconsistencies.",
+        description=(
+            "Scan the SQLite events table for ``roadmap.finished`` events and "
+            "cross-check each stored ``run_verdict`` against the current ``tasks`` "
+            "table state. Reports any roadmap whose stored verdict is ``passed`` "
+            "while a task is still in ``merge_failed``, ``blocked``, or "
+            "``awaiting_review``. Exits 1 when at least one inconsistency is "
+            "listed so the command can be used as a CI gate. Use ``--since`` to "
+            "limit the sweep to events after an ISO timestamp."
+        ),
+    )
+    audit.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "Only consider roadmap.finished events whose created_at is after this "
+            "ISO timestamp (e.g. 2025-01-01T00:00:00+00:00). Default: no filter."
+        ),
+    )
+
+    prompt_new = sub.add_parser(
+        "prompt-new",
+        help="Write a valid AgentOps contract prompt for a task (no heredoc, shell-safe).",
+        description=(
+            "Emit a valid AgentOps executor contract prompt for a task. The prompt "
+            "includes the AGENTOPS_RESULT_JSON marker instructions, the task id and "
+            "kind, allowed_files and validations placeholders, and the "
+            "anti-hallucination checklist. When ``--roadmap`` is given the real "
+            "allowed_files / validations / review config are pulled from the matching "
+            "task and filled in. The prompt is written via Python (never a shell "
+            "heredoc) so dollar signs, backticks, and markdown are preserved literally."
+        ),
+    )
+    prompt_new.add_argument("--task-id", required=True, help="Task id to embed in the prompt.")
+    prompt_new.add_argument(
+        "--kind",
+        required=True,
+        choices=("implementation", "docs", "review", "test", "audit"),
+        help="Task kind to embed in the prompt.",
+    )
+    prompt_new.add_argument(
+        "--roadmap",
+        default=None,
+        help="Optional roadmap path. When set, allowed_files/validations/review are pulled from the matching task.",
+    )
+    prompt_new.add_argument(
+        "--output",
+        default=None,
+        help="Write the prompt to this path instead of stdout.",
+    )
+
+    prune = sub.add_parser(
+        "prune",
+        help="Prune stale git worktrees and orphaned workspace directories.",
+        description=(
+            "Run ``git worktree prune`` on the repo and remove orphaned workspace "
+            "directories under .agentops/workspaces/. Use this after a crash, a "
+            "reboot, or an interrupted run to clean up before resuming. Safe to run "
+            "at any time; live worktrees are never touched."
+        ),
+    )
+    prune.add_argument("--repo", default=".", help="Repository path. Default: current directory.")
 
     # Operator Run Harness: durable, recoverable execution of long operator
     # prompts (e.g. ``opencode run`` with a long prompt). See
@@ -306,6 +397,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. 'text' (default) prints a one-line summary per run; "
         "'json' prints a JSON object with the fields the web/admin panel can "
         "consume. With --format json and no --run-id, the output is a JSON array.",
+    )
+    operator_status_cmd.add_argument(
+        "--reconcile",
+        action="store_true",
+        help=(
+            "Reconcile stale-pid entries on disk before reporting. When a "
+            "status.json says 'running'/'retry_waiting' but the recorded pid is "
+            "gone, the persisted status is rewritten to 'needs_operator' with "
+            "failure_category 'stale_pid' so direct readers (cron jobs, the web "
+            "panel, future agents) see the same answer as the runtime overlay. "
+            "Idempotent: a run that is already consistent is never demoted."
+        ),
     )
 
     operator_tail_cmd = sub.add_parser(
@@ -629,9 +732,15 @@ def main(argv: list[str] | None = None) -> int:
                 artifacts_root=Path(args.artifacts_root).expanduser().resolve() if args.artifacts_root else None,
                 executor_startup_timeout=args.executor_startup_timeout,
                 executor_idle_timeout=args.executor_idle_timeout,
+                codex_idle_timeout=getattr(args, "codex_idle_timeout", None),
             )
-            count = Orchestrator(state, options).run_roadmap(roadmap)
-            print(f"Processed {count} task(s) from roadmap {roadmap.roadmap_id}")
+            orch = Orchestrator(state, options)
+            if args.resume:
+                count = orch.resume_roadmap(roadmap)
+                print(f"Resumed {count} task(s) from roadmap {roadmap.roadmap_id}")
+            else:
+                count = orch.run_roadmap(roadmap)
+                print(f"Processed {count} task(s) from roadmap {roadmap.roadmap_id}")
             return 0
 
         if args.command == "status":
@@ -662,6 +771,24 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "doctor":
             return _cmd_doctor()
+
+        if args.command == "audit-summaries":
+            return _cmd_audit_summaries(state, args)
+
+        if args.command == "prompt-new":
+            return _cmd_prompt_new(args)
+
+        if args.command == "prune":
+            from .git_ops import prune_worktrees as _prune
+
+            repo = Path(args.repo).expanduser().resolve()
+            if not repo.exists():
+                print(f"Repo path does not exist: {repo}", file=sys.stderr)
+                return 2
+            ws_root = repo / ".agentops" / "workspaces"
+            n = _prune(repo, workspaces_root=ws_root)
+            print(f"Pruned {n} stale worktree(s).")
+            return 0
 
         if args.command == "serve":
             from . import web as _web  # local import; CLI stays light when not serving
@@ -1813,7 +1940,12 @@ def _cmd_operator_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_operator_status(args: argparse.Namespace) -> int:
-    from .operator_run import format_status_json, format_status_line, list_status
+    from .operator_run import (
+        format_status_json,
+        format_status_line,
+        list_status,
+        reconcile_status_file,
+    )
 
     root = _operator_run_root(args)
     if not root.exists():
@@ -1825,6 +1957,18 @@ def _cmd_operator_status(args: argparse.Namespace) -> int:
     except FileNotFoundError as exc:
         print(f"operator-status: {exc}", file=sys.stderr)
         return 2
+
+    # Reconcile stale-pid entries on disk before reporting. The
+    # ``--reconcile`` flag is idempotent: runs that are already
+    # consistent (persisted == canonical, pid alive) are left
+    # untouched. Only runs whose persisted status claims a live process
+    # while the pid is gone are rewritten. AO-AUDIT-002.
+    if getattr(args, "reconcile", False):
+        for run_dir_path, _payload in entries:
+            reconcile_status_file(run_dir_path)
+        # Re-list after reconcile so the reported status reflects the
+        # rewritten file.
+        entries = list_status(root, run_id=args.run_id)
 
     if not entries:
         if args.run_id:
@@ -2292,6 +2436,207 @@ def _cmd_pr_loop(args: argparse.Namespace) -> int:
     if args.dry_run:
         argv.append("--dry-run")
     return pr_loop_main(argv)
+
+
+# ---------------------------------------------------------------------------
+# audit-summaries / prompt-new
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso(value: str) -> datetime | None:
+    """Parse an ISO 8601 timestamp into a timezone-aware datetime.
+
+    Tolerates a trailing ``Z`` (rewritten to ``+00:00``) and naive values
+    (assumed UTC). Returns ``None`` when the value is not parseable so the
+    caller can skip the row instead of crashing on a malformed event.
+    """
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _cmd_audit_summaries(state: StateStore, args: argparse.Namespace) -> int:
+    """Sweep ``roadmap.finished`` events for verdict / task-state inconsistencies.
+
+    A roadmap whose stored ``run_verdict`` is ``passed`` while any of its tasks
+    is currently in ``merge_failed`` / ``blocked`` / ``awaiting_review`` is
+    reported in a markdown table. Exits 1 when at least one inconsistency is
+    found so the command can gate CI; exits 0 with no output when clean.
+    """
+    state.init()
+    since_raw = getattr(args, "since", None)
+    since_dt = _parse_iso(since_raw) if since_raw else None
+    inconsistencies: list[dict[str, Any]] = []
+    with state.connect() as conn:
+        rows = list(
+            conn.execute(
+                "SELECT roadmap_id, payload_json, created_at FROM events "
+                "WHERE type='roadmap.finished' ORDER BY seq ASC"
+            ).fetchall()
+        )
+        for row in rows:
+            created_at = row["created_at"]
+            if since_dt is not None:
+                event_dt = _parse_iso(created_at)
+                if event_dt is None or event_dt < since_dt:
+                    continue
+            try:
+                payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+            except json.JSONDecodeError:
+                continue
+            if str(payload.get("run_verdict") or "") != "passed":
+                continue
+            roadmap_id = row["roadmap_id"]
+            if not roadmap_id:
+                continue
+            task_rows = list(
+                conn.execute(
+                    "SELECT id, state FROM tasks WHERE roadmap_id=? ORDER BY id",
+                    (roadmap_id,),
+                ).fetchall()
+            )
+            merge_failed = [t["id"] for t in task_rows if t["state"] == "merge_failed"]
+            blocked = [t["id"] for t in task_rows if t["state"] == "blocked"]
+            awaiting = [t["id"] for t in task_rows if t["state"] == "awaiting_review"]
+            if not (merge_failed or blocked or awaiting):
+                continue
+            inconsistencies.append(
+                {
+                    "roadmap_id": roadmap_id,
+                    "run_verdict": "passed",
+                    "merge_failed_tasks": merge_failed,
+                    "blocked_tasks": blocked,
+                    "awaiting_review_tasks": awaiting,
+                    "finished_at": created_at,
+                }
+            )
+    if not inconsistencies:
+        return 0
+    lines = [
+        "| roadmap_id | run_verdict | merge_failed_tasks | blocked_tasks | awaiting_review_tasks | finished_at |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for item in inconsistencies:
+        lines.append(
+            f"| {item['roadmap_id']} | {item['run_verdict']} | "
+            f"{', '.join(item['merge_failed_tasks']) or '-'} | "
+            f"{', '.join(item['blocked_tasks']) or '-'} | "
+            f"{', '.join(item['awaiting_review_tasks']) or '-'} | "
+            f"{item['finished_at']} |"
+        )
+    print("\n".join(lines))
+    return 1
+
+
+_PROMPT_NEW_CONTRACT = """# AgentOps contract prompt
+
+You are the executor for one narrow task. You are not the architect, product owner, merger, or reviewer.
+
+You must:
+- modify only files listed under Allowed files,
+- avoid every Forbidden glob,
+- run or respect the Required validation commands,
+- leave a concise final status after the marker AGENTOPS_RESULT_JSON.
+
+You must not:
+- push, merge, force-push, rebase protected branches, or touch protected branches,
+- change dependencies, env files, secrets, DB/state/runtime data, migrations, evidence, exports, or production data unless explicitly allowed.
+
+# Final result marker (REQUIRED, read carefully)
+
+When the work is done, print exactly one final result block on stdout in this form:
+
+AGENTOPS_RESULT_JSON:
+{
+  "status": "done|blocked|failed",
+  "summary": "short summary",
+  "changed_files": [],
+  "validation_commands_run": [],
+  "known_risks": [],
+  "needs_review": true
+}
+
+Rules for the final marker:
+- The marker MUST be the literal token AGENTOPS_RESULT_JSON on its own line, followed by a colon and the JSON object.
+- Do NOT wrap the JSON in markdown code fences or backticks.
+- Do NOT print the marker through a heredoc, through echo, or with a shell prompt prefix.
+- Do NOT use the equals form (AGENTOPS_RESULT_JSON=...); use the colon form (AGENTOPS_RESULT_JSON:).
+- Return the marker and the JSON object directly on stdout. A missing marker, a fenced marker, a heredoc-wrapped marker, or a marker with malformed JSON is treated as "no result produced" and blocks the task.
+- AgentOps independently verifies the diff, files, branch, and validation results. Your JSON is a self-report, not the source of truth.
+"""
+
+_PROMPT_NEW_CHECKLIST = """# Anti-hallucination checklist
+Before printing the final result marker, verify each item:
+1. Every file you modified is listed under Allowed files below.
+2. Every Required validation command exits 0.
+3. You did not fabricate file paths, commit SHAs, command output, or test results.
+4. You did not push, merge, force-push, rebase, or touch protected branches.
+5. The final AGENTOPS_RESULT_JSON block is printed directly on stdout (not through a heredoc, not through echo, not inside a code fence).
+"""
+
+
+def _cmd_prompt_new(args: argparse.Namespace) -> int:
+    """Emit a valid AgentOps contract prompt for a task.
+
+    The prompt is written via Python (never a shell heredoc) so dollar signs,
+    backticks, and markdown are preserved literally. When ``--roadmap`` is
+    given the real allowed_files / validations / review config are pulled
+    from the matching task and filled in instead of leaving placeholders.
+    """
+    task_id = args.task_id
+    kind = args.kind
+    allowed_files: list[str] = []
+    validations: list[str] = []
+    review_codex: str | None = None
+    if args.roadmap:
+        roadmap = _load_roadmap_or_error(args.roadmap)
+        task = next((t for t in roadmap.tasks if t.id == task_id), None)
+        if task is None:
+            print(
+                f"Task {task_id!r} not found in roadmap {roadmap.roadmap_id!r}.",
+                file=sys.stderr,
+            )
+            return 2
+        allowed_files = list(task.allowed_files)
+        validations = list(task.validations)
+        review_codex = task.review.codex
+
+    sections: list[str] = [_PROMPT_NEW_CONTRACT, ""]
+    sections.append("# Task metadata")
+    sections.append(f"- task_id: {task_id}")
+    sections.append(f"- kind: {kind}")
+    if review_codex is not None:
+        sections.append(f"- review.codex: {review_codex}")
+    sections.append("")
+    sections.append("# Allowed files")
+    if allowed_files:
+        sections.extend(f"- {f}" for f in allowed_files)
+    else:
+        sections.append("- (fill in allowed files; one glob per line)")
+    sections.append("")
+    sections.append("# Required validation commands")
+    if validations:
+        sections.extend(f"- {v}" for v in validations)
+    else:
+        sections.append("- (fill in deterministic validation commands, e.g. 'python3 -m pytest -q')")
+    sections.append("")
+    sections.append(_PROMPT_NEW_CHECKLIST)
+    sections.append("# Task prompt body")
+    sections.append("(describe the task here)")
+    prompt_text = "\n".join(sections)
+
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(prompt_text, encoding="utf-8")
+        print(f"Wrote prompt to {output_path}")
+        return 0
+    print(prompt_text)
+    return 0
 
 
 if __name__ == "__main__":

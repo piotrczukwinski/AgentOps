@@ -1,491 +1,237 @@
 # AgentOps Control Plane
 
-AgentOps is a local, CLI-first control plane for running long autonomous coding roadmaps with a cheap executor model and a stronger reviewer model.
+> **Local-first, CLI-first control plane for long-running coding-agent
+> workflows.**
+>
+> AgentOps is a local developer tool, not a cloud service and not a
+> kernel/container sandbox. It keeps the strong reviewer (Codex) out
+> of the expensive live-watcher role and owns the durable state,
+> policy, and merge gate around a cheap executor model.
 
-The core design is deliberately **not** “a strong model watching a weak model”. AgentOps is the durable supervisor: it creates workspaces, runs agents, captures logs, validates changes, checks file/branch policy, builds compact review packets, and calls the strong model only for design/review/blocker work.
+## Why AgentOps exists
 
-## Two-agent operating model
+A typical "agent on a long task" loop puts a strong model in the
+expensive position of *watching* a weaker model — tailing process
+output, polling logs, re-reading artifacts, and re-deciding after
+every step. For multi-hour roadmaps that loop quickly burns
+through tokens, time, and budget.
+
+AgentOps is the **durable supervisor**. It owns:
+
+* the workspace (worktree, branch, diff, commit, push, merge);
+* the logs and artifacts;
+* the policy checks (file scope, branch scope, forbidden globs,
+  secret-like values);
+* the validation commands;
+* the review packet assembly;
+* the bounded repair / block / merge gate.
+
+The reviewer is called only when the durable state says it is
+useful: a *bounded* read-only review packet in, a *structured*
+verdict out. The reviewer is never a live watcher.
+
+## 60-second pitch
 
 ```text
 AgentOps deterministic control plane
-  -> executor model, for example MiniMax via OpenCode, implements a narrow task
-  -> AgentOps collects diff, logs, artifacts, and validator results
-  -> reviewer model, for example Codex, receives a compact read-only review packet
-  -> AgentOps parses the structured verdict and either accepts, repairs, or blocks
+  -> executor model (e.g. minimax/MiniMax-M3 via opencode)
+     implements a narrow task
+  -> AgentOps collects the diff, logs, artifacts, validator results
+  -> reviewer model (e.g. codex) receives a compact read-only
+     review packet
+  -> AgentOps parses the structured verdict
+     and either accepts, repairs, or blocks
 ```
 
-This is optimized for the observed failure mode where Codex token usage explodes when it polls logs, tails process output, or manually supervises a long-running executor.
+The whole thing runs on the Python standard library, talks to a
+local SQLite state file, a local git checkout, and the local
+`codex` / `opencode` binaries. There is **no telemetry, no
+analytics, no hosted backend**.
 
-## Gated autonomous roadmap runner
+## 5-minute local smoke test
 
-Roadmap files describe a graph of tasks; AgentOps is the executor of that graph.
-Per task attempt the runner is:
+```bash
+git clone https://github.com/piotrczukwinski/AgentOps.git
+cd AgentOps
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[yaml,dev]'
 
+# CLI works end-to-end
+agentops --help
+agentops doctor
+
+# Offline lint of a roadmap
+agentops plan --roadmap examples/roadmaps/demo-shell.json
+
+# Run a roadmap end-to-end with the shell runner, no reviewer needed
+agentops run --roadmap examples/roadmaps/demo-shell.json --no-codex
+agentops status
+agentops logs DEMO-SHELL-001
 ```
+
+If every command above returns zero and the status shows the
+task complete, the local install is good. The gated runner smoke
+test is `examples/roadmaps/gated-shell-review-smoke.json`.
+
+## Two-agent operating model
+
+The cheap executor does the implementation work for one narrow
+task. The strong reviewer is called only for design, review, and
+blocker decisions on a compact packet. AgentOps is the durable
+state machine in the middle:
+
+```text
 preflight -> workspace -> executor -> diff -> policy -> validation
           -> review packet -> codex/heuristic -> verdict
           -> repair (REQUEST_CHANGES) or finalize (ACCEPT) or block (BLOCK)
           -> commit -> push -> merge into integration branch -> next task
 ```
 
-A `REQUEST_CHANGES` verdict is **repairable**: the orchestrator writes
-a bounded repair prompt and re-runs the executor on the next attempt,
-looping until `ACCEPT` or the per-task attempt cap is hit. The default
-total executor attempts per task is **3** (initial + 2 repair
-attempts). The cap is configured per-roadmap via `max_repair_attempts`
-/ `max_review_repairs` and per-task via `max_attempts` (legacy). A
-`BLOCK` verdict is **terminal**: the orchestrator never repairs a
-`BLOCK` and the task transitions to `blocked` with the last review
-JSON on the payload. See `docs/gated-roadmap-runner.md` for the full
-contract.
+A `REQUEST_CHANGES` verdict is **repairable**: the orchestrator
+writes a bounded repair prompt and re-runs the executor on the
+next attempt, looping until `ACCEPT` or the per-task attempt cap
+is hit. The default total executor attempts per task is **3**
+(initial + 2 repair attempts).
 
-Codex is **not** a live watcher. AgentOps owns the workspace, the logs, the
-diff, the policy, the review-packet assembly, the budget, the retry, the
-commit, the push, and the integration-branch merge. Codex only sees a
-bounded review packet and returns a structured JSON verdict
-(`ACCEPT` / `REQUEST_CHANGES` / `BLOCK`).
+A `BLOCK` verdict is **terminal**: the orchestrator never repairs
+a `BLOCK`. The task transitions to `blocked` with the last
+review JSON on the payload.
+
+See [`docs/gated-roadmap-runner.md`](docs/gated-roadmap-runner.md)
+for the full state machine, the verdict schema, and the
+integration-branch merge gate.
+
+## Codex reviewer mode
+
+Codex is **not** a live watcher. AgentOps owns the workspace, the
+logs, the diff, the policy, the review-packet assembly, the budget,
+the retry, the commit, the push, and the integration-branch merge.
+Codex only sees a bounded read-only review packet and returns a
+structured JSON verdict (`ACCEPT` / `REQUEST_CHANGES` / `BLOCK`).
+
+The reviewer runs non-interactive:
+
+```bash
+codex -m gpt-5.3-codex-spark \
+      -c model_reasoning_effort=high \
+      --sandbox read-only \
+      --output-schema schemas/review_verdict.schema.json
+```
+
+The model and reasoning effort are configured per roadmap / per
+task via `review.model` and `review.model_reasoning_effort`, with
+the env-var fallbacks `AGENTOPS_CODEX_MODEL` and
+`AGENTOPS_CODEX_MODEL_REASONING_EFFORT`.
+
+Roadmaps can fall back to a deterministic heuristic reviewer
+when `codex` is missing or the budget is exhausted:
 
 ```bash
 agentops run --roadmap examples/roadmaps/gated-shell-review-smoke.json --autonomous
 ```
 
-The `--autonomous` flag falls back to a deterministic heuristic reviewer
-when codex is missing or the budget is exhausted, so a roadmap can run end
-to end without a human in the loop. Without `--autonomous`, tasks needing
-codex that have no available codex binary are moved to `awaiting_review`
-instead of being silently accepted. The operator can apply a verdict with:
+`--autonomous` runs the roadmap end to end without a human in
+the loop. Without `--autonomous`, tasks needing Codex that have
+no available codex binary are moved to `awaiting_review` instead
+of being silently accepted. The operator can apply a verdict with:
 
 ```bash
-agentops decide T1 --roadmap examples/roadmaps/gated-shell-review-smoke.json \
-    --verdict ACCEPT --safe-to-merge
+agentops decide T1 --roadmap <path> --verdict ACCEPT --safe-to-merge
 ```
 
-See `docs/gated-roadmap-runner.md` for the full state machine, the verdict
-schema, and the integration-branch merge gate.
+## OpenCode / MiniMax executor mode
 
-## Current MVP scope
-
-Implemented in this repository:
-
-- JSON roadmap loading, with optional YAML support if `PyYAML` is installed.
-- SQLite state database and event log.
-- Per-task artifacts under `.agentops/runs/<roadmap>/<task>/<attempt>/`.
-- `worktree_branch` execution mode.
-- `gitless_mirror` execution mode scaffold with allowed-file copyback.
-- OpenCode/MiniMax runner that runs inside the executor workspace with secrets stripped.
-- Optional `--dangerously-skip-permissions` (yolo) flag for the opencode
-  executor; **disabled by default** and only enabled when the task (or its
-  roadmap defaults) explicitly set
-  `executor_options.dangerously_skip_permissions: true` (or the
-  `metadata.x_dangerously_skip_permissions` shorthand). Yolo never enables
-  itself from risk, kind, branch, or any other implicit signal.
-- Shell runner for local tests and deterministic harnesses.
-- Codex review runner using non-interactive `codex exec` with
-  `--sandbox read-only` and a default `--output-schema` pointing at
-  `schemas/review_verdict.schema.json` (overridable per-task or per-roadmap
-  via `review.schema_path` or `review.schema`). The read-only sandbox is
-  the safety contract; on current `codex-cli` builds (0.140.0+) the default
-  approval policy is already `never`, so the older `--ask-for-approval
-  never` flag is omitted because the CLI rejects it as an unexpected
-  argument. The reviewer model can be overridden per roadmap / per task
-  via `review.model` (and the `AGENTOPS_CODEX_MODEL` env var) and the
-  reasoning effort via `review.model_reasoning_effort` /
-  `review.reasoning_effort` (and the `AGENTOPS_CODEX_MODEL_REASONING_EFFORT`
-  env var). The runner translates these to:
-
-  ```bash
-  codex -m gpt-5.3-codex-spark -c model_reasoning_effort=high
-  ```
-
-  (the older `--reasoning-effort` flag is intentionally NOT emitted
-  because the local `codex` CLI rejects it).
-- Prompt compiler for executor, review, and repair prompts.
-- Allowed/forbidden file policy checks, including untracked-file detection.
-- Empty-diff detection: implementation tasks that produce no file changes are blocked.
-- Branch safety checks, including protected-branch glob matching and protected
-  integration-branch merge blocking.
-- Validation command runner.
-- Review routing based on task risk, validation outcome, and review policy.
-- Durability across attempts: workspace, branch, log, and verdict are all
-  recorded in SQLite and replayed on resume.
-- Integration-branch merge gate (`cherry_pick` / `ff` / `no_ff`) with
-  reviewer `safe_to_merge` enforcement and protected-branch refusal.
-- CLI commands: `init`, `run`, `status`, `logs`, `artifacts`, `attempts`,
-  `review-queue`, `export-summary`, `plan`, `doctor`, `review`, `decide`,
-  `serve`, `pr-loop`, `operator-run`, `operator-status`, `operator-tail`,
-  `operator-result`, `operator-retry`, `task-tail`.
-- Offline `plan` command for preflight linting of roadmaps.
-- Local browser UI over the same CLI/state (`agentops serve`, default `127.0.0.1:8765`).
-
-Not implemented yet:
-
-- GitHub PR creation and connector-based review.
-- Full budget pricing ledger.
-- Parallel scheduling.
-- Remote workers.
-
-## Install locally
-
-```bash
-cd AgentOps
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
-```
-
-No runtime dependency is required for JSON roadmaps. YAML roadmaps need:
-
-```bash
-pip install -e '.[yaml]'
-```
-
-## Basic usage
-
-```bash
-agentops init
-agentops doctor
-agentops plan --roadmap examples/roadmaps/demo-shell.json   # offline lint
-agentops run --roadmap examples/roadmaps/demo-shell.json --no-codex
-agentops status
-agentops logs DEMO-SHELL-001
-agentops export-summary
-```
-
-For a real MiniMax/OpenCode task, set `executor` to `opencode` and `model` to `minimax/MiniMax-M3` in the roadmap.
-
-The gated runner smoke test:
-
-```bash
-agentops run --roadmap examples/roadmaps/gated-shell-review-smoke.json --no-codex
-agentops review-queue
-```
-
-See `docs/usability-mvp.md` for the full CLI reference, `docs/operator-runbook.md` for triage procedures, `docs/gated-roadmap-runner.md` for the gated runner reference, and `docs/operator-reliability-audit.md` for the production failure-mode audit (stale pid, missing result, codex-required fallback, merge_failed, etc.) with the prioritised list of next PRs.
-
-### Pinning the codex reviewer model
-
-The default codex model can be 0%-rate-limited, but the local
-`codex` CLI works with an explicit model and reasoning-effort pair:
-
-```bash
-codex -m gpt-5.3-codex-spark -c model_reasoning_effort=high
-```
-
-AgentOps exposes this through the roadmap / task `review` config (and
-as an env-var fallback) instead of requiring a PATH wrapper:
+The default executor is a small subprocess runner that wraps
+`opencode run` with the local model id `minimax/MiniMax-M3`:
 
 ```json
 {
-  "review": {
-    "mode": "required",
-    "reviewer": "codex",
-    "model": "gpt-5.3-codex-spark",
-    "model_reasoning_effort": "high"
+  "defaults": {
+    "executor": "opencode",
+    "model": "minimax/MiniMax-M3"
   }
 }
 ```
 
-The runner translates the config above to:
+A `worktree_branch` execution mode is the default; a
+`gitless_mirror` mode is available for sensitive work (no `.git`
+directory inside the executor workspace, with a copyback step
+that validates the changed files against the policy). The shell
+runner is available for local tests and deterministic harnesses.
 
-```bash
-codex -m gpt-5.3-codex-spark -c model_reasoning_effort=high
-```
+The executor process is launched with:
 
-The same fields can be set per task inside `tasks[].review`. The
-task-level values override the roadmap-level values; fields not set
-at the task level fall back to the roadmap-level review, then to
-the env var, then to the codex default (no flag).
+* GitHub write-token environment variables stripped;
+* `GIT_TERMINAL_PROMPT=0` and `GIT_ASKPASS=/bin/false`;
+* `XDG_DATA_HOME` removed;
+* `shell=False` and the prompt passed as a literal argv element
+  (never interpolated, never read from a path the executor
+  could rewrite).
 
-Env-var fallback:
+## Safety model summary
 
-| Config key                  | Env var                              |
-|-----------------------------|--------------------------------------|
-| `review.model`              | `AGENTOPS_CODEX_MODEL`               |
-| `review.model_reasoning_effort` | `AGENTOPS_CODEX_MODEL_REASONING_EFFORT` |
+AgentOps is local-first and **not** a kernel/container sandbox.
+The executor is treated as untrusted code. The MVP ships with
+the following defense-in-depth defaults; full details live in
+[`docs/security.md`](docs/security.md) and
+[`SECURITY.md`](SECURITY.md).
 
-`review.reasoning_effort` is accepted as an alias for
-`review.model_reasoning_effort`. Allowed values are `low`, `medium`,
-`high`; an unknown value fails closed at `agentops plan` time. The
-runner intentionally emits `-c model_reasoning_effort=<value>` and
-never the legacy `--reasoning-effort` flag, because the local
-`codex` CLI rejects the latter as an unexpected argument.
+* The executor subprocess does not receive common GitHub token
+  environment variables.
+* `GIT_TERMINAL_PROMPT=0` and `GIT_ASKPASS=/bin/false` are set
+  for executor subprocesses.
+* `XDG_DATA_HOME` is removed from the executor environment.
+* AgentOps, not the executor, owns commit/push by default.
+* Protected branches and force-push / merge workflows are
+  blocked by policy.
+* The integration branch default is non-protected; merging into
+  `main` / `master` / `audit/**` / `release/**` is refused at
+  the merge gate.
+* Changed files must match task `allowed_files` and must not
+  match any `forbidden_globs`. Secret-like values in patches
+  are blocked.
+* The Codex reviewer runs with `--sandbox read-only` by default.
+* The OpenCode executor's `--dangerously-skip-permissions`
+  (yolo) flag is **off by default** and is only set when the
+  task (or its roadmap defaults) explicitly opt in via
+  `executor_options.dangerously_skip_permissions` (or the
+  `metadata.x_dangerously_skip_permissions` shorthand). Yolo
+  never enables itself from risk, kind, branch, or any other
+  implicit signal.
+* The Operator Run Harness's transient retry is opt-in
+  (`--retry-on-transient`). When enabled, only
+  classifier-matched transient failures (network errors,
+  429/502/503/504, timeouts) are retried; non-transient
+  failures (auth, validation, tests, policy) are never
+  auto-retried. The retry budget is bounded by `--max-retries`
+  and the per-attempt sleep is bounded by `--backoff`.
 
-## Operator Run Harness
+**Do not** run executors with real production secrets in scope.
+For high-risk work (browser automation hardening, network
+automation changes, crawler compliance-sensitive changes, or
+anything that touches auth / billing / identity), run the
+executor inside a VM, a container, or a dedicated low-privilege
+user account that does not have repository write credentials
+in scope.
 
-Long `opencode run` prompts used to be launched with
-`opencode run ... 2>&1 | tee .operator-logs/...`. That pattern is
-fragile: a terminal disconnect, an SSH drop, or a computer reboot
-could lose the final `AGENTOPS_RESULT_JSON` block and force the
-operator to `grep` raw logs by hand.
+## Local web UI summary
 
-The Operator Run Harness is the durable replacement:
-
-```bash
-python -m agentops operator-run \
-  --name schema-path-hardening \
-  --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
-  --model minimax/MiniMax-M3 \
-  --yolo \
-  --detach
-```
-
-Each run is written to `.operator-runs/<run-id>/` with the prompt,
-the exact argv, the status, and the stdout/stderr/combined logs.
-Inspect or recover the run from a different terminal with:
-
-```bash
-python -m agentops operator-status --dir /home/czuki/AgentOps
-python -m agentops operator-status --run-id <id> --format json   # for the web/admin panel
-python -m agentops operator-tail <run-id> --dir /home/czuki/AgentOps --lines 200
-python -m agentops operator-result <run-id> --dir /home/czuki/AgentOps
-python -m agentops operator-stop <run-id> --dir /home/czuki/AgentOps   # SIGTERM, then SIGKILL
-```
-
-A detached run survives a terminal close; a foreground run leaves
-`combined.log` on disk for after-the-fact triage; a full reboot does
-not lose the logs, only the in-flight process. The harness uses
-`shell=False`, sanitized env, and `GIT_TERMINAL_PROMPT=0` so the
-safety contract from the gated-roadmap runner is preserved.
-
-For foreground runs that should also stream live output to the
-terminal, pass `--follow`. The follow stream is a side channel on
-top of the durable logs: the run still writes `stdout.log`,
-`stderr.log`, `combined.log`, `status.json`, `command.json`,
-`prompt.md`, and `result.json` exactly as before, and still honors
-`--retry-on-transient`, `--max-retries`, `--backoff`,
-`--startup-timeout`, and `--idle-timeout`. `--follow` is
-foreground-only; combining it with `--detach` is rejected with a
-clear message and the operator is pointed at
-`operator-tail` / `operator-status` for detached runs.
-
-```bash
-python -m agentops operator-run \
-  --name schema-path-hardening \
-  --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
-  --model minimax/MiniMax-M3 \
-  --follow
-```
-
-Transient network and API failures (timeout, 429, 502/503/504,
-connection reset, DNS, etc.) can be retried automatically or
-manually without losing the run:
-
-```bash
-# Automatic retry on transient failure (foreground)
-python -m agentops operator-run \
-  --name schema-recovery \
-  --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
-  --retry-on-transient
-
-# Manual retry after a reboot or a hard failure
-python -m agentops operator-status --dir /home/czuki/AgentOps
-python -m agentops operator-tail <run-id> --dir /home/czuki/AgentOps
-python -m agentops operator-retry <run-id> --dir /home/czuki/AgentOps \
-  --retry-on-transient
-```
-
-### Hung / stalled operator protection
-
-Long runs can wedge because the executor is waiting on a network
-call that never completes, or because the model API returned a
-token and silently hung. The harness has first-class protection for
-that:
-
-* **`--idle-timeout SECONDS`** runs a background watchdog on every
-  attempt. If the active `combined.log` has not grown for that
-  many seconds while the process is still alive, the watchdog
-  terminates the process group and the run is marked
-  `needs_operator` with reason `idle_timeout`. The watchdog never
-  auto-retries; the operator is expected to inspect the log and
-  run `operator-retry` themselves.
-* **`operator-status`** detects stale pids (the persisted status
-  says `running` but the recorded pid is gone) and reports them
-  with `runtime_status=stale_pid`, `pid_alive=false`, and a
-  `suggested_action=operator-retry` hint. The legacy
-  `exited`/`succeeded`/`failed` label is preserved in
-  `runtime_status_alias` for backward compatibility.
-* **`operator-status --format json`** is the contract for the
-  future admin web panel. The output includes the active attempt,
-  the active `combined.log` path/size/mtime, `idle_for_seconds`,
-  `pid_alive`, `result_json_present`, and `suggested_action`.
-* **`operator-tail`** and **`operator-result`** always read the
-  *latest* attempt's `combined.log` (falling back to the top-level
-  log for old single-attempt runs), so a stale top-level log can
-  no longer hide a fresh retry.
-* **`operator-result`** refuses to return a template placeholder
-  result (`"done|blocked"`, `"..."`, etc.) and exits non-zero with
-  a clear message, so the operator does not mistake a stub for a
-  real final answer.
-* **`operator-stop <run-id>`** safely terminates a wedged run,
-  records `stopped_at` and `stop_reason` in `status.json`, and
-  never kills the harness's own process group.
-
-The recommended command for long BusinessAgent / admin-web runs:
-
-```bash
-python -m agentops operator-run \
-  --name business-agent-batch-001 \
-  --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
-  --detach \
-  --retry-on-transient \
-  --idle-timeout 600
-```
-
-See `docs/operator-run-harness.md` for the full procedure,
-including the JSON schema and the playbook for terminal disconnects,
-transient failures, stale pids, idle timeouts, and the admin web
-panel integration.
-
-## PR repair loop (`agentops pr-loop`)
-
-`agentops operator-run` covers the *outer* operator prompt. The
-`agentops pr-loop` subcommand covers the *cross-tool* PR repair
-loop: take a schema-conformant review JSON, turn it into a deterministic
-repair prompt, and (for `REQUEST_CHANGES` verdicts) schedule the
-existing operator-run harness on the PR branch. The final merge is
-always operator-controlled; the loop never pushes to `main`, never
-force-pushes, never rebases, and never merges the PR.
-
-```bash
-python -m agentops pr-loop 13 \
-  --repo example/repo \
-  --review-json /tmp/codex.review.json \
-  --branch feat/example \
-  --pr-loop-root .agentops/pr-loop \
-  --dry-run
-```
-
-The command is deliberately narrow:
-
-* **`ACCEPT` verdict** — short-circuits, executor not invoked,
-  prints `status=approved`. `safe_to_merge=true` means ready for
-  operator merge; `safe_to_merge=false` means approved but not
-  merge-ready. The loop never auto-merges.
-* **`BLOCK` verdict** — short-circuits, executor not invoked,
-  prints `status=blocked`. Blocking issues are reported but no
-  cycle directory is created.
-* **`REQUEST_CHANGES` verdict** — writes a deterministic repair
-  prompt under `.agentops/pr-loop/<pr-number>/cycle-<n>/executor.prompt.md`
-  and (without `--dry-run`) schedules the operator-run harness on
-  the PR branch only when `safe_to_push=true`. The prompt includes
-  the reviewer `repair_prompt` verbatim, the exact blocking issues,
-  and the input verdict JSON is persisted as `review.verdict.json`
-  next to the prompt so the operator can audit which JSON drove each
-  cycle.
-
-The `--dry-run` flag writes the prompt and prints the decision
-(`status=dry_run`) without invoking the executor. Without
-`--dry-run` the loop delegates to the operator-run harness; it
-never calls `opencode` / `codex` directly. The executor is scheduled
-in detached mode so the loop can be observed with the existing
-`operator-status` / `operator-tail` / `operator-result` commands.
-
-The generated prompt contains anti-hallucination postconditions
-(non-empty diff, validations pass, commit exists, push succeeds) the
-executor must verify before printing `AGENTOPS_RESULT_JSON` with
-`status="done"`. The prompt also forbids: pushing to `main` or any
-protected branch, force-pushing, rebasing, weakening or removing
-existing tests or gates, modifying `BusinessAgent` (unless the
-blocking issue is explicitly about BusinessAgent), and merging the
-PR. The `--max-cycles` guard (default 3) stops the loop from
-spinning forever; once it fires the operator decides the next
-move. The final merge is always operator-controlled.
-
-The MVP accepts only the contract in `schemas/review_verdict.schema.json`:
-`ACCEPT`, `REQUEST_CHANGES`, or `BLOCK`; required `confidence`,
-`summary`, `blocking_issues`, `repair_prompt`, `safe_to_push`, and
-`safe_to_merge`; no unknown top-level fields; and object-only blocking
-issues with `file`, `severity`, `issue`, and `suggested_fix`. Any other
-shape fails closed with a `VerdictParseError` and a non-zero exit code.
-
-See `docs/gated-roadmap-runner.md` for the verdict contract and the
-anti-hallucination checklist, and `docs/operator-run-harness.md`
-for the per-cycle operator-run contract.
-
-For overnight monitoring, see `docs/night-run-report.md` for
-the recommended `agentops operator-run` command and the
-morning checklist.
-
-## Per-task executor observability
-
-The Operator Run Harness covers the *outer* operator prompt.
-When `agentops run` spawns an internal opencode/MiniMax process
-for each task, the same recipe is available at the per-task
-level via the streaming executor logs and `agentops task-tail`:
-
-```bash
-# Recommended: enable the per-task watchdogs so a stuck executor
-# can never wedge the run.
-python -m agentops run --roadmap <path> --autonomous \
-    --executor-startup-timeout 180 \
-    --executor-idle-timeout 900
-
-# Tail the per-task combined log while the run is in progress.
-python -m agentops task-tail STAB-001-OPERATOR-ACCEPTANCE-MATRIX --follow
-python -m agentops task-tail STAB-001-OPERATOR-ACCEPTANCE-MATRIX --lines 200
-```
-
-Every task attempt writes three log files under
-`.agentops/runs/<roadmap>/<task>/<attempt>/`:
-
-* `executor.stdout.log` — the executor's stdout, streamed in real time
-* `executor.stderr.log` — the executor's stderr, streamed in real time
-* `executor.combined.log` — the union of stdout and stderr, suitable
-  for `task-tail`
-
-The two watchdogs (`--executor-startup-timeout`,
-`--executor-idle-timeout`) terminate the executor process group and
-move the task to `BLOCKED` with
-`failure_category: executor_no_output_startup` /
-`executor_idle_timeout` when:
-
-* the combined log is still 0 bytes after the startup window
-  (executor hung on startup), or
-* the combined log has stopped growing for the idle window
-  (executor stalled mid-run).
-
-Either watchdog is greppable from the run summary's
-"Executor watchdog terminations" section, and the run-level
-verdict is never `passed` when any of them fire. See
-`docs/gated-roadmap-runner.md` for the full reference and
-`docs/operator-reliability-audit.md` (section 9) for the
-production failure-mode audit entry that closed the STAB-001
-observability gap.
-
-The split between the two observability surfaces is deliberate:
-
-* `operator-run --follow` / `operator-tail` — for the *outer*
-  operator prompt (the long prompt the operator ran by hand)
-* `agentops task-tail <task-id>` — for the *internal* task
-  executor (the opencode/MiniMax process the gated runner
-  spawned for one task)
-
-A raw `opencode | tee /tmp/log.txt` is a documented **emergency
-fallback** only; the streaming combined log and `task-tail` exist
-so operators do not have to fall back to ad-hoc pipes.
-
-## Local browser UI
-
-A small local-only dashboard is included as a thin layer over the CLI and
-the SQLite state. It runs on the Python standard library, binds to
-`127.0.0.1:8765` by default, and never executes arbitrary shell.
+A small local-only dashboard is included as a thin layer over
+the CLI and the SQLite state. It runs on the Python standard
+library, binds to `127.0.0.1:8765` by default, and **never
+executes arbitrary shell**:
 
 ```bash
 python -m agentops serve
 # AgentOps UI: http://127.0.0.1:8765
 ```
 
-The UI shows task status, latest events, active run subprocesses, and
-per-task logs/artifacts. The "Run" button always passes `--no-codex`; to
-run with Codex, use the CLI directly.
-
-See `docs/local-web-ui.md` for the full description, safety notes, and
-recommended workflow.
-
+The UI shows task status, latest events, active run subprocesses,
+and per-task logs / artifacts. The "Run" button always passes
+`--no-codex`; to run with Codex, use the CLI directly. See
+[`docs/local-web-ui.md`](docs/local-web-ui.md) for the full
+description and the safety notes.
 
 ## Roadmap budget
 
@@ -502,51 +248,80 @@ Roadmaps can declare a `budget` block that caps the run:
 }
 ```
 
-All four fields are optional and default to "no cap". When
-a cap is exceeded, the orchestrator fails closed (transitions
-the task to `BLOCKED` with `failure_category: budget_exceeded`)
-so an overnight run cannot burn unlimited resources. See
-`docs/gated-roadmap-runner.md` for the full table.
+All four fields are optional and default to "no cap". When a
+cap is exceeded, the orchestrator fails closed (transitions the
+task to `BLOCKED` with `failure_category: budget_exceeded`) so
+an overnight run cannot burn unlimited resources.
 
-## Safety defaults
+## Known limitations
 
-- The executor subprocess does not receive common GitHub token environment variables.
-- `GIT_TERMINAL_PROMPT=0` and `GIT_ASKPASS=/bin/false` are set for executor calls.
-- `XDG_DATA_HOME` is removed from the executor environment rather than rewritten to `/tmp`.
-- AgentOps, not the executor, should own commit/push by default.
-- Protected branches and force-push/merge workflows are blocked by policy.
-- The integration branch default is non-protected; merging into
-  `main`/`master`/`audit/**`/`release/**` is refused at the merge gate.
-- Review model calls are read-only by default.
-- The OpenCode executor's `--dangerously-skip-permissions` (yolo) flag is
-  **off by default**. It is only set when the task (or its roadmap
-  defaults) explicitly opt in via `executor_options.dangerously_skip_permissions`
-  or `metadata.x_dangerously_skip_permissions`. **Do not enable yolo in any
-  environment that touches production data, secrets, or shared infrastructure.**
-- The Operator Run Harness's transient retry is opt-in
-  (`--retry-on-transient`). When enabled, only classifier-matched
-  transient failures (network errors, 429/502/503/504, timeouts) are
-  retried; non-transient failures (auth, validation, tests, policy)
-  are never auto-retried. The retry budget is bounded by
-  `--max-retries` (default 3) and the per-attempt sleep is bounded
-  by `--backoff` (default `5,15,45` seconds).
+* **Not a sandbox.** AgentOps does not isolate the executor
+  process from your filesystem, your network, or your user
+  account. High-risk work should run in a VM / container /
+  limited user.
+* **No telemetry, no cloud.** The CLI talks to local binaries
+  and a local SQLite file. There is no hosted backend.
+* **Codex is not a live watcher.** It only runs against a
+  compact review packet and returns a structured verdict. It
+  does not tail process output or poll logs.
+* **No parallel scheduling.** Tasks in a roadmap run
+  sequentially. A task scheduler / worker pool is intentionally
+  out of scope.
+* **No GitHub PR automation in the MVP.** A future connector
+  can fetch the PR diff and call Codex, but it is not in the
+  current build. The `agentops pr-loop` subcommand takes the
+  review JSON the operator already has and turns it into a
+  bounded repair prompt.
+* **No full budget pricing ledger.** The roadmap budget
+  *counts* tasks, attempts, and review calls; it does not
+  price tokens.
+* **Local-only web UI.** The dashboard binds to
+  `127.0.0.1:8765` by default. It is not multi-user and not
+  designed for remote access.
+* **Best-effort maintenance.** This project is a local
+  developer tool maintained in spare time. There is no
+  formal SLA for security or bug fixes.
+
+## Roadmap
+
+Near-term:
+
+* GitHub PR connector and end-to-end PR review / repair
+  automation built on top of `agentops pr-loop`.
+* Local bundle validation and bundle integrity tests for
+  offline audit reproducibility.
+* Optional scheduled-runner mode for overnight maintenance
+  batches.
+* Improved local UI for `operator-run` status rows.
+
+Out of scope (and intentionally not planned):
+
+* A hosted, multi-tenant AgentOps service.
+* A kernel / container sandbox mode (use a VM / container
+  externally).
+* Telemetry, analytics, or any automatic update check.
+* Enabling the Codex reviewer from the local web UI.
 
 ## Repository layout
 
 ```text
 agentops/
   artifacts.py       artifact paths and writes
+  bundles.py         local bundle primitive (Phase 1, T1 + T2)
   cli.py             argparse CLI
   config.py          JSON/YAML roadmap loading
   git_ops.py         git worktree, diff, commit, push, integration merge
   models.py          dataclasses and enums
   operator_run.py    Operator Run Harness (long operator prompts)
   orchestrator.py    durable task loop
+  plan.py            offline roadmap lint
   policy.py          file and branch policy checks
   pr_loop.py         PR repair loop (review JSON -> repair prompt -> executor)
-  prompting.py       executor/review/repair prompt compiler
+  prompting.py       executor / review / repair prompt compiler
+  repo_lock.py       per-repo run lock
   review.py          review routing and Codex adapter
   runners.py         shell, OpenCode, and Codex subprocess runners
+  self_fix.py        bounded self-fix helpers
   state.py           SQLite schema and event log
   validation.py      validation command runner
   web.py             local HTTP server and dashboard
@@ -557,10 +332,14 @@ docs/
   security.md
   roadmap-format.md
   operator-runbook.md
+  operator-run-harness.md
   usability-mvp.md
   gated-roadmap-runner.md
-  operator-run-harness.md
   local-web-ui.md
+  roadmap-planning-guidelines.md
+  admin-panel-architecture.md
+  public-release-checklist.md
+  codex-for-oss-application.md
 
 examples/
   roadmaps/
@@ -572,3 +351,48 @@ schemas/
 
 tests/
 ```
+
+## Documentation map
+
+* [`docs/architecture.md`](docs/architecture.md) — internal
+  architecture and the durable state machine.
+* [`docs/two-agent-strategy.md`](docs/two-agent-strategy.md) —
+  why the executor / reviewer split exists and why a strong
+  model should not be a live watcher.
+* [`docs/gated-roadmap-runner.md`](docs/gated-roadmap-runner.md)
+  — verdict schema, repair loop, and the integration-branch
+  merge gate.
+* [`docs/operator-runbook.md`](docs/operator-runbook.md) —
+  triage procedures for a stuck roadmap.
+* [`docs/operator-run-harness.md`](docs/operator-run-harness.md)
+  — durable `opencode run` harness with watchdogs and
+  transient-failure retry.
+* [`docs/roadmap-format.md`](docs/roadmap-format.md) and
+  [`docs/roadmap-planning-guidelines.md`](docs/roadmap-planning-guidelines.md)
+  — the JSON / YAML roadmap schema and the planning contract
+  to follow when generating roadmaps with another model.
+* [`docs/security.md`](docs/security.md) — threat model and
+  the full list of MVP controls.
+* [`docs/local-web-ui.md`](docs/local-web-ui.md) — the local
+  dashboard, its safety notes, and the recommended workflow.
+* [`docs/usability-mvp.md`](docs/usability-mvp.md) — the
+  full CLI reference.
+* [`docs/public-release-checklist.md`](docs/public-release-checklist.md)
+  — the release-readiness checklist used before switching the
+  repository public.
+* [`docs/codex-for-oss-application.md`](docs/codex-for-oss-application.md)
+  — the prep document for the OpenAI Codex for Open Source
+  application.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the local setup,
+test, lint, and PR conventions. See
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for the community
+standards. See [`SECURITY.md`](SECURITY.md) for how to report
+a vulnerability.
+
+## License
+
+Apache License 2.0. See [`LICENSE`](LICENSE) for the full
+text. Copyright 2026 Piotr Czukwiński.

@@ -45,7 +45,7 @@ class _BlockingCodexService(FakeCodexService):
         super().__init__(verdicts=[])
         self.available = True
 
-    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None):
+    def review(self, prompt_path, cwd, artifact_dir, schema_path, timeout_seconds, model=None, model_reasoning_effort=None, **kwargs):
         artifact_dir.mkdir(parents=True, exist_ok=True)
         result_path = artifact_dir / "review.result.json"
         result_path.write_text("", encoding="utf-8")

@@ -230,6 +230,34 @@ class PlanLintTests(unittest.TestCase):
         report = lint_roadmap(roadmap_path)
         codes = {issue.code for issue in report.issues}
         self.assertIn("task.executor_binary_missing", codes)
+        self.assertNotIn("task.executor_unknown", codes)
+
+    def test_claude_executor_is_known_and_requires_binary(self) -> None:
+        repo = _init_repo(self.root)
+        prompt = _write_prompt(self.root)
+        roadmap_path = self.root / "r.json"
+        roadmap_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "repo": {"id": "x", "path": str(repo)},
+                    "tasks": [
+                        {
+                            "id": "T1",
+                            "kind": "guard",
+                            "prompt": str(prompt),
+                            "executor": "claude",
+                            "allowed_files": ["a.txt"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        report = lint_roadmap(roadmap_path)
+        codes = {issue.code for issue in report.issues}
+        self.assertIn("task.executor_binary_missing", codes)
+        self.assertNotIn("task.executor_unknown", codes)
 
     def test_shell_executor_requires_command(self) -> None:
         repo = _init_repo(self.root)

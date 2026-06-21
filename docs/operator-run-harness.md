@@ -29,45 +29,45 @@ the result from disk.
 python -m agentops operator-run \
   --name schema-path-hardening \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --model minimax/MiniMax-M3
 
 # Run a long prompt that should survive the terminal closing.
 python -m agentops operator-run \
   --name schema-path-hardening \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --detach
 
-# Recommended recipe for long BusinessAgent / web-admin runs:
+# Recommended recipe for long-running open-source maintainer runs:
 # detach + idle watchdog + transient retry. The watchdog kills the
 # subprocess if its combined.log has not grown for 10 minutes.
 python -m agentops operator-run \
-  --name business-agent-batch-001 \
+  --name oss-maintainer-batch-001 \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --detach \
   --retry-on-transient \
   --idle-timeout 600
 
 # Inspect the run from another terminal.
-python -m agentops operator-status --dir /home/czuki/AgentOps
-python -m agentops operator-tail <run-id> --dir /home/czuki/AgentOps --lines 200
+python -m agentops operator-status --dir /path/to/repo
+python -m agentops operator-tail <run-id> --dir /path/to/repo --lines 200
 
 # Pull the structured result out of the combined log.
-python -m agentops operator-result <run-id> --dir /home/czuki/AgentOps
+python -m agentops operator-result <run-id> --dir /path/to/repo
 
 # Stop a detached run that is wedged (e.g. stuck waiting on the
 # model API). Use --force to skip SIGTERM and go straight to SIGKILL.
-python -m agentops operator-stop <run-id> --dir /home/czuki/AgentOps
-python -m agentops operator-stop <run-id> --dir /home/czuki/AgentOps --force
+python -m agentops operator-stop <run-id> --dir /path/to/repo
+python -m agentops operator-stop <run-id> --dir /path/to/repo --force
 ```
 
 ## Observability split: outer prompt vs internal task executor
 
 The Operator Run Harness covers the **outer** operator prompt — a
 long prompt the operator ran by hand, e.g. the prompt that drives
-a BusinessAgent batch or a STAB stabilisation PR. When the
+an OSS maintainer batch or a stabilisation stabilisation PR. When the
 operator's prompt itself is "execute a roadmap that does X, Y,
 Z", AgentOps then spawns **internal** task executors (one per
 task in the roadmap) and each of those is observed through a
@@ -78,10 +78,10 @@ different command:
 | Outer operator prompt | `agentops operator-run --follow` / `agentops operator-tail <run-id>` | `.operator-runs/<run-id>/combined.log` | The `opencode run` process the operator launched by hand |
 | Internal task executor | `agentops task-tail <task-id>` | `.agentops/runs/<roadmap>/<task>/<attempt>/executor.combined.log` | The `opencode run` process the gated runner spawned for one task |
 
-The two are deliberately separate. A `STAB-001-OPERATOR-ACCEPTANCE-MATRIX`
+The two are deliberately separate. A `EX-001-OPERATOR-ACCEPTANCE-MATRIX`
 task that is stuck in `executor_running` is *not* visible to
 `operator-tail`; it is only visible to `agentops task-tail`. The
-mission brief for the STAB-001 incident (the harness for the
+mission brief for the observability-incident-001 (the harness for the
 inner task executor was missing) is fixed by the gated-runner
 observability layer; the harness documented here is the outer
 prompt's observability layer.
@@ -423,9 +423,9 @@ failure and the operator is expected to inspect the log and run
 # subprocess if the executor's combined.log has not grown for 10
 # minutes; the run id is marked needs_operator/idle_timeout.
 python -m agentops operator-run \
-  --name business-agent-batch-001 \
+  --name oss-maintainer-batch-001 \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --detach \
   --retry-on-transient \
   --idle-timeout 600
@@ -468,9 +468,9 @@ run.
 # Kill the subprocess if its combined.log is still 0 bytes after 30
 # seconds. Pair with --idle-timeout for a full watchdog stack.
 python -m agentops operator-run \
-  --name business-agent-batch-001 \
+  --name oss-maintainer-batch-001 \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --startup-timeout 30 \
   --idle-timeout 600
 ```
@@ -487,7 +487,7 @@ without having to `operator-tail` the run from a second terminal.
 python -m agentops operator-run \
   --name schema-path-hardening \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --model minimax/MiniMax-M3 \
   --follow
 ```
@@ -528,9 +528,9 @@ Properties of `--follow`:
 # --follow + --retry-on-transient: live output across the initial
 # attempt and any transient retries.
 python -m agentops operator-run \
-  --name business-agent-batch-001 \
+  --name oss-maintainer-batch-001 \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --follow \
   --retry-on-transient \
   --max-retries 3 \
@@ -540,7 +540,7 @@ python -m agentops operator-run \
 python -m agentops operator-run \
   --name not-allowed \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --follow --detach
 # --follow cannot be combined with --detach; use
 # operator-tail/operator-status for detached runs
@@ -637,7 +637,7 @@ In short:
 * `.operator-runs/` is git-ignored; nothing in the harness writes to
   `.agentops/` (the gated-roadmap state), so the two systems do not
   conflict.
-* The harness never modifies the BusinessAgent project or its
+* The harness never modifies the example/repo project or its
   dependencies. It adds a new module (`agentops.operator_run`) and
   four new subcommands to the CLI; it does not touch the existing
   runners, orchestrator, or state machine.
@@ -759,14 +759,14 @@ retry with `operator-retry`.
 python -m agentops operator-run \
   --name schema-recovery \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --retry-on-transient
 
 # Tighter budget: 2 retries, 1s between each. Useful for fast iteration.
 python -m agentops operator-run \
   --name quick-retry \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --retry-on-transient \
   --max-retries 2 \
   --backoff 1,1
@@ -776,7 +776,7 @@ python -m agentops operator-run \
 python -m agentops operator-run \
   --name detached-recovery \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --detach \
   --retry-on-transient \
   --max-retries 5 \
@@ -792,7 +792,7 @@ used.
 ### `operator-retry`
 
 ```bash
-python -m agentops operator-retry <run-id> --dir /home/czuki/AgentOps
+python -m agentops operator-retry <run-id> --dir /path/to/repo
 ```
 
 Behaviour:
@@ -925,13 +925,13 @@ record *why* it killed the run. The recommended flow:
 3. `operator-stop <id>` to free the slot when the row is wedged,
 4. `operator-retry <id>` to start a new attempt.
 
-The recommended CLI for long BusinessAgent / web-admin runs:
+The recommended CLI for long-running open-source maintainer runs:
 
 ```bash
 python -m agentops operator-run \
-  --name business-agent-batch-001 \
+  --name oss-maintainer-batch-001 \
   --prompt-file /tmp/prompt.md \
-  --dir /home/czuki/AgentOps \
+  --dir /path/to/repo \
   --detach \
   --retry-on-transient \
   --idle-timeout 600
@@ -1015,8 +1015,8 @@ checklist. The executor is required to print
 
 The prompt also forbids: pushing to `main` or any protected branch,
 force-pushing, rebasing, weakening or removing existing tests or
-gates, modifying `BusinessAgent` (unless the blocking issue is
-explicitly about BusinessAgent), and merging the PR. The
+gates, modifying `example/repo` (unless the blocking issue is
+explicitly about example/repo), and merging the PR. The
 `--max-cycles` guard (default 3) stops the loop from spinning
 forever; once it fires the operator decides the next move.
 
@@ -1090,8 +1090,8 @@ verdict was wrong) delete the cycle directory before the next run.
   scheduled.
 * The loop never force-pushes, never rebases, never merges the PR,
   and never weakens existing tests or gates.
-* The loop never modifies `BusinessAgent` (the prompt forbids it
-  unless the blocking issue is explicitly about BusinessAgent).
+* The loop never modifies `example/repo` (the prompt forbids it
+  unless the blocking issue is explicitly about example/repo).
 * The final merge is always operator-controlled. `safe_to_merge` is
   decision metadata only; the operator decides whether to merge the PR.
 

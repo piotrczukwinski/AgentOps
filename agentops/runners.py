@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import threading
@@ -43,6 +44,12 @@ def executor_env() -> dict[str, str]:
     env.pop("XDG_DATA_HOME", None)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = "/bin/false"
+    env["AGENTOPS_EXECUTOR"] = "1"
+    return env
+
+
+def model_executor_env() -> dict[str, str]:
+    env = reviewer_env()
     env["AGENTOPS_EXECUTOR"] = "1"
     return env
 
@@ -149,6 +156,95 @@ class OpenCodeRunner(BaseRunner):
         )
 
 
+class CodexExecutorRunner(BaseRunner):
+    """Use Codex as a write-capable repair executor.
+
+    This runner is intentionally separate from ``CodexRunner`` review mode:
+    review uses a read-only sandbox and structured JSON output, while takeover
+    execution must be able to edit the task worktree and then let AgentOps run
+    the normal diff, validation, policy, and review gates.
+    """
+
+    def run(
+        self,
+        task: TaskConfig,
+        prompt: str,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        startup_timeout: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
+        prompt_file = artifact_dir / "executor.input.md"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        command = ["codex", "exec", "--sandbox", "workspace-write"]
+        if task.model and task.model != "minimax/MiniMax-M3":
+            command.extend(["-m", str(task.model)])
+        if task.review.model_reasoning_effort:
+            command.extend(["-c", f"model_reasoning_effort={task.review.model_reasoning_effort}"])
+        command.append(str(prompt_file))
+        return run_argv_streaming(
+            command,
+            cwd=cwd,
+            artifact_dir=artifact_dir,
+            stdout_name="executor.stdout.log",
+            stderr_name="executor.stderr.log",
+            combined_name="executor.combined.log",
+            timeout_seconds=task.timeout_seconds,
+            env=reviewer_env(),
+            startup_timeout=startup_timeout,
+            idle_timeout=idle_timeout,
+        )
+
+
+class ClaudeRunner(BaseRunner):
+    def run(
+        self,
+        task: TaskConfig,
+        prompt: str,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        startup_timeout: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
+        prompt_file = artifact_dir / "executor.input.md"
+        prompt_file.write_text(prompt, encoding="utf-8")
+
+        command = [
+            "claude",
+            "--print",
+        ]
+        if yolo_enabled(task):
+            command.append("--dangerously-skip-permissions")
+        options = task.executor_options or {}
+        if isinstance(options, dict):
+            allowed_tools = options.get("allowed_tools") or options.get("allowedTools")
+            if allowed_tools:
+                if isinstance(allowed_tools, str):
+                    command.extend(["--allowedTools", allowed_tools])
+                else:
+                    command.extend(["--allowedTools", ",".join(str(item) for item in allowed_tools)])
+            if bool(options.get("claude_bare")):
+                command.append("--bare")
+            if bool(options.get("pass_model")) and task.model:
+                command.extend(["--model", task.model])
+
+        return run_argv_streaming(
+            command,
+            cwd=cwd,
+            artifact_dir=artifact_dir,
+            stdout_name="executor.stdout.log",
+            stderr_name="executor.stderr.log",
+            combined_name="executor.combined.log",
+            timeout_seconds=task.timeout_seconds,
+            env=model_executor_env(),
+            startup_timeout=startup_timeout,
+            idle_timeout=idle_timeout,
+            stdin_data=prompt,
+        )
+
+
 def yolo_enabled(task: TaskConfig) -> bool:
     """Return True when the task (or its roadmap defaults) explicitly opted
     into ``--dangerously-skip-permissions`` for the opencode executor.
@@ -186,7 +282,19 @@ class CodexRunner:
         binary: str | None = None,
         model: str | None = None,
         model_reasoning_effort: str | None = None,
+        idle_timeout: float | None = None,
     ) -> RunnerResult:
+        """Run the codex review command.
+
+        When ``idle_timeout`` is set, the runner streams stdout to
+        ``review.stdout.jsonl`` in real time and runs an idle watchdog:
+        if the file has not grown for ``idle_timeout`` seconds while
+        the process is alive, the process group is terminated and the
+        result is reported as ``timed_out=True`` with
+        ``failure_category="codex_idle_timeout"`` (AO-AUDIT B6). When
+        ``idle_timeout`` is None the runner keeps the legacy
+        ``subprocess.run`` path (capture_output, no live file growth).
+        """
         command = build_codex_command(
             prompt_path,
             schema_path=schema_path,
@@ -198,6 +306,17 @@ class CodexRunner:
         stdout_path = artifact_dir / "review.stdout.jsonl"
         stderr_path = artifact_dir / "review.stderr.log"
         started = utc_now()
+        if idle_timeout is not None and idle_timeout > 0:
+            return self._run_review_streaming(
+                command,
+                prompt_path=prompt_path,
+                cwd=cwd,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                started=started,
+                timeout_seconds=timeout_seconds,
+                idle_timeout=idle_timeout,
+            )
         try:
             with prompt_path.open("r", encoding="utf-8") as stdin:
                 proc = subprocess.run(
@@ -217,6 +336,199 @@ class CodexRunner:
             stdout_path.write_text(exc.stdout or "", encoding="utf-8", errors="replace")
             stderr_path.write_text((exc.stderr or "") + f"\nTIMEOUT after {timeout_seconds}s\n", encoding="utf-8", errors="replace")
             return RunnerResult(124, stdout_path, stderr_path, started, utc_now(), timed_out=True)
+
+    def run_self_fix(
+        self,
+        prompt_path: Path,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        timeout_seconds: int = 1800,
+        model: str | None = None,
+        model_reasoning_effort: str | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
+        """Run a bounded Codex self-fix write-pass in ``cwd``.
+
+        Uses ``workspace-write`` sandbox so the reviewer can apply a small
+        edit. stdout/stderr are captured to ``self_fix.stdout.log`` /
+        ``self_fix.stderr.log`` so the orchestrator can detect the skip
+        marker and the operator can audit the pass. Short bounded fixes do
+        not need the streaming watchdog path, but ``idle_timeout`` is
+        honored when set to avoid a wedged pass hanging the run.
+        """
+        command = build_codex_self_fix_command(
+            prompt_path,
+            binary="codex",
+            model=model,
+            model_reasoning_effort=model_reasoning_effort,
+        )
+        stdout_path = artifact_dir / "self_fix.stdout.log"
+        stderr_path = artifact_dir / "self_fix.stderr.log"
+        started = utc_now()
+        try:
+            with prompt_path.open("r", encoding="utf-8") as stdin:
+                proc = subprocess.run(
+                    command,
+                    cwd=str(cwd),
+                    stdin=stdin,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                    env=reviewer_env(),
+                    check=False,
+                )
+            stdout_path.write_text(proc.stdout, encoding="utf-8", errors="replace")
+            stderr_path.write_text(proc.stderr, encoding="utf-8", errors="replace")
+            return RunnerResult(proc.returncode, stdout_path, stderr_path, started, utc_now())
+        except subprocess.TimeoutExpired as exc:
+            stdout_path.write_text(exc.stdout or "", encoding="utf-8", errors="replace")
+            stderr_path.write_text(
+                (exc.stderr or "") + f"\nTIMEOUT after {timeout_seconds}s\n", encoding="utf-8", errors="replace"
+            )
+            return RunnerResult(124, stdout_path, stderr_path, started, utc_now(), timed_out=True)
+
+    def _run_review_streaming(
+        self,
+        command: list[str],
+        *,
+        prompt_path: Path,
+        cwd: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+        started: str,
+        timeout_seconds: int,
+        idle_timeout: float,
+    ) -> RunnerResult:
+        """Streaming codex review with an idle watchdog (AO-AUDIT B6).
+
+        Pumps stdout/stderr to disk on background threads so the
+        ``review.stdout.jsonl`` file grows in real time. An idle
+        watchdog terminates the process group when the file has not
+        grown for ``idle_timeout`` seconds; the result is reported as
+        ``timed_out=True`` with ``failure_category="codex_idle_timeout"``.
+        """
+        import threading as _threading
+
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_fh = stdout_path.open("ab", buffering=0)
+        stderr_fh = stderr_path.open("ab", buffering=0)
+
+        def _pump(source, fh) -> None:
+            try:
+                while True:
+                    chunk = source.read(4096)
+                    if not chunk:
+                        break
+                    with contextlib.suppress(Exception):
+                        fh.write(chunk)
+            except Exception:
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    source.close()
+
+        with prompt_path.open("r", encoding="utf-8") as stdin:
+            proc = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                stdin=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=reviewer_env(),
+                text=False,
+                start_new_session=True,
+            )
+            stdout_thread = _threading.Thread(target=_pump, args=(proc.stdout, stdout_fh), daemon=True)
+            stderr_thread = _threading.Thread(target=_pump, args=(proc.stderr, stderr_fh), daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+
+            # Idle watchdog: poll the stdout file size.
+            import time as _time
+
+            last_size = 0
+            last_growth = _time.time()
+            idle_triggered = False
+            deadline = _time.time() + float(timeout_seconds)
+            while True:
+                if proc.poll() is not None:
+                    break
+                now = _time.time()
+                if now >= deadline:
+                    # Wall-clock timeout.
+                    _terminate_process_tree(proc.pid)
+                    break
+                try:
+                    current = stdout_path.stat().st_size
+                except OSError:
+                    current = last_size
+                if current != last_size:
+                    last_size = current
+                    last_growth = now
+                elif (now - last_growth) >= idle_timeout:
+                    # Idle: terminate the process group.
+                    _terminate_process_tree(proc.pid)
+                    idle_triggered = True
+                    break
+                _time.sleep(min(0.5, idle_timeout / 4))
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _terminate_process_tree(proc.pid)
+                proc.wait(timeout=5)
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            stdout_fh.close()
+            stderr_fh.close()
+
+        exit_code = proc.returncode if proc.returncode is not None else 1
+        if idle_triggered:
+            stderr_path.open("a", encoding="utf-8").write(
+                f"\nIDLE TIMEOUT after {idle_timeout}s without stdout growth\n"
+            )
+            return RunnerResult(
+                exit_code,
+                stdout_path,
+                stderr_path,
+                started,
+                utc_now(),
+                timed_out=True,
+                failure_category="codex_idle_timeout",
+            )
+        if exit_code == 124:
+            stderr_path.open("a", encoding="utf-8").write(
+                f"\nTIMEOUT after {timeout_seconds}s\n"
+            )
+            return RunnerResult(124, stdout_path, stderr_path, started, utc_now(), timed_out=True)
+        return RunnerResult(exit_code, stdout_path, stderr_path, started, utc_now())
+
+
+def build_codex_self_fix_command(
+    prompt_path: Path,
+    *,
+    binary: str = "codex",
+    model: str | None = None,
+    model_reasoning_effort: str | None = None,
+) -> list[str]:
+    """Build the argv for a Codex self-fix write-pass.
+
+    A self-fix pass runs in ``workspace-write`` sandbox (scoped to the
+    worktree cwd) so the reviewer can apply a SMALL edit directly. Unlike
+    the review command there is no ``--output-schema``: the pass edits
+    files and prints a short status; AgentOps measures the resulting diff.
+    The reviewer is told the line budget in the prompt and skips (no edits)
+    when the fix is too big, so we do not pay for a large edit and then
+    reject it.
+    """
+    command = [binary, "exec", "--sandbox", "workspace-write"]
+    if model:
+        command.extend(["-m", str(model)])
+    if model_reasoning_effort:
+        command.extend(["-c", f"model_reasoning_effort={model_reasoning_effort}"])
+    command.append(str(prompt_path))
+    return command
 
 
 def build_codex_command(
@@ -278,6 +590,10 @@ def runner_for(task: TaskConfig) -> BaseRunner:
         return ShellRunner()
     if task.executor in {"opencode", "minimax", "minimax-m3"}:
         return OpenCodeRunner()
+    if task.executor in {"claude", "claude-minimax"}:
+        return ClaudeRunner()
+    if task.executor == "codex":
+        return CodexExecutorRunner()
     raise ValueError(f"Unsupported executor {task.executor!r}")
 
 
@@ -579,10 +895,8 @@ def _terminate_process_tree(pid: int) -> None:
     try:
         os.killpg(os.getpgid(pid), 15)
     except (ProcessLookupError, PermissionError, OSError):
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.kill(pid, 15)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
 
 
 def _pump_stream(
@@ -613,10 +927,8 @@ def _pump_stream(
     except Exception:  # noqa: BLE001 - never let the pump crash
         return
     finally:
-        try:
+        with contextlib.suppress(Exception):
             stream.close()
-        except Exception:  # noqa: BLE001 - best-effort close
-            pass
 
 
 def _wait(proc: subprocess.Popen, timeout: float | None) -> None:
@@ -642,10 +954,8 @@ def _wait(proc: subprocess.Popen, timeout: float | None) -> None:
         try:
             proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            try:
+            with contextlib.suppress(Exception):
                 _terminate_process_tree(proc.pid)
-            except Exception:  # noqa: BLE001 - best-effort
-                pass
 
 
 def _run_with_watchdogs(
@@ -659,6 +969,7 @@ def _run_with_watchdogs(
     startup_timeout: float | None,
     idle_timeout: float | None,
     env: dict[str, str] | None,
+    stdin_data: str | None = None,
 ) -> RunnerResult:
     """Shared body for :func:`run_command_streaming` and :func:`run_argv_streaming`.
 
@@ -687,6 +998,7 @@ def _run_with_watchdogs(
             proc = subprocess.Popen(
                 popen_args,
                 cwd=str(cwd),
+                stdin=subprocess.PIPE if stdin_data is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
@@ -698,6 +1010,11 @@ def _run_with_watchdogs(
                 # callers get the safe default.
                 start_new_session=True,
             )
+            if stdin_data is not None and proc.stdin is not None:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    proc.stdin.write(stdin_data.encode("utf-8"))
+                with contextlib.suppress(Exception):
+                    proc.stdin.close()
         except FileNotFoundError as exc:
             stderr_fh.write(f"[agentops] failed to launch executor: {exc}\n")
             stderr_fh.flush()
@@ -747,10 +1064,8 @@ def _run_with_watchdogs(
                 _wait(proc, timeout_seconds)
             except KeyboardInterrupt:  # noqa: PERF203 - CLI boundary
                 _terminate_process_tree(proc.pid)
-                try:
+                with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    pass
         finally:
             if idle_watchdog is not None:
                 idle_watchdog.stop()
@@ -764,17 +1079,13 @@ def _run_with_watchdogs(
             # about leaked file descriptors in tests.
             for handle in (proc.stdout, proc.stderr):
                 if handle is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         handle.close()
-                    except Exception:  # noqa: BLE001 - best-effort
-                        pass
             # Reap the child if it is still alive (it should not be,
             # but a defensive ``wait()`` avoids a zombie).
             if proc.poll() is None:
-                try:
+                with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    pass
             # Append a small banner so operator-tail / task-tail can see
             # the run finished marker even if the executor never flushed.
             try:
@@ -964,6 +1275,7 @@ def run_command_streaming(
         startup_timeout=startup_timeout,
         idle_timeout=idle_timeout,
         env=env,
+        stdin_data=None,
     )
 
 
@@ -979,6 +1291,7 @@ def run_argv_streaming(
     env: dict[str, str] | None = None,
     startup_timeout: float | None = None,
     idle_timeout: float | None = None,
+    stdin_data: str | None = None,
 ) -> RunnerResult:
     """Run an argv command and stream stdout/stderr to per-attempt log files.
 
@@ -998,4 +1311,5 @@ def run_argv_streaming(
         startup_timeout=startup_timeout,
         idle_timeout=idle_timeout,
         env=env,
+        stdin_data=stdin_data,
     )

@@ -34,7 +34,10 @@ Reviewer process: read-only Codex review, no GitHub write token.
 Use `gitless_mirror` for:
 
 - runtime crawler/search/source changes,
-- antidetect behavior,
+- browser automation hardening,
+- network automation changes,
+- crawler compliance-sensitive changes,
+- high-risk automation changes,
 - evidence retention,
 - data/enrichment/NIP resolution,
 - DB migrations/status mutation,

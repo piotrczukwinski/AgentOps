@@ -7,7 +7,6 @@ from typing import Any
 
 from .models import MergePolicy, RepoConfig, ReviewConfig, RoadmapConfig, TaskConfig
 
-
 # Canonical default for the per-task total executor attempts (initial +
 # repair attempts driven by ``REQUEST_CHANGES`` / validation failures).
 # The roadmap-level ``max_repair_attempts`` / ``max_review_repairs`` /
@@ -167,6 +166,8 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 fallback_heuristic=roadmap_review.fallback_heuristic,
                 codex_model=roadmap_review.codex_model,
                 model_reasoning_effort=roadmap_review.model_reasoning_effort,
+                self_fix=roadmap_review.self_fix,
+                self_fix_max_lines=roadmap_review.self_fix_max_lines,
             )
         elif isinstance(review_data, str):
             review = ReviewConfig(codex=review_data)
@@ -186,9 +187,20 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                 model_reasoning_effort=_resolve_model_reasoning_effort(
                     review_data, defaults, roadmap_review=roadmap_review
                 ),
+                self_fix=bool(review_data.get("self_fix", roadmap_review.self_fix)),
+                self_fix_max_lines=int(
+                    review_data.get("self_fix_max_lines", roadmap_review.self_fix_max_lines)
+                ),
             )
         else:
             raise ConfigError(f"task {task_id}: review must be string or object")
+
+        # AO-AUDIT-003 (B5): require_executor_result is tri-state.
+        # None = use the kind-based default (implementation tasks are
+        # guarded by default, others are not). An explicit True/False
+        # from the roadmap/task config wins over the default.
+        _req_result_raw = item.get("require_executor_result", None)
+        _require_executor_result = bool(_req_result_raw) if _req_result_raw is not None else None
 
         tasks.append(
             TaskConfig(
@@ -233,7 +245,11 @@ def load_roadmap(path: str | Path) -> RoadmapConfig:
                     defaults.get("executor_options"),
                     item.get("executor_options"),
                 ),
-                require_executor_result=bool(item.get("require_executor_result", False)),
+                # AO-AUDIT-003 (B5): require_executor_result is tri-state.
+                # None = use the kind-based default (implementation tasks
+                # are guarded by default, others are not). An explicit
+                # True/False from the roadmap/task config wins.
+                require_executor_result=_require_executor_result,
                 metadata={k: v for k, v in item.items() if k.startswith("x_")},
             )
         )
@@ -331,6 +347,8 @@ def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -
         fallback_heuristic=bool(value.get("fallback_heuristic", defaults.get("review_fallback_heuristic", False))),
         codex_model=_resolve_codex_model(value, defaults),
         model_reasoning_effort=_resolve_model_reasoning_effort(value, defaults),
+        self_fix=bool(value.get("self_fix", defaults.get("review_self_fix", True))),
+        self_fix_max_lines=int(value.get("self_fix_max_lines", defaults.get("review_self_fix_max_lines", 30))),
     )
 
 
@@ -369,10 +387,9 @@ def _resolve_review_codex(
         "codex": review_data.get("codex"),
         "mode": review_data.get("mode"),
     }
-    if "codex" not in review_data and "mode" not in review_data:
+    if "codex" not in review_data and "mode" not in review_data and "review_policy" in task_data:
         # Fall back to the legacy ``review_policy`` task-level field.
-        if "review_policy" in task_data:
-            source["default_mode"] = task_data["review_policy"]
+        source["default_mode"] = task_data["review_policy"]
     raw = _resolve_codex_value(source, defaults)
     codex = str(raw).lower()
     if codex not in {"auto", "required", "never", "milestone_only"}:

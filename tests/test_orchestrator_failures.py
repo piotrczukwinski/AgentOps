@@ -411,5 +411,191 @@ class ExecutorPromptMarkerContractTests(unittest.TestCase):
             self.assertIn("shell prompt", lowered)
 
 
+# ---------------------------------------------------------------------------
+# AO-AUDIT-003 (B5): result guard is ON by default for kind=implementation
+# ---------------------------------------------------------------------------
+
+
+def _build_implementation_roadmap(
+    parent: Path,
+    repo: Path,
+    *,
+    require_executor_result: bool | None = None,
+) -> Path:
+    """Build a roadmap with a single implementation task using opencode executor.
+
+    Uses ``executor: opencode`` so the B5 default-on guard applies (the
+    guard is on by default for implementation tasks whose executor is
+    an agent). When ``require_executor_result`` is None the roadmap
+    omits the key entirely so the orchestrator applies the kind-based
+    default. When True/False the key is written explicitly so the test
+    can verify opt-in/opt-out.
+    """
+    prompt = parent / "prompt.md"
+    prompt.write_text("do the thing", encoding="utf-8")
+    roadmap_path = parent / "roadmap.json"
+    task: dict[str, object] = {
+        "id": "IMPL-1",
+        "kind": "implementation",
+        "executor": "opencode",
+        "executor_command": "true",
+        "prompt": str(prompt),
+        "branch_prefix": "agentops",
+        "allowed_files": ["out.txt"],
+        "x_allow_empty_diff": True,
+        "review": {"codex": "never"},
+    }
+    if require_executor_result is not None:
+        task["require_executor_result"] = require_executor_result
+    roadmap_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "roadmap_id": "impl-guard-test",
+                "repo": {"id": "r", "path": str(repo), "base_branch": "HEAD"},
+                "integration_branch": "agentops/integration/impl-guard-test",
+                "merge_policy": {
+                    "auto_merge": True,
+                    "strategy": "cherry_pick",
+                    "require_clean_validations": True,
+                    "require_safe_to_merge": True,
+                    "protected_branches": ["main", "master"],
+                },
+                "defaults": {
+                    "executor": "opencode",
+                    "execution_mode": "worktree_branch",
+                    "max_attempts": 1,
+                    "timeout_seconds": 120,
+                },
+                "tasks": [task],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return roadmap_path
+
+
+class ImplementationResultGuardDefaultTests(unittest.TestCase):
+    """AO-AUDIT-003 (B5): implementation tasks are guarded by default."""
+
+    def test_implementation_task_blocked_when_no_marker_and_no_opt_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = _build_implementation_roadmap(root, repo)
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            # Inject the fake runner as the opencode runner (the
+            # roadmap declares executor=opencode so the B5 default-on
+            # guard applies). The fake body is empty -> no marker ->
+            # the guard must block.
+            orch = Orchestrator(
+                state,
+                RunOptions(no_codex=True, artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
+                opencode_runner=FakeShellRunner(body=""),
+            )
+            orch.run_roadmap(roadmap)
+            rows = {r["id"]: r["state"] for r in state.task_rows("impl-guard-test")}
+            self.assertEqual(rows["IMPL-1"], "blocked")
+            with state.connect() as conn:
+                events = conn.execute(
+                    "SELECT type FROM events WHERE roadmap_id='impl-guard-test' AND task_id='IMPL-1' ORDER BY seq"
+                ).fetchall()
+            types = [e["type"] for e in events]
+            self.assertIn("task.result_guard_blocked", types)
+
+    def test_implementation_task_accepted_when_explicit_opt_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = _build_implementation_roadmap(root, repo, require_executor_result=False)
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            orch = Orchestrator(
+                state,
+                RunOptions(no_codex=True, artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
+                opencode_runner=FakeShellRunner(body=""),  # no marker, but opted out
+            )
+            orch.run_roadmap(roadmap)
+            rows = {r["id"]: r["state"] for r in state.task_rows("impl-guard-test")}
+            self.assertNotEqual(rows["IMPL-1"], "blocked")
+            self.assertIn(rows["IMPL-1"], {"accepted", "pushed", "merged"})
+
+    def test_implementation_task_accepted_when_real_marker_present(self) -> None:
+        """When the opencode executor prints a real marker the guard passes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = _build_implementation_roadmap(root, repo)
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            real_body = f"{RESULT_MARKER}: " + json.dumps({"status": "done", "summary": "implemented"})
+            orch = Orchestrator(
+                state,
+                RunOptions(no_codex=True, artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
+                opencode_runner=FakeShellRunner(body=real_body),
+            )
+            orch.run_roadmap(roadmap)
+            rows = {r["id"]: r["state"] for r in state.task_rows("impl-guard-test")}
+            self.assertNotEqual(rows["IMPL-1"], "blocked")
+            self.assertIn(rows["IMPL-1"], {"accepted", "pushed", "merged"})
+
+    def test_shell_implementation_task_not_guarded_by_default(self) -> None:
+        """Shell executors are exempt: their result is the exit code, not a marker."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "shell-impl-test",
+                        "repo": {"id": "r", "path": str(repo), "base_branch": "HEAD"},
+                        "integration_branch": "agentops/integration/shell-impl-test",
+                        "merge_policy": {
+                            "auto_merge": True,
+                            "strategy": "cherry_pick",
+                            "require_safe_to_merge": True,
+                            "protected_branches": ["main", "master"],
+                        },
+                        "defaults": {"executor": "shell", "execution_mode": "worktree_branch", "max_attempts": 1},
+                        "tasks": [
+                            {
+                                "id": "SH-1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('x\\n')\"",
+                                "prompt": str(prompt),
+                                "branch_prefix": "agentops",
+                                "allowed_files": ["out.txt"],
+                                "review": {"codex": "never"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            # Use the real ShellRunner (no fake) so the executor_command
+            # actually runs and creates out.txt. The B5 guard must NOT
+            # fire because the executor is shell (not opencode).
+            orch = Orchestrator(
+                state,
+                RunOptions(no_codex=True, artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
+            )
+            orch.run_roadmap(roadmap)
+            rows = {r["id"]: r["state"] for r in state.task_rows("shell-impl-test")}
+            # Shell implementation tasks are exempt from the default
+            # guard; they rely on validations + policy, not the marker.
+            # The real shell command created out.txt so empty_diff does
+            # not fire either.
+            self.assertNotEqual(rows["SH-1"], "blocked")
+            self.assertIn(rows["SH-1"], {"accepted", "pushed", "merged"})
+
+
 if __name__ == "__main__":
     unittest.main()
