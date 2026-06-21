@@ -1509,22 +1509,39 @@ def _cmd_review(state: StateStore, args: argparse.Namespace) -> int:
             )
             service = HeuristicReviewer()  # type: ignore[assignment]
 
+    # A one-shot review may be run after a human/Codex repair edits the
+    # attempt worktree directly. Always rebuild the review packet from the
+    # current worktree instead of reusing a stale prompt/diff from the original
+    # executor run.
+    from .git_ops import collect_diff
+    from .models import ValidationResult
+    from .policy import PolicyEngine
+    from .prompting import PromptCompiler
+
+    base_sha = attempt["base_sha"] if "base_sha" in attempt.keys() else None
+    diff = collect_diff(workspace, roadmap.repo.base_branch, base_sha=base_sha)
+    diff_patch_path = attempt_dir / "diff.patch"
+    diff_stat_path = attempt_dir / "diff.stat"
+    changed_files_path = attempt_dir / "changed_files.txt"
+    diff_patch_path.write_text(diff.patch, encoding="utf-8")
+    diff_stat_path.write_text(diff.stat, encoding="utf-8")
+    changed_files_path.write_text("\n".join(diff.changed_files), encoding="utf-8")
+    state.record_artifact(roadmap.roadmap_id, task.id, attempt["id"], "diff_patch", diff_patch_path)
+    state.record_artifact(roadmap.roadmap_id, task.id, attempt["id"], "diff_stat", diff_stat_path)
+    state.record_artifact(
+        roadmap.roadmap_id,
+        task.id,
+        attempt["id"],
+        "changed_files",
+        changed_files_path,
+    )
+
+    policy_engine = PolicyEngine(roadmap)
+    policy_result = policy_engine.check_diff(task, diff)
+    validation = ValidationResult(True, ())
+    prompt_text = PromptCompiler(policy_engine).review_prompt(task, diff, policy_result, validation)
     review_prompt_path = attempt_dir / "review.prompt.md"
-    if not review_prompt_path.exists():
-        # The user is asking for an isolated review; build a minimal packet
-        # from the latest diff so the reviewer has something to look at.
-        from .git_ops import collect_diff
-        from .policy import PolicyEngine
-        from .prompting import PromptCompiler
-
-        diff = collect_diff(workspace, roadmap.repo.base_branch)
-        policy_engine = PolicyEngine(roadmap)
-        policy_result = policy_engine.check_diff(task, diff)
-        from .models import ValidationResult
-
-        validation = ValidationResult(True, ())
-        prompt_text = PromptCompiler(policy_engine).review_prompt(task, diff, policy_result, validation)
-        review_prompt_path.write_text(prompt_text, encoding="utf-8")
+    review_prompt_path.write_text(prompt_text, encoding="utf-8")
 
     state.event(roadmap.roadmap_id, task.id, attempt["id"], "task.review_requested", {"reviewer": service.name})
     state.transition_task(roadmap.roadmap_id, task.id, TaskState.CODEX_REVIEWING)

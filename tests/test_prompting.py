@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agentops.models import RepoConfig, RoadmapConfig, TaskConfig
+from agentops.models import RepoConfig, ReviewConfig, RoadmapConfig, TaskConfig
 from agentops.policy import PolicyEngine
 from agentops.prompting import PromptCompiler
 
@@ -15,7 +15,20 @@ class PromptingTests(unittest.TestCase):
             root = Path(tmp)
             prompt = root / "task.md"
             prompt.write_text("Do the thing", encoding="utf-8")
-            task = TaskConfig(id="T", kind="demo", prompt_path=prompt, allowed_files=("out.txt",), validations=("git diff --check",))
+            task = TaskConfig(
+                id="T",
+                kind="demo",
+                prompt_path=prompt,
+                allowed_files=("out.txt",),
+                validations=("git diff --check",),
+                executor="codex",
+                model="gpt-5-codex",
+                review=ReviewConfig(
+                    codex="required",
+                    codex_model="gpt-5.3-codex-review",
+                    model_reasoning_effort="high",
+                ),
+            )
             roadmap = RoadmapConfig(version=1, roadmap_id="r", repo=RepoConfig(id="repo", path=root), tasks=(task,))
             compiler = PromptCompiler(PolicyEngine(roadmap))
             text = compiler.executor_prompt(task)
@@ -23,6 +36,11 @@ class PromptingTests(unittest.TestCase):
             self.assertIn("out.txt", text)
             self.assertIn("git diff --check", text)
             self.assertIn("Do the thing", text)
+            self.assertIn('"executor": "codex"', text)
+            self.assertIn('"model": "gpt-5-codex"', text)
+            self.assertIn('"reviewer": "required"', text)
+            self.assertIn('"reviewer_model": "gpt-5.3-codex-review"', text)
+            self.assertIn('"reviewer_model_reasoning_effort": "high"', text)
 
     def test_review_prompt_includes_original_task_spec(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

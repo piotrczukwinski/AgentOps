@@ -253,6 +253,7 @@ class ReviewVerdict:
     summary: str = ""
     blocking_issues: tuple[dict[str, Any], ...] = ()
     repair_prompt: str = ""
+    repair_scope: str = ""
     safe_to_push: bool = False
     safe_to_merge: bool = False
     raw: dict[str, Any] = field(default_factory=dict)

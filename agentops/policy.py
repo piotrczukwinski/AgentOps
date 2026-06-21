@@ -65,11 +65,11 @@ class PolicyEngine:
             )
 
         if not allowed and diff.changed_files and not allow_any_files:
-            issues.append(PolicyIssue("files.allowed_missing", "critical", "Task changed files but allowed_files is empty"))
+            issues.append(PolicyIssue("files.allowed_missing", "medium", "Task changed files but allowed_files is empty"))
 
         for path in diff.changed_files:
             if allowed and not any(_match(path, pattern) for pattern in allowed):
-                issues.append(PolicyIssue("files.not_allowed", "critical", f"Changed file is outside allowed_files: {path}", path))
+                issues.append(PolicyIssue("files.not_allowed", "medium", f"Changed file is outside allowed_files: {path}", path))
             for pattern in forbidden:
                 if _match(path, pattern):
                     issues.append(PolicyIssue("files.forbidden", "critical", f"Changed file matches forbidden glob {pattern!r}: {path}", path))
@@ -79,7 +79,13 @@ class PolicyEngine:
                 issues.append(PolicyIssue("diff.secret_like_value", "critical", "Diff appears to contain a secret-like value"))
                 break
 
-        return PolicyResult(not issues, tuple(issues))
+        blocking_names = {
+            "files.empty_diff",
+            "files.forbidden",
+            "diff.secret_like_value",
+        }
+        blocking = [issue for issue in issues if issue.name in blocking_names]
+        return PolicyResult(not blocking, tuple(issues))
 
     def as_jsonable(self, result: PolicyResult) -> dict[str, object]:
         return {"ok": result.ok, "issues": [asdict(issue) for issue in result.issues]}
@@ -88,4 +94,10 @@ class PolicyEngine:
 def _match(path: str, pattern: str) -> bool:
     normalized_path = path.strip("/")
     normalized_pattern = pattern.strip("/")
-    return fnmatch.fnmatch(normalized_path, normalized_pattern) or fnmatch.fnmatch("/" + normalized_path, normalized_pattern)
+    candidates = [normalized_pattern]
+    if "/**/" in normalized_pattern:
+        candidates.append(normalized_pattern.replace("/**/", "/"))
+    return any(
+        fnmatch.fnmatch(normalized_path, item) or fnmatch.fnmatch("/" + normalized_path, item)
+        for item in candidates
+    )

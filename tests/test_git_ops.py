@@ -188,5 +188,36 @@ class BranchForTaskTests(unittest.TestCase):
         self.assertTrue(name.startswith("agentops/demo/t1-"), msg=name)
 
 
+class EnsureIntegrationBranchTests(unittest.TestCase):
+    def _init_repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        repo.mkdir()
+        git(repo, "init")
+        git(repo, "config", "user.email", "agentops@example.invalid")
+        git(repo, "config", "user.name", "AgentOps Test")
+        (repo / "README.md").write_text("seed\n", encoding="utf-8")
+        git(repo, "add", "README.md")
+        git(repo, "commit", "-m", "initial")
+        return repo
+
+    def test_existing_integration_branch_may_also_be_base_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo = self._init_repo(Path(tmp_str))
+            git(repo, "branch", "integration/agentops")
+
+            from agentops.git_ops import ensure_integration_branch
+
+            ensure_integration_branch(repo, "integration/agentops", "integration/agentops")
+
+    def test_equal_base_and_integration_without_existing_branch_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo = self._init_repo(Path(tmp_str))
+
+            from agentops.git_ops import IntegrationBranchBlocked, ensure_integration_branch
+
+            with self.assertRaises(IntegrationBranchBlocked):
+                ensure_integration_branch(repo, "integration/missing", "integration/missing")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,13 +35,33 @@ class PolicyTests(unittest.TestCase):
         names = {issue.name for issue in result.issues}
         self.assertIn("files.forbidden", names)
 
-    def test_blocks_outside_allowed_files(self) -> None:
+    def test_reports_outside_allowed_files_without_blocking(self) -> None:
         engine = self.make_engine()
         task = TaskConfig(id="T", kind="demo", prompt_path=Path("p.md"), allowed_files=("allowed.txt",))
         diff = DiffSnapshot(("other.txt",), "M\tother.txt", "", "diff", "HEAD", "HEAD")
         result = engine.check_diff(task, diff)
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
         self.assertIn("files.not_allowed", {issue.name for issue in result.issues})
+
+    def test_double_star_matches_direct_child(self) -> None:
+        engine = self.make_engine()
+        task = TaskConfig(
+            id="T",
+            kind="demo",
+            prompt_path=Path("p.md"),
+            allowed_files=("packages/db/src/**/*.test.ts",),
+        )
+        diff = DiffSnapshot(
+            ("packages/db/src/client-operations.test.ts",),
+            "M\tpackages/db/src/client-operations.test.ts",
+            "",
+            "diff",
+            "HEAD",
+            "HEAD",
+        )
+        result = engine.check_diff(task, diff)
+        self.assertTrue(result.ok, msg=str([asdict(i) for i in result.issues]))
+        self.assertNotIn("files.not_allowed", {issue.name for issue in result.issues})
 
     def test_empty_diff_blocks_by_default(self) -> None:
         engine = self.make_engine()

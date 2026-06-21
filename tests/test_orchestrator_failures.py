@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from agentops.config import load_roadmap
+from agentops.models import EXECUTOR_IDLE_TIMEOUT
 from agentops.operator_run import (
     MISSING_RESULT_CATEGORY,
     RESULT_MARKER,
@@ -71,6 +72,69 @@ class FakeShellRunner:
             stderr_path=stderr_path,
             started_at=utc_now(),
             ended_at=utc_now(),
+        )
+
+
+class SequencedFakeRunner:
+    """Fake runner that returns one stdout body per attempt."""
+
+    name = "sequenced-fake"
+
+    def __init__(self, bodies: list[str]) -> None:
+        self._bodies = bodies
+        self.prompts: list[str] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[no-untyped-def]
+        from agentops.models import RunnerResult
+        from agentops.runners import utc_now
+
+        self.prompts.append(prompt)
+        index = min(len(self.prompts) - 1, len(self._bodies) - 1)
+        stdout_path = artifact_dir / "executor.stdout.log"
+        stderr_path = artifact_dir / "executor.stderr.log"
+        stdout_path.write_text(self._bodies[index], encoding="utf-8")
+        stderr_path.write_text("", encoding="utf-8")
+        return RunnerResult(
+            exit_code=0,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            started_at=utc_now(),
+            ended_at=utc_now(),
+        )
+
+
+class WatchdogFakeRunner:
+    """Fake helper runner that simulates an executor watchdog failure."""
+
+    name = "watchdog-fake"
+
+    def __init__(self, failure_category: str) -> None:
+        self.failure_category = failure_category
+        self.prompts: list[str] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[no-untyped-def]
+        from agentops.models import RunnerResult
+        from agentops.runners import utc_now
+
+        self.prompts.append(prompt)
+        stdout_path = artifact_dir / "executor.stdout.log"
+        stderr_path = artifact_dir / "executor.stderr.log"
+        combined_path = artifact_dir / "executor.combined.log"
+        stdout_path.write_text("", encoding="utf-8")
+        stderr_path.write_text("", encoding="utf-8")
+        combined_path.write_text("helper started\n", encoding="utf-8")
+        return RunnerResult(
+            exit_code=124,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            started_at=utc_now(),
+            ended_at=utc_now(),
+            timed_out=True,
+            combined_log_path=combined_path,
+            failure_category=self.failure_category,
+            idle_for_seconds=600,
+            startup_for_seconds=180,
+            watchdog_log_size_bytes=combined_path.stat().st_size,
         )
 
 
@@ -421,6 +485,7 @@ def _build_implementation_roadmap(
     repo: Path,
     *,
     require_executor_result: bool | None = None,
+    max_attempts: int = 1,
 ) -> Path:
     """Build a roadmap with a single implementation task using opencode executor.
 
@@ -464,7 +529,7 @@ def _build_implementation_roadmap(
                 "defaults": {
                     "executor": "opencode",
                     "execution_mode": "worktree_branch",
-                    "max_attempts": 1,
+                    "max_attempts": max_attempts,
                     "timeout_seconds": 120,
                 },
                 "tasks": [task],
@@ -503,6 +568,94 @@ class ImplementationResultGuardDefaultTests(unittest.TestCase):
                 ).fetchall()
             types = [e["type"] for e in events]
             self.assertIn("task.result_guard_blocked", types)
+
+    def test_autonomous_missing_marker_routes_repair_to_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = _build_implementation_roadmap(root, repo, max_attempts=2)
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            real_body = f"{RESULT_MARKER}: " + json.dumps(
+                {"status": "done", "summary": "implemented"}
+            )
+            opencode_runner = SequencedFakeRunner(["executor finished but forgot marker\n"])
+            codex_runner = SequencedFakeRunner([real_body])
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    no_codex=True,
+                    autonomous=True,
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                opencode_runner=opencode_runner,
+                codex_runner=codex_runner,
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("impl-guard-test")[0]
+            self.assertIn(row["state"], {"accepted", "pushed", "merged"})
+            self.assertEqual(row["current_attempt"], 2)
+            self.assertEqual(len(opencode_runner.prompts), 1)
+            self.assertEqual(len(codex_runner.prompts), 1)
+            self.assertIn("executor result contract failed", codex_runner.prompts[0])
+            with state.connect() as conn:
+                attempts = conn.execute(
+                    "SELECT executor FROM attempts WHERE roadmap_id='impl-guard-test' AND task_id='IMPL-1' ORDER BY attempt_no"
+                ).fetchall()
+            self.assertEqual([attempt["executor"] for attempt in attempts], ["opencode", "codex"])
+            with state.connect() as conn:
+                events = conn.execute(
+                    "SELECT type FROM events WHERE roadmap_id='impl-guard-test' AND task_id='IMPL-1' ORDER BY seq"
+                ).fetchall()
+            types = [e["type"] for e in events]
+            self.assertIn("task.codex_takeover_queued", types)
+            self.assertNotIn("task.result_guard_retry_queued", types)
+            self.assertNotIn("task.result_guard_blocked", types)
+
+    def test_autonomous_helper_idle_timeout_routes_to_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = _build_implementation_roadmap(root, repo, max_attempts=2)
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            real_body = f"{RESULT_MARKER}: " + json.dumps(
+                {"status": "done", "summary": "implemented"}
+            )
+            opencode_runner = WatchdogFakeRunner(EXECUTOR_IDLE_TIMEOUT)
+            codex_runner = SequencedFakeRunner([real_body])
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    no_codex=True,
+                    autonomous=True,
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                opencode_runner=opencode_runner,
+                codex_runner=codex_runner,
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("impl-guard-test")[0]
+            self.assertIn(row["state"], {"accepted", "pushed", "merged"})
+            self.assertEqual(row["current_attempt"], 2)
+            self.assertEqual(len(opencode_runner.prompts), 1)
+            self.assertEqual(len(codex_runner.prompts), 1)
+            self.assertIn("helper executor stalled", codex_runner.prompts[0].lower())
+            with state.connect() as conn:
+                attempts = conn.execute(
+                    "SELECT executor FROM attempts WHERE roadmap_id='impl-guard-test' AND task_id='IMPL-1' ORDER BY attempt_no"
+                ).fetchall()
+            self.assertEqual([attempt["executor"] for attempt in attempts], ["opencode", "codex"])
+            with state.connect() as conn:
+                events = conn.execute(
+                    "SELECT type FROM events WHERE roadmap_id='impl-guard-test' AND task_id='IMPL-1' ORDER BY seq"
+                ).fetchall()
+            types = [e["type"] for e in events]
+            self.assertIn("task.executor_idle_timeout", types)
+            self.assertIn("task.codex_takeover_queued", types)
+            self.assertNotIn("task.blocked", types)
 
     def test_implementation_task_accepted_when_explicit_opt_out(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

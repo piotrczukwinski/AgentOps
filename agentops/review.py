@@ -270,6 +270,7 @@ class CodexReviewService:
                 summary=verdict.summary,
                 blocking_issues=verdict.blocking_issues,
                 repair_prompt=verdict.repair_prompt,
+                repair_scope=verdict.repair_scope,
                 safe_to_push=verdict.safe_to_push,
                 safe_to_merge=verdict.safe_to_merge,
                 raw=raw,
@@ -283,10 +284,10 @@ class CodexReviewService:
 
 
 def _verdict_from_dict(data: dict[str, Any]) -> ReviewVerdict:
-    verdict = str(data.get("verdict", "BLOCK")).upper()
+    verdict = str(data.get("verdict") or data.get("decision") or "BLOCK").upper()
     if verdict not in VALID_VERDICTS:
         verdict = "BLOCK"
-    blocking = data.get("blocking_issues", []) or []
+    blocking = data.get("blocking_issues", []) or data.get("findings", []) or []
     normalized_issues: list[dict[str, Any]] = []
     for item in blocking:
         if not isinstance(item, dict):
@@ -314,6 +315,7 @@ def _verdict_from_dict(data: dict[str, Any]) -> ReviewVerdict:
         summary=str(data.get("summary", "")),
         blocking_issues=tuple(normalized_issues),
         repair_prompt=str(data.get("repair_prompt", "")),
+        repair_scope=str(data.get("repair_scope", "")),
         safe_to_push=bool(data.get("safe_to_push", safe_to_push_default)),
         safe_to_merge=bool(data.get("safe_to_merge", safe_to_merge_default)),
         raw=data,

@@ -347,13 +347,17 @@ def branch_exists(repo: Path, name: str) -> bool:
 
 def ensure_integration_branch(repo: Path, integration_branch: str, base_branch: str) -> None:
     """Create the integration branch off ``base_branch`` if it does not exist."""
-    if not integration_branch or integration_branch == base_branch:
-        raise IntegrationBranchBlocked(
-            f"integration_branch must be a non-empty branch distinct from base {base_branch!r}"
-        )
+    if not integration_branch:
+        raise IntegrationBranchBlocked("integration_branch must be a non-empty branch")
     if is_protected_branch(integration_branch):
         raise IntegrationBranchBlocked(
             f"integration_branch {integration_branch!r} matches a protected branch pattern"
+        )
+    if integration_branch == base_branch and branch_exists(repo, integration_branch):
+        return
+    if integration_branch == base_branch:
+        raise IntegrationBranchBlocked(
+            f"integration_branch {integration_branch!r} equals base {base_branch!r} but does not exist"
         )
     if not branch_exists(repo, integration_branch):
         run_git(repo, ["branch", integration_branch, base_branch])

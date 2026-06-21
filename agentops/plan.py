@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, load_roadmap
-from .git_ops import is_git_repo, rev_parse
+from .git_ops import branch_exists, is_git_repo, rev_parse
 from .models import RoadmapConfig, TaskConfig
 
 
@@ -104,6 +104,16 @@ def _check_repo(roadmap: RoadmapConfig, errors: list[PlanIssue], warnings: list[
             "repo.integration_branch",
             "warning",
             "No integration_branch configured; reviews/pushes will not target a stable merge branch.",
+        ))
+    elif repo.integration_branch == base_ref and not branch_exists(repo.path, repo.integration_branch):
+        errors.append(PlanIssue(
+            "repo.integration_branch_missing",
+            "error",
+            (
+                f"integration_branch {repo.integration_branch!r} is also the base ref, "
+                "but that branch does not exist yet."
+            ),
+            path=str(repo.path),
         ))
 
 

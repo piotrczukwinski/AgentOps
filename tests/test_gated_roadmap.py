@@ -1434,6 +1434,7 @@ class ReviewSchemaPathTests(unittest.TestCase):
             "summary": "ok",
             "blocking_issues": [],
             "repair_prompt": "",
+            "repair_scope": "small",
             "safe_to_push": False,
             "safe_to_merge": True,
         }
@@ -1501,6 +1502,7 @@ class StubCodexBinaryTests(unittest.TestCase):
                 "summary": "stub codex",
                 "blocking_issues": [],
                 "repair_prompt": "",
+                "repair_scope": "small",
                 "safe_to_push": True,
                 "safe_to_merge": True,
             }

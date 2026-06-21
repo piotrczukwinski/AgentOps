@@ -36,6 +36,7 @@ from .git_ops import (
     merge_integration,
     push,
     rev_parse,
+    run_git,
     worktree_is_clean,
 )
 from .models import (
@@ -72,14 +73,16 @@ ACCEPTED_OUTCOMES = {
 # set intentionally includes ``MERGE_FAILED`` / ``BLOCKED`` /
 # ``AWAITING_REVIEW`` / ``AWAITING_HUMAN``: those need an operator
 # decision (``agentops decide``) before they can advance, so the resume
-# path does not silently re-run them. An operator who wants to retry a
-# blocked task should use ``agentops decide <task> --verdict ACCEPT``
-# (or remove the task from the state DB) before resuming.
+# path does not silently re-run them. ``SKIPPED`` is intentionally not
+# terminal here: dependency-skipped downstream tasks must be reconsidered
+# after an operator decision or repair unblocks their dependency.
+# An operator who wants to retry a blocked task should use
+# ``agentops decide <task> --verdict ACCEPT`` (or remove the task from
+# the state DB) before resuming.
 RESUME_SKIP_STATES = {
     TaskState.ACCEPTED.value,
     TaskState.PUSHED.value,
     TaskState.MERGED.value,
-    TaskState.SKIPPED.value,
     TaskState.MERGE_FAILED.value,
     TaskState.BLOCKED.value,
     TaskState.AWAITING_REVIEW.value,
@@ -116,6 +119,7 @@ RESUME_INFLIGHT_STATES = {
 # is the install location in production) so it works both for editable
 # installs and for repository checkouts.
 DEFAULT_REVIEW_SCHEMA_PATH = "schemas/review_verdict.schema.json"
+DEFAULT_CODEX_REVIEW_REPAIR_ATTEMPTS = 2
 
 
 def _integration_branch_exists(repo: Path, name: str) -> bool:
@@ -173,6 +177,42 @@ def _is_codex_failure_verdict(verdict: ReviewVerdict) -> bool:
         "reviewer final message was not valid json",
     )
     return any(marker in summary for marker in failure_markers)
+
+
+def _can_route_executor_watchdog_to_codex(
+    task: TaskConfig,
+    runtime: _TaskRuntime,
+    *,
+    autonomous: bool,
+) -> bool:
+    """Return True when a wedged helper executor should become Codex work.
+
+    The watchdog is meant to keep an unattended roadmap moving. For helper
+    models, a startup/idle timeout is an executor failure, not a product
+    blocker. Codex gets one takeover attempt under the same bounded repair
+    rules used for result-guard and validation failures.
+    """
+    return (
+        autonomous
+        and task.executor in {"opencode", "minimax", "minimax-m3"}
+        and not runtime.codex_takeover_active
+        and not runtime.codex_takeover_used
+    )
+
+
+def _review_repair_scope(verdict: ReviewVerdict) -> str:
+    """Return reviewer-declared repair scope with a small-fix fallback."""
+    scope = (verdict.repair_scope or "").strip().lower()
+    if scope in {"small", "large", "architectural"}:
+        return scope
+    raw = verdict.raw or {}
+    if isinstance(raw, dict):
+        raw_scope = str(raw.get("repair_scope", "")).strip().lower()
+        if raw_scope in {"small", "large", "architectural"}:
+            return raw_scope
+    if len(verdict.blocking_issues) <= 1 and verdict.repair_prompt:
+        return "small"
+    return "large"
 
 
 def _failure_category_for_verdict(verdict: ReviewVerdict) -> str:
@@ -238,6 +278,9 @@ class _TaskRuntime:
     review_verdict: ReviewVerdict | None = None
     codex_takeover_active: bool = False
     codex_takeover_used: bool = False
+    codex_takeover_reason: str = "max_repair_attempts"
+    codex_review_repairs: int = 0
+    helper_large_repair_used: bool = False
 
 
 class Orchestrator:
@@ -250,6 +293,7 @@ class Orchestrator:
         heuristic_reviewer: HeuristicReviewer | None = None,
         shell_runner: BaseRunner | None = None,
         opencode_runner: BaseRunner | None = None,
+        codex_runner: BaseRunner | None = None,
     ):
         self.state = state
         self.options = options or RunOptions()
@@ -257,6 +301,7 @@ class Orchestrator:
         self._injected_heuristic = heuristic_reviewer
         self._injected_shell_runner = shell_runner
         self._injected_opencode_runner = opencode_runner
+        self._injected_codex_runner = codex_runner
 
     # ------------------------------------------------------------------
     # Public entrypoint
@@ -316,12 +361,13 @@ class Orchestrator:
     def _run_roadmap_locked(self, roadmap: RoadmapConfig, *, resume: bool = False) -> int:
         """Roadmap execution body. Called with the repo lock already held.
 
-        When ``resume`` is True the loop skips tasks already in a
-        terminal/accepted state (so a resumed run does not redo work
-        that already landed on the integration branch) and any task
-        left in an in-flight state by the previous run is reset to
-        ``READY`` with a ``task.recovered_for_resume`` event before the
-        loop starts.
+        The loop skips tasks already in a terminal/accepted state for
+        both fresh and resumed runs. Re-importing or re-running a
+        roadmap is an operator resume action in practice, and work that
+        already landed on the integration branch must not be executed
+        again. When ``resume`` is True, tasks left in an in-flight state
+        by the previous run are reset to ``READY`` with a
+        ``task.recovered_for_resume`` event before the loop starts.
         """
         self.state.init()
         self.state.import_roadmap(roadmap)
@@ -356,14 +402,22 @@ class Orchestrator:
         completed = 0
         task_states = {row["id"]: row["state"] for row in self.state.task_rows(roadmap.roadmap_id)}
         for task in sorted(roadmap.tasks, key=lambda item: (item.priority, item.id)):
-            # Resume path: skip tasks that already reached a terminal
-            # state. This is the core of crash recovery — a task that
-            # already merged must not be re-run, and a task blocked by
-            # the reviewer or awaiting a human decision must not be
-            # silently re-tried. ``RESUME_SKIP_STATES`` is intentionally
-            # the union of accepted outcomes and the operator-decision
-            # states.
-            if resume and task_states.get(task.id) in RESUME_SKIP_STATES:
+            # Re-run path: skip tasks that already reached a terminal
+            # state. This is the core of crash recovery and repeat-run
+            # safety: a task that already merged must not be re-run, and
+            # a task blocked by the reviewer or awaiting a human decision
+            # must not be silently re-tried. ``RESUME_SKIP_STATES`` is
+            # intentionally the union of accepted outcomes and the
+            # operator-decision states. ``SKIPPED`` is not terminal so
+            # dependency-skipped downstream tasks are reconsidered.
+            current_state = task_states.get(task.id)
+            if current_state in RESUME_SKIP_STATES:
+                self._record_roadmap_event(
+                    roadmap,
+                    "task.already_finished",
+                    task.id,
+                    extra={"state": current_state, "resume": resume},
+                )
                 completed += 1
                 continue
             task_budget = budget.can_start_task()
@@ -551,7 +605,7 @@ class Orchestrator:
 
         max_attempts = self._effective_max_attempts(task, roadmap)
         accepted_outcome = False
-        for attempt_no in range(1, max_attempts + 2):
+        for attempt_no in range(1, max_attempts + DEFAULT_CODEX_REVIEW_REPAIR_ATTEMPTS + 2):
             if attempt_no > max_attempts and not runtime.codex_takeover_active:
                 break
             attempt_budget = budget.can_start_attempt(task_id=task.id)
@@ -597,7 +651,7 @@ class Orchestrator:
                     {
                         "attempt": attempt_no,
                         "after_executor": task.executor,
-                        "reason": "max_repair_attempts",
+                        "reason": runtime.codex_takeover_reason,
                     },
                 )
             attempt_id = self.state.create_attempt(
@@ -656,6 +710,59 @@ class Orchestrator:
                         "attempt": attempt_no,
                     },
                 )
+                if _can_route_executor_watchdog_to_codex(
+                    task,
+                    runtime,
+                    autonomous=self.options.autonomous,
+                ):
+                    runtime.codex_takeover_active = True
+                    runtime.codex_takeover_used = True
+                    runtime.codex_takeover_reason = EXECUTOR_NO_OUTPUT_STARTUP
+                    runtime.repair_prompt = "\n".join(
+                        [
+                            "# AgentOps Codex takeover task",
+                            "The helper executor produced no log output within the startup watchdog window.",
+                            "Complete the original task directly in this worktree.",
+                            "Do not broaden scope or modify files outside Allowed files.",
+                            "",
+                            "# Original task id",
+                            task.id,
+                            "",
+                            "# Allowed files",
+                            "\n".join(f"- {path}" for path in task.allowed_files) or "- (none)",
+                            "",
+                            "# Watchdog details",
+                            f"failure_category: {EXECUTOR_NO_OUTPUT_STARTUP}",
+                            f"startup_for_seconds: {result.startup_for_seconds}",
+                            f"combined_log: {result.combined_log_path}",
+                        ]
+                    )
+                    repair_path = artifact_store.write_text(attempt_dir, "repair.prompt.md", runtime.repair_prompt)
+                    self.state.record_artifact(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "repair_prompt",
+                        repair_path,
+                        artifact_store.sha256(repair_path),
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.codex_takeover_queued",
+                        task.id,
+                        extra={
+                            "reason": EXECUTOR_NO_OUTPUT_STARTUP,
+                            "next_attempt": attempt_no + 1,
+                            "next_executor": "codex",
+                        },
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.REPAIR_PROMPT_READY,
+                        {"reason": EXECUTOR_NO_OUTPUT_STARTUP, "executor": "codex"},
+                    )
+                    continue
                 self.state.transition_task(
                     roadmap.roadmap_id,
                     task.id,
@@ -692,6 +799,60 @@ class Orchestrator:
                         "attempt": attempt_no,
                     },
                 )
+                if _can_route_executor_watchdog_to_codex(
+                    task,
+                    runtime,
+                    autonomous=self.options.autonomous,
+                ):
+                    runtime.codex_takeover_active = True
+                    runtime.codex_takeover_used = True
+                    runtime.codex_takeover_reason = EXECUTOR_IDLE_TIMEOUT
+                    runtime.repair_prompt = "\n".join(
+                        [
+                            "# AgentOps Codex takeover task",
+                            "The helper executor stalled: its combined log stopped growing within the idle watchdog window.",
+                            "Complete the original task directly in this worktree.",
+                            "Do not broaden scope or modify files outside Allowed files.",
+                            "",
+                            "# Original task id",
+                            task.id,
+                            "",
+                            "# Allowed files",
+                            "\n".join(f"- {path}" for path in task.allowed_files) or "- (none)",
+                            "",
+                            "# Watchdog details",
+                            f"failure_category: {EXECUTOR_IDLE_TIMEOUT}",
+                            f"idle_for_seconds: {result.idle_for_seconds}",
+                            f"watchdog_log_size_bytes: {result.watchdog_log_size_bytes}",
+                            f"combined_log: {result.combined_log_path}",
+                        ]
+                    )
+                    repair_path = artifact_store.write_text(attempt_dir, "repair.prompt.md", runtime.repair_prompt)
+                    self.state.record_artifact(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "repair_prompt",
+                        repair_path,
+                        artifact_store.sha256(repair_path),
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.codex_takeover_queued",
+                        task.id,
+                        extra={
+                            "reason": EXECUTOR_IDLE_TIMEOUT,
+                            "next_attempt": attempt_no + 1,
+                            "next_executor": "codex",
+                        },
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.REPAIR_PROMPT_READY,
+                        {"reason": EXECUTOR_IDLE_TIMEOUT, "executor": "codex"},
+                    )
+                    continue
                 self.state.transition_task(
                     roadmap.roadmap_id,
                     task.id,
@@ -774,38 +935,10 @@ class Orchestrator:
                             "Do not restart from scratch. Inspect the allowed files and implement the smallest correct change.",
                         ]
                     )
-                    if attempt_no < max_attempts:
-                        runtime.repair_prompt = empty_diff_prompt
-                        repair_path = artifact_store.write_text(
-                            attempt_dir, "repair.prompt.md", runtime.repair_prompt
-                        )
-                        self.state.record_artifact(
-                            roadmap.roadmap_id,
-                            task.id,
-                            attempt_id,
-                            "repair_prompt",
-                            repair_path,
-                            artifact_store.sha256(repair_path),
-                        )
-                        self.state.transition_task(
-                            roadmap.roadmap_id,
-                            task.id,
-                            TaskState.REPAIR_PROMPT_READY,
-                            {
-                                "reason": "empty_diff_retry",
-                                "after_attempt": attempt_no,
-                            },
-                        )
-                        self._record_roadmap_event(
-                            roadmap,
-                            "task.empty_diff_retry_queued",
-                            task.id,
-                            extra={"after_attempt": attempt_no, "next_attempt": attempt_no + 1},
-                        )
-                        continue
-                    if attempt_no == max_attempts and not runtime.codex_takeover_used:
+                    if task.executor in {"opencode", "minimax", "minimax-m3"} and not runtime.codex_takeover_used:
                         runtime.codex_takeover_active = True
                         runtime.codex_takeover_used = True
+                        runtime.codex_takeover_reason = "empty_diff"
                         runtime.repair_prompt = empty_diff_prompt
                         repair_path = artifact_store.write_text(
                             attempt_dir, "repair.prompt.md", runtime.repair_prompt
@@ -837,6 +970,35 @@ class Orchestrator:
                                 "next_attempt": attempt_no + 1,
                                 "reason": "empty_diff",
                             },
+                        )
+                        continue
+                    if attempt_no < max_attempts:
+                        runtime.repair_prompt = empty_diff_prompt
+                        repair_path = artifact_store.write_text(
+                            attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                        )
+                        self.state.record_artifact(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "repair_prompt",
+                            repair_path,
+                            artifact_store.sha256(repair_path),
+                        )
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            task.id,
+                            TaskState.REPAIR_PROMPT_READY,
+                            {
+                                "reason": "empty_diff_retry",
+                                "after_attempt": attempt_no,
+                            },
+                        )
+                        self._record_roadmap_event(
+                            roadmap,
+                            "task.empty_diff_retry_queued",
+                            task.id,
+                            extra={"after_attempt": attempt_no, "next_attempt": attempt_no + 1},
                         )
                         continue
                 self.state.transition_task(
@@ -892,24 +1054,108 @@ class Orchestrator:
                 elif _cls == "template":
                     _category = TEMPLATE_RESULT_CATEGORY
                 if _category is not None:
-                    self.state.event(
-                        roadmap.roadmap_id,
-                        task.id,
-                        attempt_id,
-                        "task.result_guard_blocked",
-                        {"failure_category": _category, "exit_code": result.exit_code, "classification": _cls},
+                    result_guard_prompt = "\n".join(
+                        [
+                            "# AgentOps autonomous repair: executor result contract failed",
+                            "",
+                            "The previous executor attempt exited successfully but did not return a valid AGENTOPS_RESULT_JSON result marker.",
+                            f"Failure category: {_category}",
+                            f"Marker classification: {_cls}",
+                            "",
+                            "Continue from the current working tree. Do not restart from scratch.",
+                            "Inspect the existing changes and validations, make only the smallest correction still needed, and finish with the exact required result marker.",
+                            "",
+                            "The final stdout must contain one real JSON object in this form:",
+                            'AGENTOPS_RESULT_JSON: {"status":"done","summary":"...","changed_files":["..."],"validation_commands_run":["..."],"known_risks":[]}',
+                            "",
+                            "Do not use markdown fences, shell prompts, heredocs, or AGENTOPS_RESULT_JSON=.",
+                            "If the task is genuinely blocked, return AGENTOPS_RESULT_JSON with status \"blocked\" and a concrete blocker.",
+                        ]
                     )
-                    self.state.transition_task(
-                        roadmap.roadmap_id,
-                        task.id,
-                        TaskState.BLOCKED,
-                        {"reason": _category, "failure_category": _category},
-                    )
-                    self._record_roadmap_event(
-                        roadmap, "task.blocked_by_result_guard", task.id,
-                        extra={"failure_category": _category, "classification": _cls},
-                    )
-                    return
+                    if (
+                        self.options.autonomous
+                        and runtime.codex_takeover_active
+                        and diff.changed_files
+                    ):
+                        self.state.event(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "task.result_guard_soft_pass",
+                            {
+                                "failure_category": _category,
+                                "classification": _cls,
+                                "reason": "codex_takeover_non_empty_diff",
+                            },
+                        )
+                        should_block_for_result_guard = False
+                    elif (
+                        self.options.autonomous
+                        and task.executor in {"opencode", "minimax", "minimax-m3"}
+                        and not runtime.codex_takeover_active
+                        and not runtime.codex_takeover_used
+                    ):
+                        runtime.codex_takeover_active = True
+                        runtime.codex_takeover_used = True
+                        runtime.codex_takeover_reason = "result_guard"
+                        runtime.repair_prompt = result_guard_prompt
+                        repair_path = artifact_store.write_text(
+                            attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                        )
+                        self.state.record_artifact(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "repair_prompt",
+                            repair_path,
+                            artifact_store.sha256(repair_path),
+                        )
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            task.id,
+                            TaskState.REPAIR_PROMPT_READY,
+                            {
+                                "reason": "result_guard_codex_takeover",
+                                "failure_category": _category,
+                                "classification": _cls,
+                                "after_attempt": attempt_no,
+                                "next_executor": "codex",
+                            },
+                        )
+                        self._record_roadmap_event(
+                            roadmap,
+                            "task.codex_takeover_queued",
+                            task.id,
+                            extra={
+                                "after_attempt": attempt_no,
+                                "next_attempt": attempt_no + 1,
+                                "reason": "result_guard",
+                                "failure_category": _category,
+                                "classification": _cls,
+                            },
+                        )
+                        continue
+                    else:
+                        should_block_for_result_guard = True
+                    if should_block_for_result_guard:
+                        self.state.event(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "task.result_guard_blocked",
+                            {"failure_category": _category, "exit_code": result.exit_code, "classification": _cls},
+                        )
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            task.id,
+                            TaskState.BLOCKED,
+                            {"reason": _category, "failure_category": _category},
+                        )
+                        self._record_roadmap_event(
+                            roadmap, "task.blocked_by_result_guard", task.id,
+                            extra={"failure_category": _category, "classification": _cls},
+                        )
+                        return
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.VALIDATING)
             validation = ValidationEngine(
                 timeout_seconds=min(task.timeout_seconds, 1800)
@@ -957,6 +1203,48 @@ class Orchestrator:
 
             # Validation failure: deterministic repair first, then reviewer triage.
             if not result.ok or not validation.ok:
+                if (
+                    self.options.autonomous
+                    and task.executor in {"opencode", "minimax", "minimax-m3"}
+                    and not runtime.codex_takeover_active
+                    and not runtime.codex_takeover_used
+                ):
+                    runtime.codex_takeover_active = True
+                    runtime.codex_takeover_used = True
+                    runtime.codex_takeover_reason = "validation_repair"
+                    runtime.repair_prompt = compiler.repair_prompt_from_validation(task, validation)
+                    repair_path = artifact_store.write_text(
+                        attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                    )
+                    self.state.record_artifact(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "repair_prompt",
+                        repair_path,
+                        artifact_store.sha256(repair_path),
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.REPAIR_PROMPT_READY,
+                        {
+                            "reason": "validation_codex_takeover",
+                            "after_attempt": attempt_no,
+                            "next_executor": "codex",
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.codex_takeover_queued",
+                        task.id,
+                        extra={
+                            "after_attempt": attempt_no,
+                            "next_attempt": attempt_no + 1,
+                            "reason": "validation_repair",
+                        },
+                    )
+                    continue
                 if attempt_no < max_attempts:
                     runtime.repair_prompt = compiler.repair_prompt_from_validation(task, validation)
                     repair_path = artifact_store.write_text(
@@ -977,6 +1265,50 @@ class Orchestrator:
                     continue
                 self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.VALIDATION_FAILED)
                 self._record_roadmap_event(roadmap, "task.validation_failed", task.id)
+                return
+
+            if (
+                self.options.autonomous
+                and runtime.codex_takeover_active
+                and effective_task.executor == "codex"
+            ):
+                verdict = ReviewVerdict(
+                    verdict="ACCEPT",
+                    confidence="medium",
+                    summary=(
+                        "Codex repair/takeover completed and required validations passed; "
+                        "autonomous mode accepts Codex repair without a second review loop."
+                    ),
+                    safe_to_push=True,
+                    safe_to_merge=True,
+                    raw={
+                        "decision": "ACCEPT",
+                        "source": "codex_repair_self_accept",
+                        "reason": runtime.codex_takeover_reason,
+                    },
+                )
+                runtime.review_verdict = verdict
+                self.state.event(
+                    roadmap.roadmap_id,
+                    task.id,
+                    attempt_id,
+                    "task.codex_repair_self_accepted",
+                    {
+                        "attempt": attempt_no,
+                        "reason": runtime.codex_takeover_reason,
+                    },
+                )
+                accepted_outcome = self._finalize(
+                    roadmap=roadmap,
+                    task=task,
+                    target_worktree=target_worktree,
+                    branch=runtime.branch,
+                    artifact_store=artifact_store,
+                    attempt_dir=attempt_dir,
+                    attempt_id=attempt_id,
+                    verdict=verdict,
+                    runtime=runtime,
+                )
                 return
 
             # Decide on review.
@@ -1019,6 +1351,146 @@ class Orchestrator:
 
             if verdict.verdict == "REQUEST_CHANGES":
                 self._record_roadmap_event(roadmap, "task.request_changes", task.id)
+                repair_scope = _review_repair_scope(verdict)
+                if (
+                    self.options.autonomous
+                    and task.executor in {"opencode", "minimax", "minimax-m3"}
+                    and not runtime.codex_takeover_active
+                    and not runtime.codex_takeover_used
+                    and repair_scope == "large"
+                    and not runtime.helper_large_repair_used
+                    and attempt_no < max_attempts
+                ):
+                    runtime.helper_large_repair_used = True
+                    runtime.repair_prompt = compiler.repair_prompt_from_review(
+                        task, verdict, base=verdict.repair_prompt
+                    )
+                    repair_path = artifact_store.write_text(
+                        attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                    )
+                    self.state.record_artifact(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "repair_prompt",
+                        repair_path,
+                        artifact_store.sha256(repair_path),
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.REPAIR_PROMPT_READY,
+                        {
+                            "reason": "large_review_repair_helper",
+                            "after_attempt": attempt_no,
+                            "next_executor": task.executor,
+                            "repair_scope": repair_scope,
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.helper_repair_queued",
+                        task.id,
+                        extra={
+                            "after_attempt": attempt_no,
+                            "next_attempt": attempt_no + 1,
+                            "reason": "large_review_repair",
+                            "repair_scope": repair_scope,
+                        },
+                    )
+                    continue
+                if (
+                    self.options.autonomous
+                    and task.executor in {"opencode", "minimax", "minimax-m3"}
+                    and not runtime.codex_takeover_active
+                    and not runtime.codex_takeover_used
+                ):
+                    runtime.codex_takeover_active = True
+                    runtime.codex_takeover_used = True
+                    runtime.codex_takeover_reason = f"{repair_scope}_review_repair"
+                    runtime.repair_prompt = compiler.repair_prompt_from_review(
+                        task, verdict, base=verdict.repair_prompt
+                    )
+                    repair_path = artifact_store.write_text(
+                        attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                    )
+                    self.state.record_artifact(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "repair_prompt",
+                        repair_path,
+                        artifact_store.sha256(repair_path),
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.REPAIR_PROMPT_READY,
+                        {
+                            "reason": "review_repair_codex_takeover",
+                            "after_attempt": attempt_no,
+                            "next_executor": "codex",
+                            "repair_scope": repair_scope,
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.codex_takeover_queued",
+                        task.id,
+                        extra={
+                            "after_attempt": attempt_no,
+                            "next_attempt": attempt_no + 1,
+                            "reason": "review_repair",
+                            "repair_scope": repair_scope,
+                        },
+                    )
+                    continue
+                if (
+                    self.options.autonomous
+                    and repair_scope == "small"
+                    and runtime.codex_review_repairs < DEFAULT_CODEX_REVIEW_REPAIR_ATTEMPTS
+                ):
+                    runtime.codex_takeover_active = True
+                    runtime.codex_takeover_used = True
+                    runtime.codex_takeover_reason = "small_review_repair"
+                    runtime.codex_review_repairs += 1
+                    runtime.repair_prompt = compiler.repair_prompt_from_review(
+                        task, verdict, base=verdict.repair_prompt
+                    )
+                    repair_path = artifact_store.write_text(
+                        attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                    )
+                    self.state.record_artifact(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "repair_prompt",
+                        repair_path,
+                        artifact_store.sha256(repair_path),
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.REPAIR_PROMPT_READY,
+                        {
+                            "reason": "small_review_repair_codex",
+                            "after_attempt": attempt_no,
+                            "next_executor": "codex",
+                            "repair_scope": repair_scope,
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.codex_takeover_queued",
+                        task.id,
+                        extra={
+                            "after_attempt": attempt_no,
+                            "next_attempt": attempt_no + 1,
+                            "reason": "small_review_repair",
+                            "repair_scope": repair_scope,
+                        },
+                    )
+                    continue
                 if attempt_no < max_attempts:
                     # REQUEST_CHANGES is repairable. Build a bounded
                     # repair prompt for the next executor attempt. The
@@ -1052,6 +1524,7 @@ class Orchestrator:
                 ):
                     runtime.codex_takeover_active = True
                     runtime.codex_takeover_used = True
+                    runtime.codex_takeover_reason = "max_repair_attempts"
                     runtime.repair_prompt = compiler.repair_prompt_from_review(
                         task, verdict, base=verdict.repair_prompt
                     )
@@ -1570,14 +2043,22 @@ class Orchestrator:
                 commit_cwd = runtime.mirror
             target_sha = commit(commit_cwd, task.commit_message or f"agentops: {task.id}")
             if not target_sha:
-                # Nothing to merge.
-                self.state.transition_task(
-                    roadmap.roadmap_id,
-                    task.id,
-                    TaskState.ACCEPTED,
-                    {"branch": branch, "head_sha": None, "integration_branch": integration_branch, "no_changes": True},
+                ahead = run_git(
+                    roadmap.repo.path,
+                    ["rev-list", "--count", f"{integration_branch}..{branch}"],
+                    check=False,
                 )
-                return True
+                if ahead.returncode == 0 and int((ahead.stdout or "0").strip() or "0") > 0:
+                    target_sha = rev_parse(roadmap.repo.path, branch)
+                else:
+                    # Nothing to merge.
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.ACCEPTED,
+                        {"branch": branch, "head_sha": None, "integration_branch": integration_branch, "no_changes": True},
+                    )
+                    return True
 
         try:
             new_sha = merge_integration(
@@ -1682,6 +2163,8 @@ class Orchestrator:
             return self._injected_shell_runner
         if task.executor in {"opencode", "minimax", "minimax-m3"} and self._injected_opencode_runner is not None:
             return self._injected_opencode_runner
+        if task.executor == "codex" and self._injected_codex_runner is not None:
+            return self._injected_codex_runner
         return runner_for(task)
 
     def _effective_max_attempts(self, task: TaskConfig, roadmap: RoadmapConfig) -> int:

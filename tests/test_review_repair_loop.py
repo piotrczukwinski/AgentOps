@@ -24,10 +24,11 @@ These tests pin the new policy:
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from agentops.config import DEFAULT_MAX_REPAIR_ATTEMPTS, load_roadmap
 from agentops.git_ops import collect_diff
@@ -35,7 +36,6 @@ from agentops.models import (
     DiffSnapshot,
     PolicyResult,
     RepoConfig,
-    ReviewConfig,
     ReviewVerdict,
     RoadmapConfig,
     RunnerResult,
@@ -48,14 +48,12 @@ from agentops.policy import PolicyEngine
 from agentops.prompting import PromptCompiler
 from agentops.runners import BaseRunner, utc_now
 from agentops.state import StateStore
-
 from tests.test_gated_roadmap import (
     FakeCodexService,
     ScriptedVerdict,
     _init_repo,
     git,
 )
-
 
 # ---------------------------------------------------------------------------
 # Repair loop: REQUEST_CHANGES -> ACCEPT
@@ -130,6 +128,77 @@ class RequestChangesRepairLoopTests(unittest.TestCase):
             events = [e["type"] for e in state.latest_events(50) if e["task_id"] == "T1"]
             self.assertIn("task.request_changes", events)
             self.assertIn("task.accepted_by_review", events)
+
+    def test_autonomous_agent_review_repair_is_routed_to_codex_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "agent-repair-codex",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "opencode",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "require_executor_result": False,
+                                "review": {"codex": "required"},
+                                "max_attempts": 3,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            fake_review = FakeCodexService(
+                [
+                    ScriptedVerdict(
+                        verdict="REQUEST_CHANGES",
+                        summary="tighten the implementation",
+                        repair_prompt="Make the smallest possible correction.",
+                    ),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            opencode_runner = _FirstAttemptOnlyFakeRunner(file_to_create="out.txt")
+            codex_runner = _FirstAttemptOnlyFakeRunner(file_to_create="out.txt")
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    autonomous=True,
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_review,
+                opencode_runner=opencode_runner,
+                codex_runner=codex_runner,
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("agent-repair-codex")[0]
+            self.assertEqual(row["state"], TaskState.ACCEPTED.value)
+            self.assertEqual(row["current_attempt"], 2)
+            self.assertEqual([call["attempt_no"] for call in opencode_runner.calls], [1])
+            self.assertEqual([call["attempt_no"] for call in codex_runner.calls], [2])
+            self.assertTrue(codex_runner.calls[0]["is_repair_prompt"])
+            with state.connect() as conn:
+                rows = conn.execute(
+                    "SELECT executor FROM attempts WHERE roadmap_id='agent-repair-codex' AND task_id='T1' ORDER BY attempt_no"
+                ).fetchall()
+            self.assertEqual([row["executor"] for row in rows], ["opencode", "codex"])
+            events = [e["type"] for e in state.latest_events(50) if e["task_id"] == "T1"]
+            self.assertIn("task.codex_takeover_queued", events)
 
     def test_request_changes_twice_then_accept_succeeds_with_max_attempts_3(self) -> None:
         """Two REQUEST_CHANGES verdicts and one ACCEPT must end in
@@ -753,7 +822,6 @@ class IntegrationBranchContinuationTests(unittest.TestCase):
             current = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
             if current != "integration/agentops-test":
                 # Try to find a non-integration branch to return to.
-                base_ref = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
                 # The seed branch in this test is whatever ``git init``
                 # created. Try the obvious defaults.
                 for candidate in ("master", "main"):
@@ -1648,10 +1716,115 @@ class CumulativeRepairDiffTests(unittest.TestCase):
             self.assertIn("out.txt", final_prompt)
             self.assertIn("Attempt: 3", final_prompt)
 
-    def test_scenario_e_policy_still_blocks_out_of_scope_cumulative_files(self) -> None:
-        """Scenario E: the policy must still block on a forbidden /
-        out-of-scope file even when the file only appeared in a later
-        attempt. The cumulative diff still drives the decision.
+    def test_small_helper_request_changes_is_repaired_by_codex_without_second_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = self._build_roadmap(root, repo, max_attempts=3)
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            task = roadmap.tasks[0]
+            roadmap = replace(
+                roadmap,
+                tasks=(replace(task, executor="opencode", require_executor_result=False),),
+            )
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(
+                        verdict="REQUEST_CHANGES",
+                        summary="small repair",
+                        repair_prompt="REQUEST_CHANGES: keep the existing file valid",
+                    )
+                ]
+            )
+            helper_runner = _FirstAttemptOnlyFakeRunner("out.txt")
+            codex_runner = _FirstAttemptOnlyFakeRunner("out.txt", contents="codex repair\n")
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    autonomous=True,
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                opencode_runner=helper_runner,
+                codex_runner=codex_runner,
+            )
+
+            orch.run_roadmap(roadmap)
+
+            row = state.task_rows("cum-repair")[0]
+            self.assertEqual(row["state"], TaskState.ACCEPTED.value)
+            self.assertEqual(len(fake_codex.calls), 1)
+            self.assertEqual([call["attempt_no"] for call in helper_runner.calls], [1])
+            self.assertEqual([call["attempt_no"] for call in codex_runner.calls], [2])
+            with state.connect() as conn:
+                events = conn.execute(
+                    "SELECT type FROM events WHERE roadmap_id=? AND task_id=? ORDER BY seq",
+                    ("cum-repair", "T1"),
+                ).fetchall()
+            self.assertIn("task.codex_repair_self_accepted", {event["type"] for event in events})
+
+    def test_large_helper_request_changes_gets_one_helper_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = self._build_roadmap(root, repo, max_attempts=3)
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            task = roadmap.tasks[0]
+            roadmap = replace(
+                roadmap,
+                tasks=(replace(task, executor="opencode", require_executor_result=False),),
+            )
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(
+                        verdict="REQUEST_CHANGES",
+                        summary="large repair",
+                        repair_prompt="REQUEST_CHANGES: broad helper repair",
+                        blocking_issues=(
+                            {"file": "out.txt", "issue": "first", "severity": "medium"},
+                            {"file": "out.txt", "issue": "second", "severity": "medium"},
+                        ),
+                    ),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            helper_runner = _FirstAttemptOnlyFakeRunner("out.txt")
+            codex_runner = _FirstAttemptOnlyFakeRunner("out.txt", contents="codex repair\n")
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    autonomous=True,
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                opencode_runner=helper_runner,
+                codex_runner=codex_runner,
+            )
+
+            orch.run_roadmap(roadmap)
+
+            row = state.task_rows("cum-repair")[0]
+            self.assertEqual(row["state"], TaskState.ACCEPTED.value)
+            self.assertEqual(len(fake_codex.calls), 2)
+            self.assertEqual([call["attempt_no"] for call in helper_runner.calls], [1, 2])
+            self.assertEqual(codex_runner.calls, [])
+            with state.connect() as conn:
+                events = conn.execute(
+                    "SELECT type FROM events WHERE roadmap_id=? AND task_id=? ORDER BY seq",
+                    ("cum-repair", "T1"),
+                ).fetchall()
+            self.assertIn("task.helper_repair_queued", {event["type"] for event in events})
+
+    def test_scenario_e_policy_still_blocks_forbidden_cumulative_files(self) -> None:
+        """Scenario E: the policy must still block on a forbidden file
+        even when the file only appeared in a later attempt. The
+        cumulative diff still drives the decision.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1685,9 +1858,9 @@ class CumulativeRepairDiffTests(unittest.TestCase):
             state = StateStore(root / "state.sqlite")
             roadmap = load_roadmap(roadmap_path)
             # Force attempt 2 via REQUEST_CHANGES, then have the
-            # forbidden-file runner add an out-of-scope file. The
+            # forbidden-file runner add a globally forbidden file. The
             # cumulative diff on attempt 2 includes both out.txt and
-            # intruder.md, so the policy must block on the intruder.
+            # .env, so the policy must block on the forbidden path.
             fake_codex = FakeCodexService(
                 [
                     ScriptedVerdict(verdict="REQUEST_CHANGES", summary="r1", repair_prompt="f1"),
@@ -1695,7 +1868,7 @@ class CumulativeRepairDiffTests(unittest.TestCase):
                 ]
             )
             fake_runner = _ForbiddenFileFakeRunner(
-                allowed_file="out.txt", forbidden_file="intruder.md"
+                allowed_file="out.txt", forbidden_file=".env"
             )
             orch = Orchestrator(
                 state,
@@ -1725,9 +1898,9 @@ class CumulativeRepairDiffTests(unittest.TestCase):
             issues = payload.get("issues") or []
             names = {issue.get("name") for issue in issues}
             self.assertIn(
-                "files.not_allowed",
+                "files.forbidden",
                 names,
-                "cumulative out-of-scope file must be blocked by policy",
+                "cumulative forbidden file must be blocked by policy",
             )
             # Codex was consulted at least once (REQUEST_CHANGES on
             # attempt 1) but the second review was never reached

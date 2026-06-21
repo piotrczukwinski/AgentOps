@@ -8,6 +8,7 @@
     "summary",
     "blocking_issues",
     "repair_prompt",
+    "repair_scope",
     "safe_to_push",
     "safe_to_merge"
   ],
@@ -39,6 +40,10 @@
       }
     },
     "repair_prompt": {"type": "string"},
+    "repair_scope": {
+      "type": "string",
+      "enum": ["small", "large", "architectural"]
+    },
     "safe_to_push": {"type": "boolean"},
     "safe_to_merge": {"type": "boolean"}
   }

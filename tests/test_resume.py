@@ -9,7 +9,6 @@ run cannot race with a fresh run on the same repo.
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +19,7 @@ from agentops.orchestrator import Orchestrator, RunOptions
 from agentops.state import StateStore
 
 # Reuse the shared fixtures from the gated-roadmap test module. These
-# helpers (git, _init_repo, FakeCodexService, ScriptedVerdict,
+# helpers (_init_repo, FakeCodexService, ScriptedVerdict,
 # _write_roadmap_json) are the de-facto shared test library; see the
 # reliability audit (section 7) for the note on extracting them into a
 # real conftest.py (phase D14).
@@ -93,6 +92,125 @@ def _write_two_task_roadmap(root: Path, repo: Path) -> Path:
 
 
 class ResumeRoadmapTests(unittest.TestCase):
+    def test_run_merges_task_branch_commits_even_when_worktree_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("create and commit output", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "clean-branch-commit-test",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "integration_branch": "integration/agentops",
+                        "merge_policy": {"auto_merge": True, "strategy": "cherry_pick"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": (
+                                    "python3 -c \"from pathlib import Path; Path('out.txt').write_text('done\\n', encoding='utf-8')\" "
+                                    "&& git add out.txt && git commit -m precommitted-output"
+                                ),
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "require_executor_result": False,
+                                "validations": [
+                                    "python3 -c \"from pathlib import Path; assert Path('out.txt').read_text(encoding='utf-8') == 'done\\n'\"",
+                                ],
+                                "review": {"codex": "required"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake = FakeCodexService([ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True)])
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+            )
+            orch.run_roadmap(roadmap)
+
+            row = state.task_rows("clean-branch-commit-test")[0]
+            self.assertEqual(row["state"], TaskState.MERGED.value)
+            git(repo, "checkout", "integration/agentops")
+            self.assertEqual((repo / "out.txt").read_text(encoding="utf-8"), "done\n")
+
+    def test_fresh_run_skips_already_finished_tasks_on_repeat_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = _write_two_task_roadmap(root, repo)
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+
+            first_review = FakeCodexService(
+                [
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            first = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=first_review,
+            )
+            self.assertEqual(first.run_roadmap(roadmap), 2)
+
+            rows = {r["id"]: r for r in state.task_rows("resume-test")}
+            self.assertEqual(rows["T1"]["state"], TaskState.MERGED.value)
+            self.assertEqual(rows["T2"]["state"], TaskState.MERGED.value)
+            first_attempts = {
+                task_id: len(state.attempts_for_task(task_id, "resume-test"))
+                for task_id in ("T1", "T2")
+            }
+
+            second_review = FakeCodexService([])
+            second = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts2",
+                    workspaces_root=root / "workspaces2",
+                ),
+                review_service=second_review,
+            )
+            self.assertEqual(second.run_roadmap(roadmap), 2)
+
+            rows = {r["id"]: r for r in state.task_rows("resume-test")}
+            self.assertEqual(rows["T1"]["state"], TaskState.MERGED.value)
+            self.assertEqual(rows["T2"]["state"], TaskState.MERGED.value)
+            self.assertEqual(
+                {
+                    task_id: len(state.attempts_for_task(task_id, "resume-test"))
+                    for task_id in ("T1", "T2")
+                },
+                first_attempts,
+            )
+            with state.connect() as conn:
+                events = conn.execute(
+                    "SELECT task_id FROM events WHERE type = 'task.already_finished' AND roadmap_id = ?",
+                    ("resume-test",),
+                ).fetchall()
+            self.assertEqual({event["task_id"] for event in events}, {"T1", "T2"})
+
     def test_resume_skips_already_merged_task_and_runs_remaining(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -154,7 +272,7 @@ class ResumeRoadmapTests(unittest.TestCase):
                 RunOptions(force_reviewer="codex", artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
                 review_service=fake,
             )
-            count = orch.resume_roadmap(roadmap)
+            orch.resume_roadmap(roadmap)
 
             rows = {r["id"]: r["state"] for r in state.task_rows("resume-test")}
             self.assertEqual(rows["T1"], TaskState.MERGED.value)
@@ -170,6 +288,43 @@ class ResumeRoadmapTests(unittest.TestCase):
                 ).fetchall()
             recovered_tasks = {e["task_id"] for e in events}
             self.assertEqual(recovered_tasks, {"T1", "T2"})
+
+    def test_resume_reconsiders_dependency_skipped_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            roadmap_path = _write_two_task_roadmap(root, repo)
+            payload = json.loads(roadmap_path.read_text(encoding="utf-8"))
+            payload["tasks"][1]["depends_on"] = ["T1"]
+            roadmap_path.write_text(json.dumps(payload), encoding="utf-8")
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+
+            state.init()
+            state.import_roadmap(roadmap)
+            state.transition_task("resume-test", "T1", TaskState.ACCEPTED, {})
+            state.transition_task(
+                "resume-test",
+                "T2",
+                TaskState.SKIPPED,
+                {"reason": "dependencies_not_satisfied"},
+            )
+
+            fake = FakeCodexService([ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True)])
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+            )
+            orch.resume_roadmap(roadmap)
+
+            rows = {r["id"]: r["state"] for r in state.task_rows("resume-test")}
+            self.assertEqual(rows["T1"], TaskState.ACCEPTED.value)
+            self.assertEqual(rows["T2"], TaskState.MERGED.value)
 
     def test_resume_skips_blocked_and_awaiting_review(self) -> None:
         """Blocked / awaiting_review tasks are NOT re-run by resume.
@@ -197,7 +352,7 @@ class ResumeRoadmapTests(unittest.TestCase):
                 RunOptions(force_reviewer="codex", artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
                 review_service=fake,
             )
-            count = orch.resume_roadmap(roadmap)
+            orch.resume_roadmap(roadmap)
 
             rows = {r["id"]: r["state"] for r in state.task_rows("resume-test")}
             # T1 stays blocked; T2 was re-run and merged.

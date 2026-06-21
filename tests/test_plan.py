@@ -120,6 +120,53 @@ class PlanLintTests(unittest.TestCase):
         codes = {issue.code for issue in report.issues}
         self.assertIn("repo.base_ref", codes)
 
+    def test_existing_integration_branch_may_be_base_ref(self) -> None:
+        repo = _init_repo(self.root)
+        git(repo, "branch", "integration/agentops")
+        prompt = _write_prompt(self.root)
+        roadmap_path = self.root / "r.json"
+        roadmap_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "repo": {
+                        "id": "x",
+                        "path": str(repo),
+                        "base_branch": "integration/agentops",
+                    },
+                    "integration_branch": "integration/agentops",
+                    "tasks": [{"id": "T1", "kind": "guard", "prompt": str(prompt), "allowed_files": ["out.txt"]}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        report = lint_roadmap(roadmap_path)
+        codes = {issue.code for issue in report.issues}
+        self.assertNotIn("repo.integration_branch_missing", codes)
+
+    def test_missing_integration_branch_cannot_also_be_base_ref(self) -> None:
+        repo = _init_repo(self.root)
+        prompt = _write_prompt(self.root)
+        roadmap_path = self.root / "r.json"
+        roadmap_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "repo": {
+                        "id": "x",
+                        "path": str(repo),
+                        "base_branch": "integration/missing",
+                    },
+                    "integration_branch": "integration/missing",
+                    "tasks": [{"id": "T1", "kind": "guard", "prompt": str(prompt), "allowed_files": ["out.txt"]}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        report = lint_roadmap(roadmap_path)
+        codes = {issue.code for issue in report.issues}
+        self.assertIn("repo.integration_branch_missing", codes)
+
     def test_duplicate_task_ids(self) -> None:
         repo = _init_repo(self.root)
         prompt = _write_prompt(self.root)
