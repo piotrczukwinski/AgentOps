@@ -19,7 +19,7 @@ You must:
 You must not:
 - push, merge, force-push, rebase protected branches, or touch protected branches,
 - change dependencies, env files, secrets, DB/status/runtime data, migrations, evidence, exports, or production data unless explicitly allowed,
-- reduce data collection, source coverage, antidetect behavior, evidence retention, enrichment, NIP resolution, or HTTP evidence finalization.
+- reduce data collection, source coverage, browser automation hardening, network automation changes, evidence retention, enrichment, NIP resolution, or HTTP evidence finalization.
 
 # Final result marker (REQUIRED, read carefully)
 
@@ -419,7 +419,7 @@ class PromptCompiler:
                 "# AgentOps bounded repair task (REQUEST_CHANGES)",
                 "The reviewer requested changes. Address every blocking issue below.",
                 "Stay strictly within the Allowed files. Do not broaden scope.",
-                "Do not modify BusinessAgent unless the blocking issue is explicitly about it.",
+                "Do not modify the target repository unless the blocking issue is explicitly about it.",
                 "",
                 "# Original task id",
                 task.id,

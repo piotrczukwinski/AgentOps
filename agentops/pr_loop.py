@@ -310,8 +310,8 @@ The prompt also forbids:
 * rebasing the PR branch onto another branch,
 * weakening or removing existing tests or gates,
 * merging the PR (the merge is operator-controlled),
-* modifying BusinessAgent unless the blocking issue is explicitly
-  about BusinessAgent.
+* modifying the target repository unless the blocking issue is explicitly
+  about that same repository.
 
 ## Scope discipline
 

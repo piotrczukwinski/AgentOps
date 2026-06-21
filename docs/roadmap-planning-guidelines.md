@@ -249,7 +249,7 @@ For high-risk behavior, require fail-closed semantics:
 Preflight:
 
 ```bash
-cd /home/czuki/AgentOps
+cd /path/to/repo
 source .venv/bin/activate
 git checkout main
 git pull --ff-only

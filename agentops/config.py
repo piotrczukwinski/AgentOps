@@ -7,7 +7,6 @@ from typing import Any
 
 from .models import MergePolicy, RepoConfig, ReviewConfig, RoadmapConfig, TaskConfig
 
-
 # Canonical default for the per-task total executor attempts (initial +
 # repair attempts driven by ``REQUEST_CHANGES`` / validation failures).
 # The roadmap-level ``max_repair_attempts`` / ``max_review_repairs`` /
@@ -388,10 +387,9 @@ def _resolve_review_codex(
         "codex": review_data.get("codex"),
         "mode": review_data.get("mode"),
     }
-    if "codex" not in review_data and "mode" not in review_data:
+    if "codex" not in review_data and "mode" not in review_data and "review_policy" in task_data:
         # Fall back to the legacy ``review_policy`` task-level field.
-        if "review_policy" in task_data:
-            source["default_mode"] = task_data["review_policy"]
+        source["default_mode"] = task_data["review_policy"]
     raw = _resolve_codex_value(source, defaults)
     codex = str(raw).lower()
     if codex not in {"auto", "required", "never", "milestone_only"}:

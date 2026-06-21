@@ -39,7 +39,11 @@ output for each of the commands below.
 * [ ] `git grep -nE "AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}" -- ':!*.md'` returns nothing.
 * [ ] `git grep -nE "(api[_-]?key|secret|token|password)\s*[:=]\s*['\"][^'\"]+['\"]" -- ':!*.md' ':!schemas/*' ':!examples/*' ':!tests/*'` returns nothing.
 * [ ] `git grep -nE "/home/[a-z]+|/Users/[a-z]+|C:\\\\Users\\\\"` returns nothing.
-* [ ] `git grep -nEi "antidetect|businessagent|biuro|admin-web|admin-web|STAB-001"` returns nothing.
+* [ ] `git grep -nEi` against the **deny-list of private /
+      internal codenames** (the specific tokens are intentionally
+      not reproduced in this public file; the release PR must
+      run the sweep from the maintainer's private prep notes
+      and paste zero matches) returns nothing.
 * [ ] No real production hostnames, real personal email
       addresses, or real customer names appear in any tracked
       file. `git grep -nE "@[a-z0-9.-]+\\.(com|org|io|net|local)"` should not return anything except
@@ -131,8 +135,11 @@ branch, with a clean working tree. Attach the output to the
 release PR.
 
 ```bash
-# Sensitive-term sweep (should return nothing in the diff)
-git grep -nE "BusinessAgent|antidetect|/home/czuki|biuro|piotr@local.agentops|AgentOps Internal" -- ':!*.tar.gz' ':!.venv/**' ':!*.sqlite*' ':!.agentops/**'
+# Sensitive-term sweep (should return nothing in the diff).
+# The exact deny-list of private codenames lives in the
+# maintainer's private prep notes; it is intentionally not
+# reproduced in this public file. The release PR must show the
+# pasted output of the sweep and a clean result.
 git grep -nE "/home/[a-z]+|/Users/[a-z]+|C:\\\\Users\\\\" -- ':!.venv/**' ':!.agentops/**'
 
 # Diff hygiene

@@ -178,9 +178,8 @@ class SchemaContractTests(unittest.TestCase):
 
     def test_lowercase_approve_request_changes_comment_rejected(self) -> None:
         for verdict in ("approve", "request_changes", "comment"):
-            with self.subTest(verdict=verdict):
-                with self.assertRaises(pr_loop.VerdictParseError):
-                    pr_loop.parse_review_payload(_valid_payload(verdict=verdict))
+            with self.subTest(verdict=verdict), self.assertRaises(pr_loop.VerdictParseError):
+                pr_loop.parse_review_payload(_valid_payload(verdict=verdict))
 
     def test_recommended_merge_rejected_as_unknown_field(self) -> None:
         payload = _valid_payload()
@@ -450,7 +449,7 @@ class RepairPromptPostconditionTests(unittest.TestCase):
         "Modify only the files that are necessary",
         "Validation commands (run all of them",
         "Use `status=\"blocked\"`",
-        "BusinessAgent",
+        "target repository",
     ]
 
     def test_repair_prompt_contains_all_postconditions(self) -> None:

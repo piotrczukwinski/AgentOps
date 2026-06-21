@@ -18,10 +18,10 @@ from agentops.operator_run import (
     NEEDS_OPERATOR_STATUS,
     RETRY_WAITING_STATUS,
     RUNNING_STATUS,
-    reconcile_status_file,
-    write_status,
     RunSpec,
     generate_run_id,
+    reconcile_status_file,
+    write_status,
 )
 
 

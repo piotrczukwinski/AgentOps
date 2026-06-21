@@ -71,9 +71,10 @@ class RepoLockTests(unittest.TestCase):
             self.assertTrue(is_run_locked(self.repo))
             # Child holds the flock; a second acquire from THIS process
             # must fail with a clear error.
-            with self.assertRaises(RunAlreadyLockedError) as cm:
-                with acquire_run_lock(self.repo, roadmap_id="R2"):
-                    pass
+            with self.assertRaises(RunAlreadyLockedError) as cm, acquire_run_lock(
+                self.repo, roadmap_id="R2"
+            ):
+                pass
             self.assertEqual(cm.exception.holder_run_id, "R1")
             self.assertEqual(cm.exception.holder_pid, child.pid)
         finally:

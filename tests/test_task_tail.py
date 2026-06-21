@@ -18,6 +18,7 @@ offline.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -307,7 +308,7 @@ class TaskTailCliDispatchTests(unittest.TestCase):
     def test_cli_help_lists_task_tail(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "agentops", "task-tail", "--help"],
-            cwd="/home/czuki/AgentOps",
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             capture_output=True,
             text=True,
             check=False,

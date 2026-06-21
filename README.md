@@ -163,7 +163,7 @@ runner is available for local tests and deterministic harnesses.
 The executor process is launched with:
 
 * GitHub write-token environment variables stripped;
-* `GIT_TERMAL_PROMPT=0` and `GIT_ASKPASS=/bin/false`;
+* `GIT_TERMINAL_PROMPT=0` and `GIT_ASKPASS=/bin/false`;
 * `XDG_DATA_HOME` removed;
 * `shell=False` and the prompt passed as a literal argv element
   (never interpolated, never read from a path the executor

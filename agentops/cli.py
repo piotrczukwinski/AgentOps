@@ -159,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
             "``raw opencode | tee`` emergency fallbacks."
         ),
     )
-    task_tail_cmd.add_argument("task_id", help="Task id to tail (e.g. STAB-001-OPERATOR-ACCEPTANCE-MATRIX).")
+    task_tail_cmd.add_argument("task_id", help="Task id to tail (e.g. EX-001-OPERATOR-ACCEPTANCE-MATRIX).")
     task_tail_cmd.add_argument(
         "--roadmap",
         default=None,

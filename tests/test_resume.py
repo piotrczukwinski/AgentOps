@@ -9,7 +9,6 @@ run cannot race with a fresh run on the same repo.
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,7 +27,6 @@ from tests.test_gated_roadmap import (
     FakeCodexService,
     ScriptedVerdict,
     _init_repo,
-    git,
 )
 
 
@@ -154,7 +152,7 @@ class ResumeRoadmapTests(unittest.TestCase):
                 RunOptions(force_reviewer="codex", artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
                 review_service=fake,
             )
-            count = orch.resume_roadmap(roadmap)
+            orch.resume_roadmap(roadmap)
 
             rows = {r["id"]: r["state"] for r in state.task_rows("resume-test")}
             self.assertEqual(rows["T1"], TaskState.MERGED.value)
@@ -197,7 +195,7 @@ class ResumeRoadmapTests(unittest.TestCase):
                 RunOptions(force_reviewer="codex", artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
                 review_service=fake,
             )
-            count = orch.resume_roadmap(roadmap)
+            orch.resume_roadmap(roadmap)
 
             rows = {r["id"]: r["state"] for r in state.task_rows("resume-test")}
             # T1 stays blocked; T2 was re-run and merged.

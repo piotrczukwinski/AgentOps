@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "roadmap_id": "businessagent-pr08-evidence-001",
+  "roadmap_id": "oss-maintainer-pr08-evidence-001",
   "repo": {
-    "id": "BusinessAgent",
-    "path": "/home/czuki/BusinessAgent",
+    "id": "example-target-repo",
+    "path": "/path/to/example-target-repo",
     "base_branch": "audit/pr08-evidence-sweep-chapter-pack"
   },
   "defaults": {
@@ -37,7 +37,7 @@
         "python3 scripts/verify_pr08_evidence_retention.py --json",
         "python3 scripts/verify_pr08_no_data_reduction.py --json",
         "python3 scripts/verify_pr08_source_coverage.py --json",
-        "python3 scripts/verify_pr08_antidetect_non_regression.py --json",
+        "python3 scripts/verify_pr08_browser_automation_hardening_non_regression.py --json",
         "ruff check scripts/verify_pr08_evidence_retention.py tests/test_pr08_evidence_retention_guards.py",
         "git diff --check"
       ],
