@@ -34,13 +34,13 @@ Every row in the `model_calls` table is one of:
 
 Token values the ledger knows about:
 
-| Field | Source |
+| Field | Source / persistence |
 |---|---|
-| `input_tokens` | Codex JSONL `turn.completed.usage.input_tokens`, OpenAI-style `prompt_tokens`, Anthropic-style `input_tokens`, executor `AGENTOPS_USAGE_JSON.input_tokens`. |
-| `cached_tokens` | `cached_tokens`, Anthropic `cache_read_input_tokens` / `cached_input_tokens`, OpenAI `prompt_tokens_details.cached_tokens`, executor marker. |
-| `output_tokens` | `output_tokens`, `completion_tokens`, executor marker. |
-| `total_tokens` | `total_tokens` when the provider publishes it. The ledger never back-derives split tokens from total. |
-| `cost_estimate` | **Not invented by the ledger.** Reserved for future operator-supplied pricing; the dashboard shows it last and labels it as operator-supplied. |
+| `input_tokens` | Recognized at parse time from Codex JSONL `turn.completed.usage.input_tokens`, OpenAI-style `prompt_tokens`, Anthropic-style `input_tokens`, executor `AGENTOPS_USAGE_JSON.input_tokens`. **Persisted** in the `model_calls.input_tokens` column. |
+| `cached_tokens` | Recognized from `cached_tokens`, Anthropic `cache_read_input_tokens` / `cached_input_tokens`, OpenAI `prompt_tokens_details.cached_tokens`, executor marker. **Persisted** in `model_calls.cached_tokens`. |
+| `output_tokens` | Recognized from `output_tokens`, `completion_tokens`, executor marker. **Persisted** in `model_calls.output_tokens`. |
+| `total_tokens` | **Recognized but not persisted.** `normalize_usage` accepts a provider-supplied `total_tokens` as metadata (it is what the dashboard surfaces when the split is missing), but the v0.1 `model_calls` table does not have a `total_tokens` column and `record_model_call` does not accept it. The rollup helper therefore computes `total_tokens` per snapshot from any rows that came through a path that preserved the value (today: none, since the orchestrator never persists it). Persisting `total_tokens` is a follow-up if / when a real workload needs it; this PR deliberately avoids a schema migration. |
+| `cost_estimate` | **Not invented by the ledger.** Reserved for future operator-supplied pricing; the dashboard shows it last and labels it as operator-supplied. **Persisted** in `model_calls.cost_estimate`. |
 
 ## What the ledger deliberately does not do
 
@@ -129,7 +129,18 @@ The `model_calls` table is the existing schema from
 enable the ledger; the three new methods on `StateStore`
 (`record_model_call`, `model_call_rows`, `model_call_summary`) and
 the helper module `agentops/usage.py` work against the existing
-columns.
+columns. Concretely, the v0.1 ledger persists only:
+
+* `input_tokens`, `cached_tokens`, `output_tokens` (the canonical
+  split), and
+* `cost_estimate` (operator-supplied; never derived from tokens).
+
+`total_tokens` is recognized at parse time by
+`agentops.usage.normalize_usage` so a future API that publishes
+*only* a total can still surface something; the v0.1 schema does not
+persist it. Persisting `total_tokens` is a deliberate follow-up,
+not a bug in this PR, and adding the column is held back so the
+public release series stays migration-free.
 
 ## Where the markers come from
 

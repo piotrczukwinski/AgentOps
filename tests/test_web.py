@@ -2219,6 +2219,43 @@ class UsageLedgerTests(unittest.TestCase):
             self.assertEqual(len(data["latest_calls"]), 3)
             self.assertEqual(data["totals"]["known_calls"], 2)
 
+    def test_api_usage_filter_unknown_only_returns_null_totals(self) -> None:
+        """Filtered ``/api/usage`` must report ``null`` (not ``0``)
+        when the matching rows all have NULL token fields.
+
+        Regression guard for the bug where ``_filtered_usage_snapshot``
+        built its totals with ``int(summary.get(...) or 0)`` and
+        therefore reported ``input_tokens: 0`` for an all-unknown
+        match. The dashboard renders ``null`` as ``unknown``; a
+        literal ``0`` would imply a measured zero, which the ledger
+        never does.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            for index in range(2):
+                store.record_model_call(
+                    roadmap_id="r-unknown",
+                    task_id=f"T{index}",
+                    attempt_id=f"A{index}",
+                    provider="shell",
+                    model="shell",
+                    purpose="executor",
+                )
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(port, "/api/usage?roadmap=r-unknown")
+            finally:
+                self._stop(server, thread)
+            self.assertEqual(status, 200)
+            totals = data["totals"]
+            self.assertEqual(totals["known_calls"], 0)
+            self.assertEqual(totals["unknown_calls"], 2)
+            self.assertIsNone(totals["input_tokens"])
+            self.assertIsNone(totals["cached_tokens"])
+            self.assertIsNone(totals["output_tokens"])
+            self.assertIsNone(totals["total_tokens"])
+
     def test_api_usage_endpoint_empty_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "state.sqlite")

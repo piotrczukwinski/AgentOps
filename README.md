@@ -492,29 +492,12 @@ tests/
 
 ## Contributing
 
-AgentOps welcomes small, well-scoped PRs. The reading order for
-a first-time contributor is in
-[`CONTRIBUTING.md`](CONTRIBUTING.md) "Where to start", and the
-module-by-module map of the codebase is in
-[`docs/architecture-map.md`](docs/architecture-map.md). For a
-list of areas that need help this week, see
-[`docs/contributor-roadmap.md`](docs/contributor-roadmap.md).
-
-* [`CONTRIBUTING.md`](CONTRIBUTING.md) — local setup, tests,
-  lint, smoke test, PR conventions, small-PR policy.
-* [`AGENTS.md`](AGENTS.md) — agent-facing contributor guide and
-  the safety hard rules.
-* [`docs/architecture-map.md`](docs/architecture-map.md) —
-  module-by-module map of `agentops/`, with the tests and docs
-  that pin each module's behaviour.
-* [`docs/contributor-roadmap.md`](docs/contributor-roadmap.md) —
-  where the project is, where it is going, and the
-  "good first issue" sized slices.
-* [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — community
-  standards.
-* [`SECURITY.md`](SECURITY.md) — how to report a vulnerability
-  **privately**. Security issues do not go through the public
-  issue tracker.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the local setup,
+test, lint, and PR conventions. See
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for the community
+standards. See [`SECURITY.md`](SECURITY.md) for how to report
+a vulnerability. See [`AGENTS.md`](AGENTS.md) for the
+agent-facing contributor guide and the safety hard rules.
 
 ## License
 

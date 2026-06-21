@@ -2021,7 +2021,11 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
 
         When a filter is set we go through the per-row query so the
         latest_calls table only contains the matching rows; the totals
-        and rollups are computed from that same filtered set.
+        and rollups are computed from that same filtered set. Token
+        totals are routed through :func:`_totals_from_summary` so a
+        filter that matches only unknown calls reports
+        ``input_tokens: null`` instead of the misleading ``0`` a raw
+        ``COALESCE(SUM(NULL), 0)`` would produce.
         """
         generated_at = _utc_now_iso()
         state = self._server_state().state
@@ -2052,14 +2056,7 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         return {
             "generated_at": generated_at,
             "filter": {"roadmap_id": roadmap_filter, "task_id": task_filter},
-            "totals": {
-                "known_calls": int(summary.get("known_calls") or 0),
-                "unknown_calls": int(summary.get("unknown_calls") or 0),
-                "input_tokens": int(summary.get("input_tokens") or 0),
-                "cached_tokens": int(summary.get("cached_tokens") or 0),
-                "output_tokens": int(summary.get("output_tokens") or 0),
-                "total_tokens": rollup.get("total_tokens"),
-            },
+            "totals": _totals_from_summary(summary, rollup),
             "by_purpose": list(rollup.get("by_purpose") or []),
             "by_model": list(rollup.get("by_model") or []),
             "latest_calls": rows,
