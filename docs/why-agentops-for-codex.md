@@ -32,3 +32,14 @@ The 75-90% figure is not a benchmark and not a guaranteed token
 reduction. It is useful because it names the design target:
 minimize strong-model supervision work while preserving strong
 review where it matters.
+
+AgentOps is not a universal cost reducer. It is most useful when
+there is enough implementation work for a cheaper executor model
+to absorb and enough review / validation state for Codex to benefit
+from a compact packet. For tiny tasks, direct Codex may be the
+better tool: a single small edit does not need a durable state
+machine and a bounded review packet in front of it. The economic
+case for AgentOps is workload-dependent and is most plausible for
+multi-step roadmaps with non-trivial implementation, retry, and
+validation work. The break-even shape is sketched in
+[`cost-model.md`](cost-model.md).

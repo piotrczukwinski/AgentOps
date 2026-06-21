@@ -143,7 +143,65 @@ For this workflow, the strong model was moved from "watch the
 executor while it works" to "review the bounded packet when there
 is something worth reviewing."
 
-## 8. Evidence table
+## 8. Where the economics come from
+
+The 75-90% figure is the result of **two distinct mechanisms** that
+act together, not just one:
+
+* **Reduced Codex live supervision.** As described above, the
+  repeated watcher turns, log-tailing, and context rehydration
+  disappear because AgentOps owns them locally.
+* **Token substitution: implementation moves to a cheaper executor
+  model.** The implementation tokens (writing code, editing files,
+  re-reading the workspace, generating repair attempts) are spent
+  on a cheap executor model, not on Codex. The strong model only
+  sees the bounded review packet.
+
+These are two different sources of saving. Either one alone would
+be smaller; together they are what the reviewer estimated.
+
+A few important distinctions:
+
+* **The estimate is about expensive strong-model work, not
+  necessarily total all-model tokens.** AgentOps may increase the
+  number of cheap executor tokens (more attempts, more repair
+  passes) while decreasing the number of Codex tokens. That is the
+  intended trade.
+* **Cheap executor tokens may increase while Codex tokens
+  decrease.** A naive "total token count" comparison would not see
+  the benefit. The relevant claim is that expensive strong-model
+  usage is bounded and reserved for higher-value review points.
+* **AgentOps has fixed overhead.** Review-packet assembly, policy
+  checks, validation capture, state persistence, and the
+  orchestrator's per-task work all cost local compute and operator
+  attention, even when they are cheap.
+
+AgentOps therefore has a **break-even profile**:
+
+* For **tiny tasks** (a single small edit, a one-file fix), the
+  review packet and orchestration overhead can outweigh the
+  saving. Direct Codex may be cheaper or simpler, and the
+  per-task saving may be small or even negative.
+* For **larger tasks and multi-step roadmaps**, the implementation
+  surface grows, retry/log/validation volume grows, and the
+  cheaper executor absorbs most of the implementation tokens.
+  The bounded Codex review packet stays roughly the same size per
+  task, so the relative saving grows with task size.
+
+The break-even point depends on:
+
+* task size and total implementation volume;
+* the executor / reviewer price ratio;
+* the size of the bounded review packet;
+* retry count and validation/log volume;
+* how often Codex would otherwise need to supervise the live run.
+
+The 75-90% estimate is most plausible for **long-running
+multi-step roadmaps** with non-trivial implementation, retry, and
+validation work. For tiny tasks, the same control plane can still
+help, but the benefit is not the headline number.
+
+## 9. Evidence table
 
 | Supervision activity | Live-watcher pattern | AgentOps pattern | Why this matters |
 |---|---|---|---|
@@ -156,7 +214,7 @@ is something worth reviewing."
 | repair prompt generation | Codex writes the next repair instruction live. | AgentOps generates bounded repair prompts from structured verdicts. | Repair loops become repeatable and capped. |
 | final review | Codex reviews a broad live transcript. | Codex reviews a compact packet with diff, policy, and validation evidence. | The strong model spends its context on judgement. |
 
-## 9. Outcome in the repository
+## 10. Outcome in the repository
 
 Public-safe AgentOps outcomes from the surrounding
 self-maintenance work include:
@@ -175,7 +233,7 @@ section only records public-safe outcomes and the public AgentOps
 self-maintenance evidence that demonstrates the same control-plane
 pattern.
 
-## 10. Limitations
+## 11. Limitations
 
 * This is not a benchmark.
 * There is no raw token accounting yet unless future runs add it.
@@ -185,7 +243,7 @@ pattern.
   published.
 * A future benchmark is needed before making any general claim.
 
-## 11. Future benchmark protocol
+## 12. Future benchmark protocol
 
 To turn this estimate into a benchmark:
 
@@ -203,7 +261,7 @@ To turn this estimate into a benchmark:
 The benchmark should report both wins and losses. If a workflow
 does not benefit from AgentOps, that result should be published too.
 
-## 12. Short quote block for application
+## 13. Short quote block for application
 
 > AgentOps has already been dogfooded on its own maintainer
 > workflows. In one Codex-reviewed roadmap, Codex estimated that

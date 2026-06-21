@@ -206,10 +206,13 @@ Concrete evidence already in the repository:
 * `AGENTS.md` — the agent-facing contributor guide that
   encodes the safety boundaries as hard rules.
 
-In one Codex-reviewed roadmap, Codex estimated a roughly
-75-90% reduction in strong-model supervision work compared with
-a live-watcher pattern; the repository documents this as a
-roadmap-specific estimate, not a global benchmark.
+In one Codex-reviewed roadmap, Codex estimated roughly 75-90%
+less expensive strong-model supervision work compared with a
+live-watcher pattern. The mechanism is twofold: execution tokens
+move to a cheaper executor model, and Codex is reserved for
+bounded review packets. This is documented as a roadmap-specific
+estimate, not a global benchmark or guaranteed total-token
+reduction.
 
 ## 10. Known limitations
 

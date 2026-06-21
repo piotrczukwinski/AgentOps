@@ -425,7 +425,11 @@ tests/
   cost model; no fabricated token numbers.
 * [`docs/evidence/codex-roadmap-reduction-estimate.md`](docs/evidence/codex-roadmap-reduction-estimate.md)
   — roadmap-specific Codex reviewer estimate for reduced
-  strong-model supervision work.
+  strong-model supervision work. The expected benefit is
+  workload-dependent: AgentOps is most useful when the
+  implementation / retry / log surface is large enough for cheap
+  execution plus bounded Codex review to beat direct strong-model
+  execution.
 * [`docs/evidence/self-maintenance-prs.md`](docs/evidence/self-maintenance-prs.md)
   — public-safe summary of AgentOps self-maintenance
   workflows.
