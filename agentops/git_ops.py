@@ -470,6 +470,20 @@ def merge_integration(
         _advance_branch(repo, integration_branch, new_sha, base_sha)
         return new_sha
 
-    # Default: cherry-pick. Use the tip commit of the task branch.
-    tip = rev_parse(repo, task_branch)
-    return cherry_pick_into(repo, integration_branch, tip)
+    # Default: cherry-pick every task-branch commit that is not already
+    # on the integration branch. A task branch can legitimately contain
+    # multiple commits when the executor self-commits and a reviewer
+    # self-fix adds a follow-up commit. Cherry-picking only the tip would
+    # apply the follow-up without its base implementation and can produce
+    # a false merge conflict.
+    commits = run_git(
+        repo,
+        ["rev-list", "--reverse", f"{integration_branch}..{task_branch}"],
+        check=True,
+    ).stdout.splitlines()
+    if not commits:
+        return None
+    new_sha: str | None = None
+    for sha in commits:
+        new_sha = cherry_pick_into(repo, integration_branch, sha)
+    return new_sha
