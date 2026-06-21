@@ -51,6 +51,7 @@ from . import bundles
 from .artifacts import safe_name
 from .plan import lint_roadmap
 from .state import StateStore
+from .usage import summarize_model_calls
 
 log = logging.getLogger("agentops.web")
 
@@ -1022,6 +1023,172 @@ def collect_artifacts(state: StateStore, task_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Model usage ledger (read-only, loopback-only)
+# ---------------------------------------------------------------------------
+
+
+USAGE_NOTES: tuple[str, ...] = (
+    "Unknown means the provider/CLI did not expose usage.",
+    "Missing token fields are not treated as zero.",
+    "No price estimate is invented here; cost_estimate is operator-supplied.",
+    "This is a local ledger, not telemetry.",
+)
+
+
+def _usage_row_to_dict(row: Any) -> dict[str, Any]:
+    """Convert one ``model_calls`` row to a JSON-safe dict.
+
+    The dashboard renders these rows in a table; we never include the
+    raw prompt body, the executor log path, or any other potentially
+    sensitive field. Only the tokens, identifiers, and timestamps are
+    forwarded.
+    """
+    try:
+        return {
+            "id": row["id"],
+            "roadmap_id": row["roadmap_id"],
+            "task_id": row["task_id"],
+            "attempt_id": row["attempt_id"],
+            "provider": row["provider"],
+            "model": row["model"],
+            "purpose": row["purpose"],
+            "input_tokens": row["input_tokens"],
+            "cached_tokens": row["cached_tokens"],
+            "output_tokens": row["output_tokens"],
+            "cost_estimate": row["cost_estimate"],
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+        }
+    except (KeyError, TypeError, IndexError):
+        try:
+            return dict(row)
+        except Exception:  # noqa: BLE001 - defensive projection
+            return {}
+
+
+def collect_usage_snapshot(state: StateStore, *, limit: int = 25) -> dict[str, Any]:
+    """Return the dashboard-ready model-usage snapshot.
+
+    The snapshot is the single source of truth for both ``/api/usage``
+    and the ``usage_summary`` block of ``/api/admin``. It is
+    read-only, loopback-only, and never invokes subprocesses. The
+    shape is stable and locked by ``tests/test_web.py``.
+
+    Top-level keys (all present even when the DB is empty):
+
+    * ``generated_at`` — ISO timestamp the snapshot was computed.
+    * ``totals`` — known / unknown call counts and token sums.
+    * ``by_purpose`` — per-purpose rollup (executor / review / self_fix).
+    * ``by_model`` — per-(provider, model, purpose) rollup.
+    * ``latest_calls`` — newest ``limit`` rows (default 25), projected
+      to a JSON-safe dict.
+    * ``notes`` — short human-readable explanations the dashboard
+      renders alongside the section.
+
+    ``totals.total_tokens`` is ``None`` when no row had a known
+    ``total_tokens`` value. The ``model_calls`` schema does not store
+    a ``total_tokens`` column directly; the rollup helper computes it
+    from the per-row normalized usage when present.
+    """
+    generated_at = _utc_now_iso()
+    try:
+        state.init()
+        rows = [_usage_row_to_dict(r) for r in state.model_call_rows(limit=limit)]
+        summary = state.model_call_summary()
+    except Exception as exc:  # noqa: BLE001 - never raise out of the snapshot
+        log.warning("collect_usage_snapshot: state lookup failed: %s", exc)
+        rows = []
+        summary = {
+            "call_count": 0,
+            "known_calls": 0,
+            "unknown_calls": 0,
+            "input_tokens": 0,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "latest_started_at": None,
+        }
+    rollup = summarize_model_calls(rows)
+    return {
+        "generated_at": generated_at,
+        "totals": _totals_from_summary(summary, rollup),
+        "by_purpose": list(rollup.get("by_purpose") or []),
+        "by_model": list(rollup.get("by_model") or []),
+        "latest_calls": rows,
+        "notes": list(USAGE_NOTES),
+    }
+
+
+def collect_usage_summary(state: StateStore) -> dict[str, Any]:
+    """Return the compact ``usage_summary`` block embedded in ``/api/admin``.
+
+    This is the same data as :func:`collect_usage_snapshot` but
+    trimmed to the totals + per-purpose rollup; the dashboard's Admin
+    panel uses it so the operator sees the usage headline without
+    paying for the latest_calls projection.
+    """
+    try:
+        state.init()
+        rows = [_usage_row_to_dict(r) for r in state.model_call_rows()]
+        summary = state.model_call_summary()
+    except Exception as exc:  # noqa: BLE001 - never raise out of the snapshot
+        log.warning("collect_usage_summary: state lookup failed: %s", exc)
+        return {
+            "generated_at": _utc_now_iso(),
+            "totals": {
+                "known_calls": 0,
+                "unknown_calls": 0,
+                "input_tokens": None,
+                "cached_tokens": None,
+                "output_tokens": None,
+                "total_tokens": None,
+            },
+            "by_purpose": [],
+            "by_model": [],
+            "latest_started_at": None,
+            "notes": list(USAGE_NOTES),
+        }
+    rollup = summarize_model_calls(rows)
+    return {
+        "generated_at": _utc_now_iso(),
+        "totals": _totals_from_summary(summary, rollup),
+        "by_purpose": list(rollup.get("by_purpose") or []),
+        "by_model": list(rollup.get("by_model") or []),
+        "latest_started_at": summary.get("latest_started_at"),
+        "notes": list(USAGE_NOTES),
+    }
+
+
+def _totals_from_summary(summary: dict[str, Any], rollup: dict[str, Any]) -> dict[str, Any]:
+    """Build the ``totals`` block shared by snapshot + admin summary.
+
+    When ``known_calls == 0`` the per-token totals are reported as
+    ``None`` so the dashboard renders them as ``unknown`` instead of
+    the misleading ``0`` a SQL ``COALESCE(SUM(NULL), 0)`` would
+    produce. Once at least one call exposes token data the totals
+    carry the actual sums.
+    """
+    known_calls = int(summary.get("known_calls") or 0)
+    unknown_calls = int(summary.get("unknown_calls") or 0)
+    if known_calls > 0:
+        return {
+            "known_calls": known_calls,
+            "unknown_calls": unknown_calls,
+            "input_tokens": int(summary.get("input_tokens") or 0),
+            "cached_tokens": int(summary.get("cached_tokens") or 0),
+            "output_tokens": int(summary.get("output_tokens") or 0),
+            "total_tokens": rollup.get("total_tokens"),
+        }
+    return {
+        "known_calls": known_calls,
+        "unknown_calls": unknown_calls,
+        "input_tokens": None,
+        "cached_tokens": None,
+        "output_tokens": None,
+        "total_tokens": None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Admin / Operator panel snapshot (read-only, loopback-only)
 # ---------------------------------------------------------------------------
 #
@@ -1478,6 +1645,7 @@ def collect_admin_snapshot(state: StateStore) -> dict[str, Any]:
         "pr_loop_cycles": pr_loop_cycles,
         "recommended_commands": list(ADMIN_RECOMMENDED_COMMANDS),
         "diagnostics": diagnostics,
+        "usage_summary": collect_usage_summary(state),
     }
 
 
@@ -1763,6 +1931,9 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/admin":
             self._send_json(collect_admin_snapshot(self._server_state().state))
             return
+        if path == "/api/usage":
+            self._handle_usage(query)
+            return
 
         self._send_json({"error": f"not found: {path}"}, status=404)
 
@@ -1805,6 +1976,92 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             limit = 100
         limit = max(1, min(limit, 1000))
         self._send_json(collect_run_history(self._server_state().state, limit=limit))
+
+    def _handle_usage(self, query: dict) -> None:
+        """Serve :func:`collect_usage_snapshot` for ``GET /api/usage``.
+
+        Query parameters (all optional):
+
+        * ``limit`` — newest-N clamp; ``1..200``, default ``25``.
+        * ``roadmap`` — filter by ``roadmap_id``.
+        * ``task`` — filter by ``task_id``.
+
+        The endpoint never reads files outside the DB and never invokes
+        subprocesses. Empty filters return the global snapshot so the
+        dashboard can call it without arguments.
+        """
+        limit_raw = (query.get("limit") or ["25"])[0]
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 25
+        limit = max(1, min(limit, 200))
+        roadmap_raw = (query.get("roadmap") or [None])[0]
+        task_raw = (query.get("task") or [None])[0]
+        roadmap_filter = roadmap_raw if isinstance(roadmap_raw, str) and roadmap_raw.strip() else None
+        task_filter = task_raw if isinstance(task_raw, str) and task_raw.strip() else None
+        if roadmap_filter or task_filter:
+            snapshot = self._filtered_usage_snapshot(
+                roadmap_filter=roadmap_filter,
+                task_filter=task_filter,
+                limit=limit,
+            )
+        else:
+            snapshot = collect_usage_snapshot(self._server_state().state, limit=limit)
+        self._send_json(snapshot)
+
+    def _filtered_usage_snapshot(
+        self,
+        *,
+        roadmap_filter: str | None,
+        task_filter: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Return a filtered usage snapshot without a global scan.
+
+        When a filter is set we go through the per-row query so the
+        latest_calls table only contains the matching rows; the totals
+        and rollups are computed from that same filtered set. Token
+        totals are routed through :func:`_totals_from_summary` so a
+        filter that matches only unknown calls reports
+        ``input_tokens: null`` instead of the misleading ``0`` a raw
+        ``COALESCE(SUM(NULL), 0)`` would produce.
+        """
+        generated_at = _utc_now_iso()
+        state = self._server_state().state
+        try:
+            state.init()
+            rows = [
+                _usage_row_to_dict(r)
+                for r in state.model_call_rows(
+                    roadmap_id=roadmap_filter, task_id=task_filter, limit=limit
+                )
+            ]
+            summary = state.model_call_summary(
+                roadmap_id=roadmap_filter, task_id=task_filter
+            )
+        except Exception as exc:  # noqa: BLE001 - never raise out of the endpoint
+            log.warning("collect_usage_snapshot (filtered): state lookup failed: %s", exc)
+            rows = []
+            summary = {
+                "call_count": 0,
+                "known_calls": 0,
+                "unknown_calls": 0,
+                "input_tokens": 0,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+                "latest_started_at": None,
+            }
+        rollup = summarize_model_calls(rows)
+        return {
+            "generated_at": generated_at,
+            "filter": {"roadmap_id": roadmap_filter, "task_id": task_filter},
+            "totals": _totals_from_summary(summary, rollup),
+            "by_purpose": list(rollup.get("by_purpose") or []),
+            "by_model": list(rollup.get("by_model") or []),
+            "latest_calls": rows,
+            "notes": list(USAGE_NOTES),
+        }
 
     def _handle_task_attempts(self, path: str) -> None:
         """Serve :func:`collect_task_attempts` for ``/api/tasks/<id>/attempts``."""
@@ -2527,6 +2784,44 @@ INDEX_TEMPLATE = """<!doctype html>
   </section>
 
   <section class="card">
+    <h2 style="margin-top:0;font-size:15px;">Model usage <span class="muted" id="usage-generated-at"></span></h2>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="pill" id="usage-empty-pill">loading&hellip;</span>
+      <span class="muted" id="usage-summary"></span>
+    </div>
+    <h3 style="font-size:13px;margin:8px 0 4px;">Token totals</h3>
+    <div class="row" id="usage-totals-cards" style="gap:12px;">
+      <span class="pill" id="usage-known-calls">known calls: -</span>
+      <span class="pill" id="usage-unknown-calls">unknown calls: -</span>
+      <span class="pill" id="usage-input-tokens">input: -</span>
+      <span class="pill" id="usage-cached-tokens">cached: -</span>
+      <span class="pill" id="usage-output-tokens">output: -</span>
+    </div>
+    <h3 style="font-size:13px;margin:8px 0 4px;">By purpose</h3>
+    <table>
+      <thead>
+        <tr><th>Purpose</th><th>Calls</th><th>Known</th><th>Unknown</th><th>Input</th><th>Cached</th><th>Output</th></tr>
+      </thead>
+      <tbody id="usage-purpose-rows"><tr><td colspan="7" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:8px 0 4px;">By model</h3>
+    <table>
+      <thead>
+        <tr><th>Provider</th><th>Model</th><th>Purpose</th><th>Calls</th><th>Known</th><th>Unknown</th><th>Input</th><th>Cached</th><th>Output</th></tr>
+      </thead>
+      <tbody id="usage-model-rows"><tr><td colspan="9" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:8px 0 4px;">Latest model calls</h3>
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Purpose</th><th>Provider</th><th>Model</th><th>Roadmap</th><th>Task</th><th>Input</th><th>Cached</th><th>Output</th><th>Status</th></tr>
+      </thead>
+      <tbody id="usage-latest-rows"><tr><td colspan="10" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <ul id="usage-notes" class="muted" style="margin:8px 0 0;padding-left:18px;font-size:12px;"></ul>
+  </section>
+
+  <section class="card">
     <h2 style="margin-top:0;font-size:15px;">Roadmap</h2>
     <div class="row">
       <label for="roadmap-select" class="muted">Select:</label>
@@ -2686,6 +2981,18 @@ INDEX_TEMPLATE = """<!doctype html>
   const adminPrLoopSummary = $("admin-pr-loop-summary");
   const adminPrLoopRows = $("admin-pr-loop-rows");
   const adminRecommendedCommands = $("admin-recommended-commands");
+  const usageGeneratedAt = $("usage-generated-at");
+  const usageEmptyPill = $("usage-empty-pill");
+  const usageSummary = $("usage-summary");
+  const usageKnownCalls = $("usage-known-calls");
+  const usageUnknownCalls = $("usage-unknown-calls");
+  const usageInputTokens = $("usage-input-tokens");
+  const usageCachedTokens = $("usage-cached-tokens");
+  const usageOutputTokens = $("usage-output-tokens");
+  const usagePurposeRows = $("usage-purpose-rows");
+  const usageModelRows = $("usage-model-rows");
+  const usageLatestRows = $("usage-latest-rows");
+  const usageNotes = $("usage-notes");
   const historySummary = $("history-summary");
   const logTask = $("log-task");
   const logAttempt = $("log-attempt");
@@ -3145,6 +3452,136 @@ async function tailOperatorRun() {
     }
   }
 
+  // ---- Model usage ledger (T9) ---------------------------------------
+  // The dashboard reads /api/usage and renders four tables: a totals
+  // pill row, a per-purpose rollup, a per-model rollup, and the latest
+  // N model_calls rows. Missing values render as "unknown" (not "0") so
+  // the dashboard never implies measured usage where the provider did
+  // not expose any.
+
+  function formatTokenCount(value) {
+    if (value == null) return "unknown";
+    return String(value);
+  }
+
+  function formatStartedAt(value) {
+    if (!value) return "-";
+    return value;
+  }
+
+  function usageStatus(row) {
+    const hasAny = row.input_tokens != null
+      || row.cached_tokens != null
+      || row.output_tokens != null;
+    if (hasAny) return "known";
+    return "unknown";
+  }
+
+  async function renderUsage() {
+    if (!usageEmptyPill) return;
+    const res = await fetchJson("/api/usage?limit=25");
+    if (!res.ok || !res.data) {
+      usageEmptyPill.className = "err";
+      usageEmptyPill.textContent = "usage snapshot unavailable";
+      if (usageSummary) {
+        usageSummary.className = "err";
+        usageSummary.textContent = res.data && res.data.error ? res.data.error : ("HTTP " + res.status);
+      }
+      return;
+    }
+    const data = res.data;
+    const totals = data.totals || {};
+    const empty = (totals.known_calls || 0) === 0 && (totals.unknown_calls || 0) === 0;
+    usageEmptyPill.className = "pill";
+    usageEmptyPill.innerHTML = empty
+      ? '<span class="status-dot"></span> no model calls recorded yet'
+      : '<span class="status-dot ok"></span> ok';
+    if (usageGeneratedAt) {
+      usageGeneratedAt.textContent = data.generated_at ? "snapshot: " + data.generated_at : "";
+    }
+    if (usageSummary) {
+      usageSummary.className = "muted";
+      usageSummary.textContent = "known=" + (totals.known_calls || 0)
+        + " unknown=" + (totals.unknown_calls || 0)
+        + " total_tokens=" + formatTokenCount(totals.total_tokens);
+    }
+    if (usageKnownCalls) usageKnownCalls.textContent = "known calls: " + (totals.known_calls || 0);
+    if (usageUnknownCalls) usageUnknownCalls.textContent = "unknown calls: " + (totals.unknown_calls || 0);
+    if (usageInputTokens) usageInputTokens.textContent = "input: " + formatTokenCount(totals.input_tokens);
+    if (usageCachedTokens) usageCachedTokens.textContent = "cached: " + formatTokenCount(totals.cached_tokens);
+    if (usageOutputTokens) usageOutputTokens.textContent = "output: " + formatTokenCount(totals.output_tokens);
+
+    const purposes = (data.by_purpose || []);
+    if (usagePurposeRows) {
+      if (!purposes.length) {
+        usagePurposeRows.innerHTML = '<tr><td colspan="7" class="muted">No model calls recorded yet. Run <code>agentops run</code> with at least one executor attempt or one review call.</td></tr>';
+      } else {
+        usagePurposeRows.innerHTML = purposes.map(function (p) {
+          return "<tr>"
+            + "<td>" + escapeHtml(p.purpose) + "</td>"
+            + "<td>" + escapeHtml(p.calls) + "</td>"
+            + "<td>" + escapeHtml(p.known_calls) + "</td>"
+            + "<td>" + escapeHtml(p.unknown_calls) + "</td>"
+            + "<td>" + formatTokenCount(p.input_tokens) + "</td>"
+            + "<td>" + formatTokenCount(p.cached_tokens) + "</td>"
+            + "<td>" + formatTokenCount(p.output_tokens) + "</td>"
+            + "</tr>";
+        }).join("");
+      }
+    }
+    const models = (data.by_model || []);
+    if (usageModelRows) {
+      if (!models.length) {
+        usageModelRows.innerHTML = '<tr><td colspan="9" class="muted">No model rows yet.</td></tr>';
+      } else {
+        usageModelRows.innerHTML = models.map(function (m) {
+          return "<tr>"
+            + "<td>" + escapeHtml(m.provider) + "</td>"
+            + "<td>" + escapeHtml(m.model) + "</td>"
+            + "<td>" + escapeHtml(m.purpose) + "</td>"
+            + "<td>" + escapeHtml(m.calls) + "</td>"
+            + "<td>" + escapeHtml(m.known_calls) + "</td>"
+            + "<td>" + escapeHtml(m.unknown_calls) + "</td>"
+            + "<td>" + formatTokenCount(m.input_tokens) + "</td>"
+            + "<td>" + formatTokenCount(m.cached_tokens) + "</td>"
+            + "<td>" + formatTokenCount(m.output_tokens) + "</td>"
+            + "</tr>";
+        }).join("");
+      }
+    }
+    const latest = data.latest_calls || [];
+    if (usageLatestRows) {
+      if (!latest.length) {
+        usageLatestRows.innerHTML = '<tr><td colspan="10" class="muted">No model call rows yet. Once AgentOps records an executor or review call this table fills in.</td></tr>';
+      } else {
+        usageLatestRows.innerHTML = latest.map(function (row) {
+          const status = usageStatus(row);
+          const pill = status === "known"
+            ? '<span class="pill">' + escapeHtml(status) + "</span>"
+            : '<span class="pill" style="background:#8884;">' + escapeHtml(status) + "</span>";
+          return "<tr>"
+            + "<td>" + escapeHtml(formatStartedAt(row.started_at)) + "</td>"
+            + "<td>" + escapeHtml(row.purpose) + "</td>"
+            + "<td>" + escapeHtml(row.provider) + "</td>"
+            + "<td>" + escapeHtml(row.model) + "</td>"
+            + "<td>" + escapeHtml(row.roadmap_id) + "</td>"
+            + "<td>" + escapeHtml(row.task_id) + "</td>"
+            + "<td>" + formatTokenCount(row.input_tokens) + "</td>"
+            + "<td>" + formatTokenCount(row.cached_tokens) + "</td>"
+            + "<td>" + formatTokenCount(row.output_tokens) + "</td>"
+            + "<td>" + pill + "</td>"
+            + "</tr>";
+        }).join("");
+      }
+    }
+    if (usageNotes) {
+      const notes = data.notes || [];
+      usageNotes.innerHTML = notes.map(function (n) {
+        return "<li>" + escapeHtml(n) + "</li>";
+      }).join("");
+    }
+  }
+
   async function loadHistory() {
     if (!historyRows) return;
     const res = await fetchJson("/api/run-history?limit=100");
@@ -3354,10 +3791,12 @@ async function tailOperatorRun() {
   loadHistory();
   loadRoadmaps();
   renderAdmin();
+  renderUsage();
   refresh();
   autoTimer = setInterval(function () {
     refresh();
     renderAdmin();
+    renderUsage();
   }, 3000);
 })();
 </script>

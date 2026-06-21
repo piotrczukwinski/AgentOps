@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -65,8 +66,11 @@ from .self_fix import (
     restore_working_files,
     snapshot_working_files,
 )
-from .state import StateStore
+from .state import StateStore, utc_now
+from .usage import extract_usage_marker, normalize_usage
 from .validation import ValidationEngine
+
+log = logging.getLogger("agentops.orchestrator")
 
 # Outcomes that count as "satisfied" for dependency checking.
 ACCEPTED_OUTCOMES = {
@@ -637,6 +641,16 @@ class Orchestrator:
             )
             self.state.finish_attempt(
                 roadmap.roadmap_id, task.id, attempt_id, result.exit_code, None, state="executor_finished"
+            )
+            executor_started_at = getattr(result, "started_at", None) or utc_now()
+            executor_ended_at = getattr(result, "ended_at", None) or utc_now()
+            self._record_executor_model_call(
+                roadmap=roadmap,
+                task=effective_task,
+                attempt_id=attempt_id,
+                started_at=executor_started_at,
+                ended_at=executor_ended_at,
+                result=result,
             )
             self.state.record_artifact(
                 roadmap.roadmap_id, task.id, attempt_id, "executor_stdout", result.stdout_path
@@ -1317,9 +1331,11 @@ class Orchestrator:
                     roadmap.roadmap_id, task.id, TaskState.CODEX_REVIEWING
                 )
                 self.state.event(roadmap.roadmap_id, task.id, attempt_id, "task.review_requested", {"reviewer": "heuristic"})
+                heuristic_started_at = utc_now()
                 verdict, result_path = heuristic.review(
                     None, target_worktree, attempt_dir, schema_path=None, timeout_seconds=task.timeout_seconds
                 )  # type: ignore[arg-type]
+                heuristic_ended_at = utc_now()
                 prompt_path = artifact_store.write_text(attempt_dir, "review.prompt.md", review_prompt)
                 self.state.record_artifact(
                     roadmap.roadmap_id,
@@ -1341,6 +1357,15 @@ class Orchestrator:
                     result_path,
                     verdict.verdict,
                     verdict.raw,
+                )
+                self._record_reviewer_model_call(
+                    roadmap=roadmap,
+                    task=task,
+                    attempt_id=attempt_id,
+                    started_at=heuristic_started_at,
+                    ended_at=heuristic_ended_at,
+                    reviewer="heuristic",
+                    raw_verdict=verdict.raw if isinstance(verdict.raw, dict) else None,
                 )
                 self.state.transition_task(
                     roadmap.roadmap_id,
@@ -1420,9 +1445,11 @@ class Orchestrator:
             if allow_heuristic_fallback:
                 self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.CODEX_REVIEWING)
                 self.state.event(roadmap.roadmap_id, task.id, attempt_id, "task.review_requested", {"reviewer": "heuristic"})
+                fallback_started_at = utc_now()
                 verdict, result_path = heuristic.review(
                     None, target_worktree, attempt_dir, schema_path=None, timeout_seconds=task.timeout_seconds
                 )  # type: ignore[arg-type]
+                fallback_ended_at = utc_now()
                 self.state.record_artifact(
                     roadmap.roadmap_id, task.id, attempt_id, "review_result", result_path
                 )
@@ -1435,6 +1462,15 @@ class Orchestrator:
                     result_path,
                     verdict.verdict,
                     verdict.raw,
+                )
+                self._record_reviewer_model_call(
+                    roadmap=roadmap,
+                    task=task,
+                    attempt_id=attempt_id,
+                    started_at=fallback_started_at,
+                    ended_at=fallback_ended_at,
+                    reviewer="heuristic",
+                    raw_verdict=verdict.raw if isinstance(verdict.raw, dict) else None,
                 )
                 self.state.transition_task(
                     roadmap.roadmap_id,
@@ -1481,6 +1517,7 @@ class Orchestrator:
         # model keeps the review gate productive. Config-level values
         # always win over the env fallback (see
         # ``agentops.config._resolve_codex_model`` / ``..._effort``).
+        codex_started_at = utc_now()
         verdict, result_path = codex_service.review(
             review_prompt_path,
             target_worktree,
@@ -1491,6 +1528,7 @@ class Orchestrator:
             model_reasoning_effort=task.review.model_reasoning_effort,
             idle_timeout=self.options.codex_idle_timeout,
         )
+        codex_ended_at = utc_now()
         self.state.record_artifact(
             roadmap.roadmap_id, task.id, attempt_id, "review_result", result_path
         )
@@ -1503,6 +1541,16 @@ class Orchestrator:
             result_path,
             verdict.verdict,
             verdict.raw,
+        )
+        self._record_reviewer_model_call(
+            roadmap=roadmap,
+            task=task,
+            attempt_id=attempt_id,
+            started_at=codex_started_at,
+            ended_at=codex_ended_at,
+            reviewer="codex",
+            raw_verdict=verdict.raw if isinstance(verdict.raw, dict) else None,
+            model_name=task.review.codex_model,
         )
         # For tasks that require Codex, a codex process failure or
         # unparseable verdict is NOT a real reviewer BLOCK. Reclassify
@@ -1611,6 +1659,7 @@ class Orchestrator:
             return SelfFixOutcome(accepted=False, reason=reason, skipped=skipped)
 
         try:
+            self_fix_started_at = utc_now()
             result = codex_service.self_fix(
                 sf_prompt_path,
                 target_worktree,
@@ -1620,6 +1669,7 @@ class Orchestrator:
                 model_reasoning_effort=task.review.model_reasoning_effort,
                 idle_timeout=self.options.codex_idle_timeout,
             )
+            self_fix_ended_at = utc_now()
         except Exception as exc:  # noqa: BLE001 - never let self-fix crash the run
             self.state.event(
                 roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_error", {"error": str(exc)}
@@ -1630,6 +1680,41 @@ class Orchestrator:
             self.state.record_artifact(
                 roadmap.roadmap_id, task.id, attempt_id, "self_fix_result", result.stdout_path,
                 artifact_store.sha256(result.stdout_path),
+            )
+
+        # Self-fix is a codex write-pass, distinct from the read-only
+        # review path. Record it as purpose="self_fix" so the dashboard
+        # can separate reviewer work from reviewer-driven repairs.
+        try:
+            stdout_for_usage = ""
+            try:
+                stdout_for_usage = result.stdout_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                stdout_for_usage = ""
+            usage_marker = extract_usage_marker(stdout_for_usage)
+            payload = None if usage_marker is None else usage_marker
+            normalized = normalize_usage(payload)
+            self.state.record_model_call(
+                roadmap_id=roadmap.roadmap_id,
+                task_id=task.id,
+                attempt_id=attempt_id,
+                provider="codex",
+                model=task.review.codex_model or "codex-default",
+                purpose="self_fix",
+                input_tokens=normalized["input_tokens"],
+                cached_tokens=normalized["cached_tokens"],
+                output_tokens=normalized["output_tokens"],
+                started_at=self_fix_started_at,
+                ended_at=self_fix_ended_at,
+            )
+        except Exception:  # noqa: BLE001 - ledger is best-effort
+            log.warning(
+                "model_calls: failed to record self_fix call for task=%s attempt=%s",
+                task.id,
+                attempt_id,
+                exc_info=True,
             )
 
         # 1. Skip marker: the reviewer decided the fix is too big / ambiguous.
@@ -1986,6 +2071,165 @@ class Orchestrator:
         ):
             return self._injected_opencode_runner
         return runner_for(task)
+
+    @staticmethod
+    def _provider_for_executor(executor: str) -> str:
+        """Map ``task.executor`` to the canonical ``model_calls.provider``.
+
+        ``shell`` is not a paid model call, but it still gets a row so
+        the dashboard can show attempt counts and "unknown usage" per
+        executor. The provider string is what the dashboard groups on.
+        """
+        if executor == "shell":
+            return "shell"
+        if executor == "codex":
+            return "codex"
+        # opencode / minimax / minimax-m3 / claude / claude-minimax all
+        # go through the opencode-style runner today; collapse them
+        # into a single ``opencode`` provider so the rollup reads
+        # naturally. Per-executor labels still live on ``task.executor``.
+        return "opencode"
+
+    @staticmethod
+    def _model_label_for_executor(task: TaskConfig) -> str:
+        """Pick the model id recorded for one executor attempt.
+
+        Shell tasks have no model; we store ``"shell"`` so the
+        dashboard's by-model rollup is unambiguous and does not have
+        to special-case missing models. Non-shell executors record
+        ``task.model`` (which may be empty for legacy roadmaps; the
+        OpenCode runner already handles empty model).
+        """
+        if task.executor == "shell":
+            return "shell"
+        return task.model or ""
+
+    def _record_executor_model_call(
+        self,
+        *,
+        roadmap: RoadmapConfig,
+        task: TaskConfig,
+        attempt_id: str,
+        started_at: str,
+        ended_at: str,
+        result: Any,
+    ) -> None:
+        """Write one ``model_calls`` row for an executor attempt.
+
+        Token values come from :func:`agentops.usage.extract_usage_marker`
+        applied to the executor's combined log (and stdout when the
+        combined log is missing). When the marker is absent or
+        unparseable, the token fields stay ``None`` and the row is
+        recorded as ``unknown``. The function never raises: the
+        ledger is a passive observer and must not break the run.
+        """
+        provider = self._provider_for_executor(task.executor)
+        model = self._model_label_for_executor(task)
+        input_tokens: int | None = None
+        cached_tokens: int | None = None
+        output_tokens: int | None = None
+        raw_payload: dict[str, Any] | None = None
+        try:
+            sources: list[Path] = []
+            combined = getattr(result, "combined_log_path", None)
+            stdout_path = getattr(result, "stdout_path", None)
+            if isinstance(combined, Path):
+                sources.append(combined)
+            if isinstance(stdout_path, Path):
+                sources.append(stdout_path)
+            for source in sources:
+                try:
+                    text = source.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                payload = extract_usage_marker(text)
+                if payload is not None:
+                    raw_payload = payload
+                    break
+        except Exception:  # noqa: BLE001 - ledger is best-effort
+            raw_payload = None
+        if raw_payload is not None:
+            normalized = normalize_usage(raw_payload)
+            input_tokens = normalized["input_tokens"]
+            cached_tokens = normalized["cached_tokens"]
+            output_tokens = normalized["output_tokens"]
+        try:
+            self.state.record_model_call(
+                roadmap_id=roadmap.roadmap_id,
+                task_id=task.id,
+                attempt_id=attempt_id,
+                provider=provider,
+                model=model,
+                purpose="executor",
+                input_tokens=input_tokens,
+                cached_tokens=cached_tokens,
+                output_tokens=output_tokens,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+        except Exception:  # noqa: BLE001 - ledger is best-effort
+            log.warning("model_calls: failed to record executor call for task=%s attempt=%s", task.id, attempt_id, exc_info=True)
+
+    def _record_reviewer_model_call(
+        self,
+        *,
+        roadmap: RoadmapConfig,
+        task: TaskConfig,
+        attempt_id: str,
+        started_at: str,
+        ended_at: str,
+        reviewer: str,
+        raw_verdict: dict[str, Any] | None,
+        model_name: str | None = None,
+        purpose: str = "review",
+    ) -> None:
+        """Write one ``model_calls`` row for a reviewer (codex or heuristic).
+
+        Heuristic is a deterministic local reviewer, not a paid model
+        call. We still record a row so the dashboard can show what
+        happened, but the provider / model labels make the distinction
+        explicit (``provider="heuristic"``, ``model="heuristic"``) and
+        the row stays in the ``unknown`` bucket because no tokens are
+        spent.
+        """
+        try:
+            if reviewer == "heuristic":
+                self.state.record_model_call(
+                    roadmap_id=roadmap.roadmap_id,
+                    task_id=task.id,
+                    attempt_id=attempt_id,
+                    provider="heuristic",
+                    model="heuristic",
+                    purpose=purpose,
+                    input_tokens=None,
+                    cached_tokens=None,
+                    output_tokens=None,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                )
+                return
+            payload = None
+            if isinstance(raw_verdict, dict):
+                usage_block = raw_verdict.get("usage")
+                if isinstance(usage_block, dict):
+                    payload = usage_block
+            normalized = normalize_usage(payload)
+            model_id = model_name or task.review.codex_model or "codex-default"
+            self.state.record_model_call(
+                roadmap_id=roadmap.roadmap_id,
+                task_id=task.id,
+                attempt_id=attempt_id,
+                provider="codex",
+                model=model_id,
+                purpose=purpose,
+                input_tokens=normalized["input_tokens"],
+                cached_tokens=normalized["cached_tokens"],
+                output_tokens=normalized["output_tokens"],
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+        except Exception:  # noqa: BLE001 - ledger is best-effort
+            log.warning("model_calls: failed to record %s call for task=%s attempt=%s", reviewer, task.id, attempt_id, exc_info=True)
 
     def _effective_max_attempts(self, task: TaskConfig, roadmap: RoadmapConfig) -> int:
         """Return the effective per-task total executor attempt cap.

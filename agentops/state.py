@@ -316,6 +316,184 @@ class StateStore:
                 (str(uuid.uuid4()), roadmap_id, task_id, attempt_id, reviewer, str(prompt_path), str(result_path) if result_path else None, verdict, json.dumps(usage or {}, sort_keys=True), utc_now()),
             )
 
+    def record_model_call(
+        self,
+        roadmap_id: str | None,
+        task_id: str | None,
+        attempt_id: str | None,
+        provider: str,
+        model: str,
+        purpose: str,
+        input_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cost_estimate: float | None = None,
+        started_at: str | None = None,
+        ended_at: str | None = None,
+    ) -> str:
+        """Insert one ``model_calls`` row and return its generated id.
+
+        The ledger is honest: ``None`` token values are stored as
+        ``NULL`` so the dashboard can tell *known* from *unknown*
+        without having to recover the original missing data. Negative
+        or non-numeric values are coerced to ``None`` (defence in
+        depth; the orchestrator and the usage helpers already filter).
+
+        ``cost_estimate`` is reserved for future per-call cost capture.
+        It is never invented from token counts here; callers that want
+        to populate it must source the value from a price the operator
+        explicitly opted into. The dashboard treats it as
+        *operator-supplied* metadata and shows it last so it cannot be
+        mistaken for a measured number.
+        """
+        call_id = str(uuid.uuid4())
+        started = started_at or utc_now()
+        ended = ended_at
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO model_calls(
+                  id, roadmap_id, task_id, attempt_id, provider, model, purpose,
+                  input_tokens, cached_tokens, output_tokens, cost_estimate,
+                  started_at, ended_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    call_id,
+                    roadmap_id,
+                    task_id,
+                    attempt_id,
+                    provider,
+                    model,
+                    purpose,
+                    input_tokens,
+                    cached_tokens,
+                    output_tokens,
+                    cost_estimate,
+                    started,
+                    ended,
+                ),
+            )
+        return call_id
+
+    def model_call_rows(
+        self,
+        roadmap_id: str | None = None,
+        task_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return ``model_calls`` rows newest first.
+
+        Both filters are optional; omitting them returns every recorded
+        row (useful for the dashboard's global snapshot). ``limit``
+        caps the result size; ``None`` means "no limit". The query
+        uses the existing ``model_calls`` table layout so no schema
+        migration is required.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if roadmap_id is not None:
+            clauses.append("roadmap_id = ?")
+            params.append(roadmap_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        limit_sql = ""
+        limit_params: list[Any] = []
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            limit_sql = " LIMIT ?"
+            limit_params.append(int(limit))
+        sql = (
+            "SELECT * FROM model_calls"
+            + where_sql
+            + " ORDER BY started_at DESC, id DESC"
+            + limit_sql
+        )
+        with self.connect() as conn:
+            cur = conn.execute(sql, (*params, *limit_params))
+            return list(cur.fetchall())
+
+    def model_call_summary(
+        self,
+        roadmap_id: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the dashboard-ready aggregate for the ``model_calls`` table.
+
+        The aggregation is SQL-side where it is cheap (counts, sums);
+        the per-purpose / per-model buckets are filled in by
+        :func:`agentops.usage.summarize_model_calls` so the dashboard
+        and the CLI share the exact same rollup logic. The shape is
+        stable and locked by ``tests/test_state.py`` /
+        ``tests/test_usage.py``.
+
+        ``total_tokens`` is not part of the ``model_calls`` schema
+        (we keep the table layout minimal and compute ``total_tokens``
+        from ``normalize_usage`` in the rollup helper); the SQL
+        aggregate therefore tracks only the columns we persist.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if roadmap_id is not None:
+            clauses.append("roadmap_id = ?")
+            params.append(roadmap_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT
+                  COUNT(*) AS call_count,
+                  SUM(CASE WHEN input_tokens IS NOT NULL
+                            OR cached_tokens IS NOT NULL
+                            OR output_tokens IS NOT NULL
+                           THEN 1 ELSE 0 END) AS known_calls,
+                  SUM(CASE WHEN input_tokens IS NULL
+                            AND cached_tokens IS NULL
+                            AND output_tokens IS NULL
+                           THEN 1 ELSE 0 END) AS unknown_calls,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens
+                FROM model_calls
+                {where_sql}
+                """,
+                params,
+            ).fetchone()
+            latest_row = conn.execute(
+                f"""
+                SELECT started_at FROM model_calls
+                {where_sql}
+                ORDER BY started_at DESC, id DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        try:
+            call_count = int(row["call_count"] or 0)
+        except (KeyError, TypeError, ValueError):
+            call_count = 0
+        try:
+            known_calls = int(row["known_calls"] or 0)
+        except (KeyError, TypeError, ValueError):
+            known_calls = 0
+        try:
+            unknown_calls = int(row["unknown_calls"] or 0)
+        except (KeyError, TypeError, ValueError):
+            unknown_calls = 0
+        return {
+            "call_count": call_count,
+            "known_calls": known_calls,
+            "unknown_calls": unknown_calls,
+            "input_tokens": int(row["input_tokens"] or 0) if row else 0,
+            "cached_tokens": int(row["cached_tokens"] or 0) if row else 0,
+            "output_tokens": int(row["output_tokens"] or 0) if row else 0,
+            "latest_started_at": latest_row["started_at"] if latest_row else None,
+        }
+
     def task_rows(self, roadmap_id: str | None = None) -> list[sqlite3.Row]:
         with self.connect() as conn:
             if roadmap_id:

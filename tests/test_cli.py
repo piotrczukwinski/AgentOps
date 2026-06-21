@@ -353,5 +353,114 @@ class CliRunSmokeTests(unittest.TestCase):
             self.assertIn("Repo path does not exist", result.stderr)
 
 
+class CliUsageTests(unittest.TestCase):
+    """End-to-end tests for ``agentops usage`` (the usage ledger CLI)."""
+
+    def _seed(self, store: StateStore) -> None:
+        store.record_model_call(
+            roadmap_id="r",
+            task_id="T1",
+            attempt_id="A1",
+            provider="opencode",
+            model="minimax/MiniMax-M3",
+            purpose="executor",
+            input_tokens=120,
+            cached_tokens=15,
+            output_tokens=22,
+        )
+        store.record_model_call(
+            roadmap_id="r",
+            task_id="T1",
+            attempt_id="A1",
+            provider="codex",
+            model="codex-default",
+            purpose="review",
+        )
+
+    def test_usage_json_shape_matches_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            result = _Runner().run(
+                ["--db", str(Path(tmp) / "state.sqlite"), "usage", "--json"]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIn("totals", payload)
+            self.assertIn("by_purpose", payload)
+            self.assertIn("by_model", payload)
+            self.assertIn("latest_calls", payload)
+            self.assertIn("notes", payload)
+            self.assertEqual(payload["totals"]["known_calls"], 1)
+            self.assertEqual(payload["totals"]["unknown_calls"], 1)
+            self.assertEqual(payload["totals"]["input_tokens"], 120)
+            self.assertEqual(payload["totals"]["cached_tokens"], 15)
+            self.assertEqual(payload["totals"]["output_tokens"], 22)
+            self.assertIsNone(payload["totals"]["total_tokens"])
+            purposes = {row["purpose"]: row for row in payload["by_purpose"]}
+            self.assertEqual(purposes["executor"]["calls"], 1)
+            self.assertEqual(purposes["review"]["calls"], 1)
+
+    def test_usage_text_table_prints_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            result = _Runner().run(
+                ["--db", str(Path(tmp) / "state.sqlite"), "usage"]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("AgentOps model usage", result.stdout)
+            self.assertIn("known_calls", result.stdout)
+            self.assertIn("unknown_calls", result.stdout)
+            self.assertIn("By purpose", result.stdout)
+            self.assertIn("Latest calls", result.stdout)
+            self.assertIn("unknown", result.stdout)
+
+    def test_usage_with_no_rows_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite"
+            result = _Runner().run(["--db", str(db_path), "usage", "--json"])
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["totals"]["known_calls"], 0)
+            self.assertEqual(payload["totals"]["unknown_calls"], 0)
+            self.assertEqual(payload["latest_calls"], [])
+            self.assertIsNone(payload["totals"]["total_tokens"])
+
+    def test_usage_filters_by_roadmap_and_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            store.record_model_call(
+                roadmap_id="other",
+                task_id="T9",
+                attempt_id="A9",
+                provider="opencode",
+                model="minimax/MiniMax-M3",
+                purpose="executor",
+                input_tokens=1,
+                cached_tokens=0,
+                output_tokens=1,
+            )
+            result = _Runner().run(
+                [
+                    "--db",
+                    str(Path(tmp) / "state.sqlite"),
+                    "usage",
+                    "--roadmap",
+                    "r",
+                    "--json",
+                ]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["filter"]["roadmap_id"], "r")
+            self.assertEqual(payload["totals"]["known_calls"], 1)
+            self.assertEqual(len(payload["latest_calls"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
