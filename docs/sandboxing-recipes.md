@@ -197,8 +197,12 @@ anything high-risk:
 env | grep -Ei 'token|secret|key|password'
 ```
 
-* Common names AgentOps already strips: `GH_TOKEN`, `GITHUB_TOKEN`,
-  `GH_HOST`, and a handful of other well-known GitHub variables.
+* Common token names AgentOps already strips: `GH_TOKEN`,
+  `GITHUB_TOKEN`, `GITHUB_PAT`, `GIT_TOKEN`, `CODEX_API_KEY`,
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+  `HUGGINGFACE_API_KEY`, and `HF_TOKEN` (see
+  `agentops/runners.py` `TOKEN_ENV_NAMES`).
 * Non-standard names may still exist: `MY_CI_TOKEN`,
   `INTERNAL_DEPLOY_KEY`, project-specific variables, etc.
 
