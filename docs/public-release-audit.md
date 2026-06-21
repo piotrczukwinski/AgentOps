@@ -191,3 +191,136 @@ with a clear pass / fail.
 * The repository is **not yet public**. The visibility
   switch is the maintainer's manual action and is gated on
   the steps in §8 above.
+
+## 10. Final validation run
+
+This section records the final pre-public validation run
+performed after the public-readiness, admin dashboard,
+application package, Codex evidence, sandboxing recipes, and
+demo recording guide PRs were merged into `main`.
+
+* **Date:** 2026-06-21 (UTC)
+* **Branch:** `public-release-final-check-008` (from
+  `main` @ `f1a790ba25fbc0566050f9926e6712ce5def8bde`)
+* **Scope:** validation only; no product changes, no
+  dependency changes, no telemetry, no web-shell endpoint,
+  no Codex-from-UI, no `main` push, no release tag, no
+  public visibility switch.
+
+### 10.1 Repository metadata files
+
+| File | Status |
+|---|---|
+| `README.md` | present |
+| `LICENSE` | present |
+| `SECURITY.md` | present |
+| `CONTRIBUTING.md` | present |
+| `AGENTS.md` | present |
+| `CODE_OF_CONDUCT.md` | present |
+| `.github/workflows/ci.yml` | present |
+| `.github/ISSUE_TEMPLATE/bug_report.md` | present |
+| `.github/ISSUE_TEMPLATE/feature_request.md` | present |
+| `.github/pull_request_template.md` | present |
+
+### 10.2 Key docs
+
+| File | Status |
+|---|---|
+| `docs/demo.md` | present |
+| `docs/demo-recording.md` | present |
+| `docs/public-release-checklist.md` | present |
+| `docs/public-release-audit.md` | present |
+| `docs/codex-for-oss-application.md` | present |
+| `docs/why-agentops-for-codex.md` | present |
+| `docs/cost-model.md` | present |
+| `docs/evidence/codex-roadmap-reduction-estimate.md` | present |
+| `docs/evidence/self-maintenance-prs.md` | present |
+| `docs/sandboxing-recipes.md` | present |
+| `docs/local-web-ui.md` | present |
+| `docs/admin-panel-architecture.md` | present |
+
+### 10.3 Command results
+
+| Command | Result |
+|---|---|
+| `python3 -m py_compile $(find agentops -name '*.py' \| sort)` | OK (no errors) |
+| `python3 -m unittest discover -s tests -q` | OK (645 tests passed in 159.0s) |
+| `ruff check .` | OK (all checks passed) |
+| `python3 -m agentops --help` | OK (prints subcommand list including `serve`, `run`, `status`, `plan`, `doctor`) |
+| `python3 -m agentops doctor` | OK (`git`, `opencode`, `codex`, `python` all detected; `agentops version: 0.1.0`) |
+| `python3 -m agentops plan --roadmap examples/roadmaps/demo-shell.json` | OK (`no issues found`) |
+| `python3 -m agentops plan --roadmap examples/roadmaps/gated-shell-review-smoke.json` | OK (`no issues found`) |
+| `python3 -m agentops run --roadmap examples/roadmaps/demo-shell.json --no-codex --max-tasks 1` | OK (`Processed 1 task(s) from roadmap demo-shell-roadmap`) |
+| `python3 -m agentops status` | OK (status dump returned; new `DEMO-SHELL-001` attempt accepted) |
+| `git diff --check` | OK (no whitespace / conflict markers) |
+| Private-term grep (see §10.4) | OK (no matches) |
+| Secret-like scan (see §10.5) | OK (no matches) |
+
+### 10.4 Private-term grep
+
+```
+git grep -nE '/home/czuki|BusinessAgent|biuro|antidetect|AgentOps Internal|piotr@local.agentops|business-agent|STAB|admin-web|web-admin|GIT_TERMAL_PROMPT'
+```
+
+* Tracked working tree: **no matches.**
+* Old roadmap IDs containing the old `biuro-p1-operator-queue`
+  and `agentops-reliability-audit-v2` names are present in
+  the local SQLite state file at `.agentops/state.sqlite`.
+  That file is git-ignored and is a runtime artifact, not
+  source code. It is **not** part of the public repository
+  and will not be published.
+
+### 10.5 Secret-like scan
+
+* AWS / GitHub PAT / `sk-` / Slack token shape grep
+  (`AKIA[0-9A-Z]{16}` / `ghp_[A-Za-z0-9]{36}` /
+  `github_pat_…` / `sk-…` / `xox[abp]-…`) over tracked
+  non-doc, non-test, non-example, non-schema files:
+  **no matches.**
+* Generic `api_key|secret|token|password = "…"` literal
+  scan over the same file set: **no matches.**
+* No false positives; nothing to whitelist.
+
+### 10.6 Working tree
+
+* `git status --short` on the validation branch shows
+  only intentionally untracked local artifacts
+  (`AgentOps.tar.gz`, `bundles/`). `.agentops/`,
+  `.operator-runs/`, and `.operator-logs/` are
+  git-ignored. No tracked file is modified, staged, or
+  deleted.
+* `git log --oneline --decorate -10` confirms the branch
+  is at `main` HEAD (`f1a790b`) with the public-readiness,
+  admin dashboard, application package, Codex evidence,
+  sandboxing recipes, and demo recording guide commits
+  visible in history.
+
+### 10.7 Remaining manual actions
+
+These actions are owned by the maintainer and are not
+automated by this validation run:
+
+* Switch the repository visibility to public (GitHub
+  Settings → Danger Zone → "Change repository visibility").
+* Add the GitHub topics listed in
+  [`docs/public-release-checklist.md`](../public-release-checklist.md)
+  (e.g. `agentops`, `codex`, `coding-agents`,
+  `maintainer-tools`, `oss-maintenance`, `opencode`, `cli`,
+  `automation`).
+* Create the `v0.1.0` GitHub release tag from `main` at
+  the validated commit.
+* (Optional) Record a short screenshot / GIF of the Admin
+  / Operator panel following
+  [`docs/demo-recording.md`](../demo-recording.md).
+* Submit the Codex for Open Source application using the
+  drafts in
+  [`docs/codex-for-oss-application.md`](../codex-for-oss-application.md).
+
+### 10.8 Verdict
+
+`READY_FOR_PUBLIC_RELEASE` — every automated gate listed
+in §10.3 is green, the private-term grep and secret-like
+scan both return zero matches on tracked source, the
+working tree is clean (only intentionally untracked local
+runtime artifacts remain), and the only outstanding items
+are the maintainer-owned manual steps in §10.7.
