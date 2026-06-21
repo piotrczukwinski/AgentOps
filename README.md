@@ -418,6 +418,21 @@ tests/
 
 * [`docs/demo.md`](docs/demo.md) — 5-minute, no-API-key,
   no-external-service demo for a public visitor.
+* [`docs/why-agentops-for-codex.md`](docs/why-agentops-for-codex.md)
+  — why AgentOps is a strong fit for Codex as a bounded
+  reviewer rather than a live watcher.
+* [`docs/cost-model.md`](docs/cost-model.md) — conceptual
+  cost model; no fabricated token numbers.
+* [`docs/evidence/codex-roadmap-reduction-estimate.md`](docs/evidence/codex-roadmap-reduction-estimate.md)
+  — roadmap-specific Codex reviewer estimate for reduced
+  strong-model supervision work. The expected benefit is
+  workload-dependent: AgentOps is most useful when the
+  implementation / retry / log surface is large enough for cheap
+  execution plus bounded Codex review to beat direct strong-model
+  execution.
+* [`docs/evidence/self-maintenance-prs.md`](docs/evidence/self-maintenance-prs.md)
+  — public-safe summary of AgentOps self-maintenance
+  workflows.
 * [`docs/case-studies/agentops-self-maintenance.md`](docs/case-studies/agentops-self-maintenance.md)
   — evidence-based case study of using AgentOps to improve
   AgentOps itself.

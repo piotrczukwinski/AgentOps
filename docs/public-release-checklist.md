@@ -92,6 +92,25 @@ output for each of the commands below.
 * [ ] No tracked file under `docs/`, `examples/`, `tests/`, or
       the repository root contains a private machine path,
       a private project name, or a personal email address.
+* [ ] The 75-90% estimate is framed as a roadmap-specific
+      Codex reviewer estimate.
+* [ ] No global benchmark claim is made from the 75-90%
+      estimate.
+* [ ] No private repo names or private paths are included in
+      the Codex evidence package.
+* [ ] `docs/cost-model.md` contains no fabricated token
+      numbers.
+* [ ] The cost model explains break-even behavior
+      (workload-dependent benefit, fixed orchestration overhead,
+      and the cheap-executor / strong-reviewer split).
+* [ ] Docs do not imply AgentOps is always cheaper
+      (`docs/cost-model.md`, `docs/why-agentops-for-codex.md`,
+      `README.md`, and the Codex evidence package all surface
+      the break-even shape and the "tiny tasks may show little or
+      no benefit" caveat).
+* [ ] Docs distinguish expensive strong-model usage from total
+      all-model tokens (cheap executor tokens may increase while
+      Codex tokens decrease).
 * [ ] The web UI does not enable the Codex reviewer. The
       dashboard's `Run` button always passes `--no-codex`.
 * [ ] The Admin / Operator panel (`GET /api/admin`) is
