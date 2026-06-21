@@ -246,7 +246,7 @@ A maintainer-facing demo of AgentOps takes about 5
 minutes:
 
 ```bash
-git clone https://github.com/example/repo ~/AgentOps
+git clone https://github.com/piotrczukwinski/AgentOps.git ~/AgentOps
 cd ~/AgentOps
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev,yaml]'

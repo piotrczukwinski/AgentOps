@@ -53,7 +53,7 @@ machine without preparation:
 ## 1. Install (about 1 minute)
 
 ```bash
-git clone https://github.com/example/repo ~/AgentOps
+git clone https://github.com/piotrczukwinski/AgentOps.git ~/AgentOps
 cd ~/AgentOps
 
 python3 -m venv .venv

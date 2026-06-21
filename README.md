@@ -51,7 +51,7 @@ analytics, no hosted backend**.
 ## 5-minute local smoke test
 
 ```bash
-git clone https://github.com/example/repo ~/AgentOps
+git clone https://github.com/piotrczukwinski/AgentOps.git ~/AgentOps
 cd ~/AgentOps
 python3 -m venv .venv
 . .venv/bin/activate
