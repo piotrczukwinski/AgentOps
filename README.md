@@ -492,12 +492,43 @@ tests/
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the local setup,
-test, lint, and PR conventions. See
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for the community
-standards. See [`SECURITY.md`](SECURITY.md) for how to report
-a vulnerability. See [`AGENTS.md`](AGENTS.md) for the
-agent-facing contributor guide and the safety hard rules.
+AgentOps is a local-first, CLI-first project maintained in
+spare time. Contributions of any size are welcome; the
+maintainer reviews safety changes especially carefully.
+
+* Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for the local
+  setup, the test / lint / smoke commands, the safety-first PR
+  expectations, the **Where to start** section (with the four
+  contribution tracks: docs, tests, web UI, core
+  orchestration), the small-PR policy, and the
+  "Before you touch safety-sensitive code" checklist.
+* Read [`docs/code-map.md`](docs/code-map.md) for a
+  contributor-friendly map of the `agentops/` package: what
+  each module owns, what it must not own, good first
+  contribution ideas, and the safety notes.
+* Read [`docs/contributor-roadmap.md`](docs/contributor-roadmap.md)
+  for the good first / medium / advanced paths, with the
+  expected files touched, expected tests, and risk level for
+  each row.
+* Read [`AGENTS.md`](AGENTS.md) for the agent-facing
+  contributor guide and the [safety hard
+  rules](AGENTS.md#safety-boundaries-hard-rules) that apply
+  to every PR.
+* Read [`SECURITY.md`](SECURITY.md) for how to report a
+  vulnerability (use the private advisory channel, not a
+  public issue) and for the supported-versions policy.
+* Read [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for the
+  community standards.
+
+Issue templates live under
+[`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/). The
+[`good_first_issue`](.github/ISSUE_TEMPLATE/good_first_issue.md)
+and
+[`docs_improvement`](.github/ISSUE_TEMPLATE/docs_improvement.md)
+templates are the lightest entry points; the
+[`feature_request`](.github/ISSUE_TEMPLATE/feature_request.md)
+and [`bug_report`](.github/ISSUE_TEMPLATE/bug_report.md)
+templates cover everything else.
 
 ## License
 
