@@ -36,6 +36,22 @@ If any of the above **is** touched on purpose, call it out
 in the PR description and add a test that proves the
 **default** is still safe.
 
+### Touch points in this PR
+
+<!-- Confirm what surfaces this PR changes. The maintainer
+     reviews safety changes especially carefully; being
+     explicit here speeds up the review. -->
+
+- [ ] This PR does **not** touch any safety-sensitive file
+      (see [`CONTRIBUTING.md`](CONTRIBUTING.md) "Before you
+      touch safety-sensitive code").
+- [ ] This PR does **not** change CLI subcommand shape, the
+      web UI, the SQLite state schema, or the runner
+      behaviour.
+- [ ] This PR does **not** change model usage, token, or
+      cost reporting behaviour. Missing values must still
+      render as `unknown`, not `0`.
+
 ## Validation run locally
 
 <!-- Paste the output of the validation commands from

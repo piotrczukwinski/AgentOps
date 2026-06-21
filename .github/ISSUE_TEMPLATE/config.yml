@@ -1,0 +1,44 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security advisory (private)
+    url: https://github.com/example/repo/security/advisories/new
+    about: Please report security vulnerabilities **privately** through
+      GitHub Security Advisories, not through a public issue. See
+      SECURITY.md for the full reporting flow and the
+      supported-versions policy.
+  - name: Security policy
+    url: https://github.com/example/repo/blob/main/SECURITY.md
+    about: SECURITY.md is the public security policy: what the
+      project considers in-scope, the threat model, and how the
+      maintainer handles reports.
+  - name: Contributing guide
+    url: https://github.com/example/repo/blob/main/CONTRIBUTING.md
+    about: Read CONTRIBUTING.md before opening an issue or a PR. It
+      covers the local setup, the test / lint / smoke commands, the
+      safety hard rules, the four contribution tracks (A. docs, B.
+      tests, C. web UI, D. core orchestration), and the small-PR
+      policy. New contributors should also read AGENTS.md.
+  - name: Demo docs
+    url: https://github.com/example/repo/blob/main/docs/demo.md
+    about: docs/demo.md is the 5-minute, no-API-key, no-external-service
+      demo for a public visitor. docs/demo-recording.md is the
+      no-API-key recording recipe for a maintainer-provided screenshot
+      or GIF.
+  - name: Contributor roadmap
+    url: https://github.com/example/repo/blob/main/docs/contributor-roadmap.md
+    about: docs/contributor-roadmap.md lists the areas that need help
+      this week: good first / medium / advanced paths, expected files
+      touched, expected tests, and risk level for each row. Pick a
+      small slice from the "Good first contributions" section first.
+  - name: Code map
+    url: https://github.com/example/repo/blob/main/docs/code-map.md
+    about: docs/code-map.md is the contributor-friendly map of the
+      agentops/ package: what each module owns, what it must not
+      own, good first contribution ideas, and the safety notes. Read
+      it before opening a PR that touches a runtime module.
+  - name: Discussion forum
+    url: https://github.com/example/repo/discussions
+    about: Use GitHub Discussions for "how do I..." questions, design
+      proposals that are not yet ready for an issue, and roadmap
+      feedback. Use the issue tracker for actionable, well-scoped
+      work only.
