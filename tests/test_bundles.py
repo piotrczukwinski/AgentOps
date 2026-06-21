@@ -1,7 +1,7 @@
 """Direct unit tests for :mod:`agentops.bundles`.
 
 The bundle pack/unpack/validate module is the building block for the
-admin panel. These tests build fixtures inside
+Admin / Operator panel. These tests build fixtures inside
 ``tempfile.TemporaryDirectory`` (no pytest fixtures, no reliance on
 ``conftest``) and cover the public surface needed for Phase 1 T1 and T2:
 

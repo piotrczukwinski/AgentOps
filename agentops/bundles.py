@@ -2,7 +2,7 @@
 
 A "bundle" is a zip archive that contains a ``manifest.json`` file plus a
 roadmap file and any number of prompt files. This module is the
-read/write/validate primitive used by the admin panel (Phase 1, T1 + T2)
+read/write/validate primitive used by the Admin / Operator panel (Phase 1, T1 + T2)
 and contains:
 
 * :class:`BundleError` - raised for any structural bundle problem
@@ -13,7 +13,7 @@ and contains:
   resolved roadmap file path.
 * :class:`BundleCheck` - a single validation check (error or warning).
 * :class:`BundleReport` - the aggregated validation report with a
-  ``to_dict()`` shape used by the admin panel JSON endpoint.
+  ``to_dict()`` shape used by the Admin / Operator panel JSON endpoint.
 * :func:`parse_manifest` / :func:`load_manifest` - manifest validation
   and JSON loading.
 * :func:`unpack_bundle` - safe extraction of a bundle zip (zip-slip
@@ -24,7 +24,7 @@ and contains:
   already-unpacked bundle directory.
 
 This module uses the Python standard library only; there are no
-third-party imports on purpose (see the admin panel architecture
+third-party imports on purpose (see the Admin / Operator panel architecture
 document, section "Hard constraints"). The optional imports from
 :mod:`agentops.config` and :mod:`agentops.plan` are deferred to inside
 :func:`validate_bundle` so the pack/unpack surface stays usable in

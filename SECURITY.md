@@ -64,7 +64,7 @@ Please report security issues **privately** and **responsibly**,
 not via public GitHub issues.
 
 * Open a **private** security advisory on GitHub:
-  `https://github.com/piotrczukwinski/AgentOps/security/advisories/new`
+  `https://github.com/example/repo/security/advisories/new`
 * Or email the maintainer at the address listed in
   [`pyproject.toml`](pyproject.toml).
 

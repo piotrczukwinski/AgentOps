@@ -2836,7 +2836,7 @@ def _suggested_action(
 ) -> str | None:
     """Return a one-line operator hint based on the runtime state.
 
-    The hint is consumed by the CLI and the future admin web panel so
+    The hint is consumed by the CLI and the Admin / Operator panel so
     the operator does not have to remember the playbook for every
     failure mode.
     """
@@ -2870,7 +2870,7 @@ def _resolve_runtime_status(run_dir_path: Path, payload: dict[str, Any]) -> dict
     consistent across the two persistence formats.
 
     The function also surfaces the *active* attempt's combined.log path,
-    size and mtime so the operator (and the future admin web panel) can
+    size and mtime so the operator (and the Admin / Operator panel) can
     see at a glance which log to tail, and so the idle watchdog has a
     canonical source of truth.
     """
@@ -3227,10 +3227,10 @@ def stop_run(
     return payload
 
 
-# JSON status fields that a web/admin panel can consume. The set is
-# intentionally narrow: the future web UI only needs the fields below to
-# render a status row and decide what action button to show. Everything
-# else stays inside the on-disk status.json.
+# JSON status fields that the Admin / Operator panel can consume. The
+# set is intentionally narrow: the local dashboard only needs the
+# fields below to render a status row and decide what action button
+# to show. Everything else stays inside the on-disk status.json.
 JSON_STATUS_FIELDS = (
     "run_id",
     "name",
@@ -3269,9 +3269,9 @@ JSON_STATUS_FIELDS = (
 def format_status_json(payload: dict[str, Any]) -> dict[str, Any]:
     """Project a status payload to the JSON-friendly schema.
 
-    The output is a plain dict with the same keys a web/admin panel
-    would consume. ``None`` values are dropped so the JSON is compact
-    and downstream code does not have to filter falsy values.
+    The output is a plain dict with the same keys the Admin / Operator
+    panel would consume. ``None`` values are dropped so the JSON is
+    compact and downstream code does not have to filter falsy values.
     ``result_json_present`` is computed from the on-disk ``result.json``
     when ``result_dir`` is supplied; otherwise the function assumes
     ``result.json`` is the only result file.

@@ -51,11 +51,11 @@ analytics, no hosted backend**.
 ## 5-minute local smoke test
 
 ```bash
-git clone https://github.com/piotrczukwinski/AgentOps.git
-cd AgentOps
+git clone https://github.com/piotrczukwinski/AgentOps.git ~/AgentOps
+cd ~/AgentOps
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e '.[yaml,dev]'
+pip install -e '.[dev,yaml]'
 
 # CLI works end-to-end
 agentops --help
@@ -65,14 +65,15 @@ agentops doctor
 agentops plan --roadmap examples/roadmaps/demo-shell.json
 
 # Run a roadmap end-to-end with the shell runner, no reviewer needed
-agentops run --roadmap examples/roadmaps/demo-shell.json --no-codex
+agentops run --roadmap examples/roadmaps/demo-shell.json --no-codex --max-tasks 1
 agentops status
-agentops logs DEMO-SHELL-001
 ```
 
 If every command above returns zero and the status shows the
 task complete, the local install is good. The gated runner smoke
-test is `examples/roadmaps/gated-shell-review-smoke.json`.
+test is `examples/roadmaps/gated-shell-review-smoke.json`. The
+full walkthrough (CLI + web UI + Admin / Operator panel + optional
+Codex / OpenCode) is in [`docs/demo.md`](docs/demo.md).
 
 ## Two-agent operating model
 
@@ -349,11 +350,16 @@ docs/
   operator-run-harness.md
   usability-mvp.md
   gated-roadmap-runner.md
+  prompt-authoring-guidelines.md
   local-web-ui.md
-  roadmap-planning-guidelines.md
   admin-panel-architecture.md
+  roadmap-planning-guidelines.md
   public-release-checklist.md
   codex-for-oss-application.md
+  public-release-audit.md
+  demo.md
+  case-studies/
+    agentops-self-maintenance.md
 
 examples/
   roadmaps/
@@ -368,6 +374,8 @@ tests/
 
 ## Documentation map
 
+### Architecture and core design
+
 * [`docs/architecture.md`](docs/architecture.md) — internal
   architecture and the durable state machine.
 * [`docs/two-agent-strategy.md`](docs/two-agent-strategy.md) —
@@ -376,6 +384,9 @@ tests/
 * [`docs/gated-roadmap-runner.md`](docs/gated-roadmap-runner.md)
   — verdict schema, repair loop, and the integration-branch
   merge gate.
+
+### Run, triage, and operations
+
 * [`docs/operator-runbook.md`](docs/operator-runbook.md) —
   triage procedures for a stuck roadmap.
 * [`docs/operator-run-harness.md`](docs/operator-run-harness.md)
@@ -385,18 +396,40 @@ tests/
   [`docs/roadmap-planning-guidelines.md`](docs/roadmap-planning-guidelines.md)
   — the JSON / YAML roadmap schema and the planning contract
   to follow when generating roadmaps with another model.
+* [`docs/prompt-authoring-guidelines.md`](docs/prompt-authoring-guidelines.md)
+  — task prompt and Codex review prompt rules, including the
+  `allowed_files` hint semantics.
+
+### Safety and interfaces
+
 * [`docs/security.md`](docs/security.md) — threat model and
   the full list of MVP controls.
 * [`docs/local-web-ui.md`](docs/local-web-ui.md) — the local
   dashboard, its safety notes, and the recommended workflow.
+* [`docs/admin-panel-architecture.md`](docs/admin-panel-architecture.md)
+  — the Admin / Operator panel contract (`GET /api/admin`).
+
+### CLI and reference
+
 * [`docs/usability-mvp.md`](docs/usability-mvp.md) — the
   full CLI reference.
+
+### Public release and OSS application
+
+* [`docs/demo.md`](docs/demo.md) — 5-minute, no-API-key,
+  no-external-service demo for a public visitor.
+* [`docs/case-studies/agentops-self-maintenance.md`](docs/case-studies/agentops-self-maintenance.md)
+  — evidence-based case study of using AgentOps to improve
+  AgentOps itself.
 * [`docs/public-release-checklist.md`](docs/public-release-checklist.md)
   — the release-readiness checklist used before switching the
-  repository public.
+  repository public, including the final manual steps.
 * [`docs/codex-for-oss-application.md`](docs/codex-for-oss-application.md)
   — the prep document for the OpenAI Codex for Open Source
-  application.
+  application, with form-ready answer drafts.
+* [`docs/public-release-audit.md`](docs/public-release-audit.md)
+  — the final readiness audit summarising metadata, license,
+  CI, safety, demo, docs, and remaining manual actions.
 
 ## Contributing
 
@@ -404,7 +437,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the local setup,
 test, lint, and PR conventions. See
 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for the community
 standards. See [`SECURITY.md`](SECURITY.md) for how to report
-a vulnerability.
+a vulnerability. See [`AGENTS.md`](AGENTS.md) for the
+agent-facing contributor guide and the safety hard rules.
 
 ## License
 

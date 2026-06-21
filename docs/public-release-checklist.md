@@ -178,7 +178,68 @@ match, the release is **not** ready and the issue must be
 fixed in the release branch before the repo is switched
 public.
 
-## 7. Follow-up PRs (intentionally out of scope)
+## 7. Final manual steps (run by the maintainer)
+
+This section lists the actions that **only the maintainer
+can do** before the repository is switched from private to
+public and before the Codex for Open Source application is
+submitted. None of these are automated; each is a small
+GitHub UI action with a clear pass / fail.
+
+* [ ] **Confirm the release branch is clean.**
+      `git status` shows a clean working tree on
+      `public-release-application-package-003` (or the
+      current release branch).
+* [ ] **Run the validation commands from §6** and paste the
+      output in the release PR. Every command must return
+      zero on the release branch.
+* [ ] **Run the private-term grep.** The exact deny-list of
+      private / internal codenames lives in the
+      maintainer's private prep notes; the release PR must
+      paste the output of the sweep and confirm zero
+      matches in tracked files.
+* [ ] **Optional — run a secret scanner if available.**
+      `gitleaks detect --no-banner --source .` and
+      `trufflehog filesystem .` (if installed) must both
+      return clean.
+* [ ] **Check the GitHub repository description.** It must
+      read as a public pitch, not a private runbook, and
+      must match the `description` field in `pyproject.toml`.
+* [ ] **Add the GitHub Topics.** The full topic set to add
+      on the repository's About page:
+
+      * `agentops`
+      * `codex`
+      * `coding-agents`
+      * `maintainer-tools`
+      * `oss-maintenance`
+      * `opencode`
+      * `cli`
+      * `automation`
+* [ ] **Create the v0.1.0 release tag** on the merged
+      `main` commit after the release PR is merged. Tag
+      message: short, public, no private codenames.
+* [ ] **Add a screenshot or animated GIF of the Admin /
+      Operator panel** if desired. Place the file under
+      `docs/img/` and reference it from `README.md`. This
+      step is purely cosmetic and is **not** a hard
+      requirement.
+* [ ] **Switch the repository visibility to public** in
+      GitHub Settings → General → Danger Zone. This is the
+      visibility switch the rest of this document guards.
+* [ ] **Submit the Codex for Open Source application** using
+      the draft answers in
+      [`docs/codex-for-oss-application.md`](codex-for-oss-application.md).
+      Trim the 500-character drafts to fit the form's hard
+      limit if the form requires it.
+* [ ] **Watch the first 24 hours of public traffic.** The
+      first wave of public visitors will hit `README.md`,
+      `docs/demo.md`, and the Admin / Operator panel first;
+      any wording that looks wrong in those surfaces
+      should be fixed in a follow-up PR before more users
+      arrive.
+
+## 8. Follow-up PRs (intentionally out of scope)
 
 * A direct Codex integration that fetches the PR diff and
   calls the reviewer on the operator's behalf. This should
