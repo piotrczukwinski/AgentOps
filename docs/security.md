@@ -19,7 +19,7 @@ The executor agent can make mistakes, over-edit, run shell commands, or attempt 
 
 ## Important limitation
 
-The MVP is a local control plane, not a kernel/container sandbox. For high-risk work, run executors in a container, VM, or user account without repository write credentials.
+The MVP is a local control plane, not a kernel/container sandbox. For high-risk work, run executors in a container, VM, or user account without repository write credentials. For practical isolation recipes, see [sandboxing-recipes.md](sandboxing-recipes.md).
 
 ## Recommended unattended setup
 

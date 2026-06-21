@@ -214,7 +214,8 @@ automation changes, crawler compliance-sensitive changes, or
 anything that touches auth / billing / identity), run the
 executor inside a VM, a container, or a dedicated low-privilege
 user account that does not have repository write credentials
-in scope.
+in scope. Practical recipes for that are in
+[`docs/sandboxing-recipes.md`](docs/sandboxing-recipes.md).
 
 ## Local web UI summary
 
@@ -404,6 +405,9 @@ tests/
 
 * [`docs/security.md`](docs/security.md) — threat model and
   the full list of MVP controls.
+* [`docs/sandboxing-recipes.md`](docs/sandboxing-recipes.md) —
+  practical low-privilege / container guidance for running
+  executor agents.
 * [`docs/local-web-ui.md`](docs/local-web-ui.md) — the local
   dashboard, its safety notes, and the recommended workflow.
 * [`docs/admin-panel-architecture.md`](docs/admin-panel-architecture.md)

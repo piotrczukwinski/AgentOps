@@ -76,6 +76,13 @@ output for each of the commands below.
 * [ ] `SECURITY.md` explains how to report vulnerabilities
       responsibly (private advisory + maintainer email).
 * [ ] `SECURITY.md` does **not** promise a formal SLA.
+* [ ] `docs/sandboxing-recipes.md` exists and clearly states
+      AgentOps is not a sandbox.
+* [ ] `README.md` and `SECURITY.md` link to
+      `docs/sandboxing-recipes.md`.
+* [ ] `docs/sandboxing-recipes.md` does **not** claim safety
+      guarantees; it is framed as external isolation practices
+      for the executor environment, not AgentOps controls.
 * [ ] `CONTRIBUTING.md` exists at the repository root and
       covers local setup, tests, lint, docs, the no-secrets
       rule, the no-private-paths rule, and safety-first PR
