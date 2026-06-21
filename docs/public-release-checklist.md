@@ -249,7 +249,14 @@ GitHub UI action with a clear pass / fail.
       Operator panel** if desired. Place the file under
       `docs/img/` and reference it from `README.md`. This
       step is purely cosmetic and is **not** a hard
-      requirement.
+      requirement. The reproducible recording script lives
+      in [`docs/demo-recording.md`](demo-recording.md); if
+      you do record, follow the §2 redaction checklist and
+      the §8 pre-commit checklist in that document before
+      pushing any image. The recording is optional, the
+      text walkthrough in [`docs/demo.md`](demo.md) is the
+      source of truth, and a missing image must not block
+      the release.
 * [ ] **Switch the repository visibility to public** in
       GitHub Settings → General → Danger Zone. This is the
       visibility switch the rest of this document guards.

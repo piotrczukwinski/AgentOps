@@ -1,5 +1,10 @@
 # AgentOps Control Plane
 
+[![CI](https://github.com/piotrczukwinski/AgentOps/actions/workflows/ci.yml/badge.svg)](https://github.com/piotrczukwinski/AgentOps/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/piotrczukwinski/AgentOps)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![local-first / no telemetry](https://img.shields.io/badge/local--first-no%20telemetry-blue)](#)
+
 > **Local-first, CLI-first control plane for long-running coding-agent
 > workflows.**
 >
@@ -74,6 +79,16 @@ task complete, the local install is good. The gated runner smoke
 test is `examples/roadmaps/gated-shell-review-smoke.json`. The
 full walkthrough (CLI + web UI + Admin / Operator panel + optional
 Codex / OpenCode) is in [`docs/demo.md`](docs/demo.md).
+
+## Demo screenshot / GIF
+
+Screenshot/GIF pending. See [`docs/demo-recording.md`](docs/demo-recording.md)
+for the exact no-API-key recording script.
+
+If a maintainer-provided image is committed under `docs/img/`, it
+will be linked from this section. The recording is optional and
+is **not** required to run the demo; the text walkthrough in
+[`docs/demo.md`](docs/demo.md) is the source of truth.
 
 ## Two-agent operating model
 
