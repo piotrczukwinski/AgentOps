@@ -174,6 +174,16 @@ Concise commitments, each sized to one or two roadmaps:
 
 Concrete evidence already in the repository:
 
+* `docs/why-agentops-for-codex.md` — concise explanation of
+  why AgentOps is a strong fit for Codex: Codex reviews
+  bounded packets instead of supervising live runs.
+* `docs/cost-model.md` — conceptual cost model; it does not
+  invent token numbers or claim a universal savings rate.
+* `docs/evidence/codex-roadmap-reduction-estimate.md` —
+  roadmap-specific Codex reviewer estimate for reduced
+  strong-model supervision work.
+* `docs/evidence/self-maintenance-prs.md` — public-safe
+  summary of AgentOps self-maintenance workflows.
 * `docs/public-release-checklist.md` — the full
   pre-public checklist, with each item checkable in the
   release PR.
@@ -195,6 +205,11 @@ Concrete evidence already in the repository:
   threat model and the full list of MVP controls.
 * `AGENTS.md` — the agent-facing contributor guide that
   encodes the safety boundaries as hard rules.
+
+In one Codex-reviewed roadmap, Codex estimated a roughly
+75-90% reduction in strong-model supervision work compared with
+a live-watcher pattern; the repository documents this as a
+roadmap-specific estimate, not a global benchmark.
 
 ## 10. Known limitations
 
