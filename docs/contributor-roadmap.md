@@ -159,19 +159,28 @@ passes.
 
 ### Timeline observability
 
-* **Description:** a small "timeline" view in the local web UI
-  (per-task events, attempt counts, review verdict timestamps)
-  backed by an existing state row. Read-only; no new endpoint
-  logic.
+* **Description:** improvements to the local run-timeline
+  surface (`agentops timeline`, `GET /api/timeline`, the
+  `Run timeline` dashboard card, the `timeline_summary` block
+  in `GET /api/admin`). Read-only; pure projection over the
+  existing `events` table. See
+  [`docs/observability.md`](observability.md) for the full
+  contract.
 * **Recommended issue:** open one using the
-  `feature_request` template.
-* **Files:** `agentops/web.py`, `tests/test_web.py`,
-  [`docs/local-web-ui.md`](local-web-ui.md).
-* **Tests:** a `tests/test_web.py` case that asserts the new
-  view on a fresh checkout matches the rows the state DB
-  already records.
-* **Risk:** medium. The web UI is a safety boundary; do not add
-  arbitrary shell or enable the Codex reviewer.
+  `feature_request` template and tag it `timeline`.
+* **Files:** `agentops/timeline.py`, `agentops/cli.py`,
+  `agentops/web.py`, `tests/test_timeline.py`,
+  `tests/test_cli.py`, `tests/test_web.py`,
+  [`docs/observability.md`](observability.md).
+* **Tests:** every change to the summary / severity /
+  `suggested_action` mapping must add at least one
+  `tests/test_timeline.py` case that pins the new behavior.
+* **Risk:** medium. The timeline is a safety boundary: it
+  must never expose raw prompt bodies, raw logs, env vars,
+  secrets, or full local paths. Do not widen the
+  `DANGEROUS_PAYLOAD_KEYS` / `PATHLIKE_KEYS` allowlists
+  without an explicit PR description and a new test that
+  proves the default is still safe.
 
 ### Roadmap JSON Schema
 

@@ -604,6 +604,402 @@ class WebEnvSafetyTests(unittest.TestCase):
         self.assertNotIn("AGENTOPS_NO_CODEX", safe)
 
 
+class TimelineApiTests(unittest.TestCase):
+    """Read-only tests for the new ``/api/timeline`` endpoint and the
+    ``timeline_summary`` block embedded in ``/api/admin``.
+
+    These tests seed the SQLite ``events`` table through the public
+    :class:`StateStore` methods and verify the dashboard snapshot,
+    the admin summary block, and the ``/api/timeline`` HTTP surface.
+    The HTTP test uses the same in-process server harness the
+    existing ``/api/admin`` tests use, so the wire format is
+    verified end to end without spawning a real Codex / OpenCode
+    binary.
+    """
+
+    def _seed(self, store: StateStore) -> None:
+        # Mix of info / warning / error severities plus a payload
+        # that contains every dangerous key so we can verify the
+        # public response never forwards them.
+        store.event("r", "T1", "A1", "roadmap.imported", {"tasks": 1})
+        store.event(
+            "r",
+            "T1",
+            "A1",
+            "attempt.started",
+            {"attempt_no": 1},
+        )
+        store.event(
+            "r",
+            "T1",
+            "A1",
+            "attempt.finished",
+            {"exit_code": 0, "head_sha": "deadbeef12345678"},
+        )
+        store.event(
+            "r",
+            "T1",
+            "A1",
+            "task.awaiting_review",
+            {"reviewer": "codex"},
+        )
+        store.event(
+            "r",
+            "T1",
+            "A1",
+            "task.validation_failed",
+            {
+                "failure_category": "validation_failed",
+                "prompt_body": "SECRET-PROMPT-BODY",
+                "stdout_path": "/home/leak/.agentops/runs/r/T/1/executor.stdout.log",
+                "env": {"API_KEY": "sk-leak"},
+            },
+        )
+
+    def test_collect_timeline_snapshot_empty_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            snap = web.collect_timeline_snapshot(store)
+            self.assertEqual(snap["count"], 0)
+            self.assertEqual(snap["rows"], [])
+            self.assertEqual(
+                snap["severity_counts"],
+                {"info": 0, "warning": 0, "error": 0},
+            )
+            self.assertIsNone(snap["latest_error"])
+            self.assertIsNone(snap["latest_warning"])
+            self.assertEqual(snap["filter"], {"roadmap_id": None, "task_id": None})
+            self.assertEqual(snap["limit"], 100)
+            self.assertIn(
+                "Timeline is local-only",
+                " ".join(snap["notes"]),
+            )
+
+    def test_collect_timeline_snapshot_seeded_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            snap = web.collect_timeline_snapshot(store)
+            self.assertEqual(snap["count"], 5)
+            counts = snap["severity_counts"]
+            self.assertGreaterEqual(counts["info"], 2)
+            self.assertGreaterEqual(counts["warning"], 1)
+            self.assertEqual(counts["error"], 1)
+            self.assertIsNotNone(snap["latest_error"])
+            self.assertIsNotNone(snap["latest_warning"])
+            # The earliest event appears first (chronological order).
+            self.assertEqual(snap["rows"][0]["type"], "roadmap.imported")
+            self.assertEqual(snap["rows"][-1]["type"], "task.validation_failed")
+
+    def test_collect_timeline_snapshot_does_not_leak_prompt_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            snap = web.collect_timeline_snapshot(store)
+            serialized = json.dumps(snap, sort_keys=True)
+            self.assertNotIn("SECRET-PROMPT-BODY", serialized)
+            self.assertNotIn("prompt_body", serialized)
+            self.assertNotIn("/home/leak", serialized)
+            self.assertNotIn(".agentops", serialized)
+            self.assertNotIn("sk-leak", serialized)
+
+    def test_collect_timeline_snapshot_handles_corrupt_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            store.event("r", "T", "A1", "task.ready", {"i": 1})
+            # Direct DB poke so the payload_json column holds a
+            # non-JSON string. The collector must never crash.
+            with store.connect() as conn:
+                conn.execute(
+                    "UPDATE events SET payload_json=? WHERE type='task.ready'",
+                    ("not-json-{",),
+                )
+            snap = web.collect_timeline_snapshot(store)
+            self.assertEqual(snap["count"], 1)
+            self.assertEqual(snap["rows"][0]["type"], "task.ready")
+
+    def test_collect_timeline_snapshot_filter_by_roadmap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            store.event("r-a", "T", "A1", "task.ready", {})
+            store.event("r-b", "T", "A1", "task.ready", {})
+            snap = web.collect_timeline_snapshot(store, roadmap_id="r-a")
+            self.assertEqual(snap["count"], 1)
+            self.assertEqual(snap["rows"][0]["roadmap_id"], "r-a")
+
+    def test_collect_timeline_snapshot_filter_by_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            store.event("r", "T1", "A1", "task.ready", {})
+            store.event("r", "T2", "A1", "task.ready", {})
+            snap = web.collect_timeline_snapshot(store, task_id="T2")
+            self.assertEqual(snap["count"], 1)
+            self.assertEqual(snap["rows"][0]["task_id"], "T2")
+
+    def test_collect_timeline_summary_for_admin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            data = web.collect_admin_snapshot(store)
+            summary = data["timeline_summary"]
+            self.assertIn("generated_at", summary)
+            self.assertIn("count", summary)
+            self.assertIn("severity_counts", summary)
+            self.assertIn("latest_event", summary)
+            self.assertIn("latest_error", summary)
+            self.assertIn("latest_warning", summary)
+            self.assertEqual(summary["count"], 5)
+            self.assertEqual(
+                set(summary["severity_counts"].keys()),
+                {"info", "warning", "error"},
+            )
+            self.assertIsNotNone(summary["latest_event"])
+            self.assertIsNotNone(summary["latest_error"])
+
+    def test_admin_snapshot_includes_timeline_summary_for_fresh_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            data = web.collect_admin_snapshot(store)
+            summary = data["timeline_summary"]
+            self.assertEqual(summary["count"], 0)
+            self.assertEqual(
+                summary["severity_counts"],
+                {"info": 0, "warning": 0, "error": 0},
+            )
+            self.assertIsNone(summary["latest_event"])
+            self.assertIsNone(summary["latest_error"])
+            self.assertIsNone(summary["latest_warning"])
+
+    def _server(self, store: StateStore) -> tuple[int, Any, threading.Thread]:
+        port = _free_port()
+        server = web.make_server("127.0.0.1", port, state=store)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return port, server, thread
+
+    def _stop(self, server: Any, thread: threading.Thread) -> None:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    def _http_get(self, port: int, path: str) -> tuple[int, dict[str, Any]]:
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8")
+        finally:
+            conn.close()
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            data = {"error": "invalid JSON"}
+        return resp.status, data
+
+    def test_api_timeline_endpoint_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(port, "/api/timeline")
+            finally:
+                self._stop(server, thread)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["count"], 0)
+            self.assertEqual(data["rows"], [])
+            self.assertEqual(data["limit"], 100)
+
+    def test_api_timeline_endpoint_seeded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            self._seed(store)
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(port, "/api/timeline?limit=10")
+            finally:
+                self._stop(server, thread)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["count"], 5)
+            self.assertEqual(data["limit"], 10)
+            for row in data["rows"]:
+                # Sensitive payload keys MUST NOT leak.
+                self.assertNotIn("payload", row)
+                self.assertNotIn("payload_json", row)
+                self.assertNotIn("prompt_body", row)
+
+    def test_api_timeline_endpoint_respects_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            for i in range(10):
+                store.event("r", f"T{i}", "A1", "task.ready", {"i": i})
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(port, "/api/timeline?limit=3")
+            finally:
+                self._stop(server, thread)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["count"], 3)
+            self.assertEqual(data["limit"], 3)
+
+    def test_api_timeline_endpoint_clamps_limit_high(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            port, server, thread = self._server(store)
+            try:
+                _status, data = self._http_get(port, "/api/timeline?limit=99999")
+            finally:
+                self._stop(server, thread)
+            # Server-side clamp: limit must never exceed 500.
+            self.assertLessEqual(data["limit"], 500)
+
+    def test_api_timeline_endpoint_clamps_limit_low(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            store.event("r", "T", "A1", "task.ready", {})
+            port, server, thread = self._server(store)
+            try:
+                _status, data = self._http_get(port, "/api/timeline?limit=0")
+            finally:
+                self._stop(server, thread)
+            # Server-side clamp: limit must never go below 1.
+            self.assertGreaterEqual(data["limit"], 1)
+
+    def test_api_timeline_endpoint_filter_by_roadmap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            store.event("r-a", "T", "A1", "task.ready", {})
+            store.event("r-b", "T", "A1", "task.ready", {})
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(
+                    port, "/api/timeline?roadmap=r-a"
+                )
+            finally:
+                self._stop(server, thread)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["filter"]["roadmap_id"], "r-a")
+            self.assertEqual(data["count"], 1)
+            self.assertEqual(data["rows"][0]["roadmap_id"], "r-a")
+
+    def test_api_timeline_endpoint_filter_by_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            store.event("r", "T1", "A1", "task.ready", {})
+            store.event("r", "T2", "A1", "task.ready", {})
+            port, server, thread = self._server(store)
+            try:
+                status, data = self._http_get(
+                    port, "/api/timeline?task=T2"
+                )
+            finally:
+                self._stop(server, thread)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["filter"]["task_id"], "T2")
+            self.assertEqual(data["count"], 1)
+            self.assertEqual(data["rows"][0]["task_id"], "T2")
+
+    def test_api_timeline_endpoint_does_not_leak_secret_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            store.event(
+                "r",
+                "T1",
+                "A1",
+                "task.validation_failed",
+                {
+                    "failure_category": "validation_failed",
+                    "prompt_body": "SECRET-PROMPT-BODY",
+                    "api_key": "sk-leak",
+                    "stdout_path": "/home/leak/.agentops/runs/r/T/1/executor.stdout.log",
+                },
+            )
+            port, server, thread = self._server(store)
+            try:
+                _status, data = self._http_get(port, "/api/timeline")
+            finally:
+                self._stop(server, thread)
+            serialized = json.dumps(data, sort_keys=True)
+            for leak in (
+                "SECRET-PROMPT-BODY",
+                "sk-leak",
+                "/home/leak",
+                "prompt_body",
+                "api_key",
+                "stdout_path",
+            ):
+                self.assertNotIn(leak, serialized)
+
+    def test_render_index_html_has_timeline_card(self) -> None:
+        html = web.render_index_html()
+        self.assertIn("Run timeline", html)
+        self.assertIn("/api/timeline", html)
+        self.assertIn("timeline-rows", html)
+        self.assertIn("renderTimeline", html)
+        self.assertIn("timeline-info-count", html)
+        self.assertIn("timeline-warning-count", html)
+        self.assertIn("timeline-error-count", html)
+        self.assertIn("timeline-latest-warning", html)
+        self.assertIn("timeline-latest-error", html)
+        self.assertIn("timeline-empty", html)
+        self.assertIn("timeline-refresh-note", html)
+        # The dashboard must not advertise a generic shell/exec
+        # endpoint; the timeline card must keep its safety
+        # boundary.
+        for forbidden in ("/api/exec", "/api/shell", "/api/command", "/api/run_command"):
+            self.assertNotIn(forbidden, html)
+
+    def test_render_index_html_keeps_legacy_anchors(self) -> None:
+        html = web.render_index_html()
+        # Regression guard: every anchor added by the timeline
+        # card sits beside the existing cards, so every existing
+        # anchor must still render so the dashboard stays
+        # forward-compatible.
+        self.assertIn("AgentOps Local UI", html)
+        self.assertIn("/api/admin", html)
+        self.assertIn("/api/usage", html)
+
+    def test_no_post_route_for_timeline(self) -> None:
+        # The timeline is read-only; POSTing to /api/timeline
+        # must not silently write anything.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite")
+            store.init()
+            port, server, thread = self._server(store)
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    conn.request(
+                        "POST",
+                        "/api/timeline",
+                        body=json.dumps({"oops": True}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    resp = conn.getresponse()
+                    _body = resp.read()
+                finally:
+                    conn.close()
+            finally:
+                self._stop(server, thread)
+            # POST /api/timeline is not a registered handler, so
+            # it falls through to the generic 404.
+            self.assertEqual(resp.status, 404)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1579,6 +1975,7 @@ class AdminSnapshotShapeTests(unittest.TestCase):
         "recommended_commands",
         "diagnostics",
         "usage_summary",
+        "timeline_summary",
     }
 
     def _server(self, store):

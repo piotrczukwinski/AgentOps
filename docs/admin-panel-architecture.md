@@ -234,3 +234,53 @@ A dedicated `GET /api/usage` endpoint exposes the same data
 with optional `?roadmap=` and `?task=` filters; the CLI
 equivalent is `agentops usage [--json] [--limit N]
 [--roadmap ROADMAP_ID] [--task TASK_ID]`.
+
+## 9. Run timeline observability
+
+After the Model usage card, the dashboard renders a third
+**Run timeline** card. It is backed by `GET /api/timeline`
+and is a read-only projection of the SQLite `events` table
+that the durable orchestrator already writes.
+
+The contract is locked by `tests/test_timeline.py` and
+`tests/test_web.py`; see [`docs/observability.md`](observability.md)
+for the full schema. Highlights:
+
+* The endpoint is GET only and is loopback-only.
+* `limit` is clamped server-side to `1..500`; the default is
+  `100`. `roadmap=` and `task=` are AND-ed filters.
+* The response includes `severity_counts`, `latest_error`,
+  `latest_warning`, the projected `rows` list, and a stable
+  `notes` block.
+* A compact `timeline_summary` block (count, severity counts,
+  latest event / latest error / latest warning) is embedded
+  in the `GET /api/admin` snapshot so the operator panel can
+  show the timeline headline without fetching another
+  endpoint.
+* The CLI equivalent is `agentops timeline [--json]
+  [--limit N] [--roadmap ROADMAP_ID] [--task TASK_ID]`.
+  Both surfaces render the same JSON shape so a downstream
+  consumer can switch between them without a conversion.
+
+The timeline is safe by construction:
+
+* The `payload_json` column is never forwarded. Only a short
+  `summary` derived from known payload keys (`exit_code`,
+  `head_sha`, `run_verdict`, `attempt_no`, …) and a copyable
+  `suggested_action` CLI hint are surfaced.
+* Payload keys known to carry prompt bodies, raw logs, env
+  vars, or secrets are explicitly dropped before the summary
+  is built (the drop-list lives in
+  `agentops.timeline.DANGEROUS_PAYLOAD_KEYS`).
+* Path-like keys are dropped too, so the dashboard rendering
+  cannot leak an absolute path on the operator's machine.
+* Suggested actions are copyable text only. Nothing in
+  AgentOps executes the hint on behalf of the operator, and
+  the dashboard never binds the suggested action to a click
+  handler that would run shell.
+* The endpoint never reads files outside the state DB and
+  never invokes subprocesses.
+
+The card auto-refreshes every 3 seconds alongside the rest of
+the dashboard and is empty-safe: a fresh checkout renders an
+"no events recorded yet" hint instead of an error.

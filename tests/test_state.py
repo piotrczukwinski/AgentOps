@@ -129,6 +129,93 @@ class StateTests(unittest.TestCase):
             self.assertEqual(summary["output_tokens"], 20)
             self.assertIsNotNone(summary["latest_started_at"])
 
+    def test_timeline_event_rows_empty_returns_empty_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "state.sqlite")
+            store.init()
+            self.assertEqual(store.timeline_event_rows(), [])
+
+    def test_timeline_event_rows_returns_newest_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "state.sqlite")
+            store.init()
+            store.event("r", "T", "A1", "task.ready", {})
+            store.event("r", "T", "A1", "attempt.started", {"attempt_no": 1})
+            store.event("r", "T", "A1", "attempt.finished", {"exit_code": 0})
+            rows = store.timeline_event_rows()
+            self.assertEqual(len(rows), 3)
+            # Newest-first: attempt.finished has the highest seq.
+            self.assertEqual(rows[0]["type"], "attempt.finished")
+            self.assertEqual(rows[-1]["type"], "task.ready")
+            self.assertGreater(rows[0]["seq"], rows[-1]["seq"])
+
+    def test_timeline_event_rows_filter_by_roadmap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "state.sqlite")
+            store.init()
+            store.event("r-a", "T1", "A1", "task.ready", {})
+            store.event("r-b", "T2", "A1", "task.ready", {})
+            rows = store.timeline_event_rows(roadmap_id="r-a")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["roadmap_id"], "r-a")
+            self.assertEqual(rows[0]["task_id"], "T1")
+
+    def test_timeline_event_rows_filter_by_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "state.sqlite")
+            store.init()
+            store.event("r", "T1", "A1", "task.ready", {})
+            store.event("r", "T2", "A1", "task.ready", {})
+            rows = store.timeline_event_rows(task_id="T2")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["task_id"], "T2")
+
+    def test_timeline_event_rows_filters_and_combined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "state.sqlite")
+            store.init()
+            store.event("r-a", "T1", "A1", "task.ready", {})
+            store.event("r-a", "T2", "A1", "task.ready", {})
+            store.event("r-b", "T1", "A1", "task.ready", {})
+            rows = store.timeline_event_rows(roadmap_id="r-a", task_id="T1")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["roadmap_id"], "r-a")
+            self.assertEqual(rows[0]["task_id"], "T1")
+
+    def test_timeline_event_rows_clamps_invalid_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "state.sqlite")
+            store.init()
+            for index in range(5):
+                store.event("r", f"T{index}", "A1", "task.ready", {"i": index})
+            # Non-int limit falls back to the default 100.
+            self.assertEqual(len(store.timeline_event_rows(limit=None)), 5)
+            # bool is explicitly rejected even though bool is a
+            # subclass of int in Python.
+            self.assertEqual(len(store.timeline_event_rows(limit=True)), 5)
+            # Negative or zero limit is clamped up to 1.
+            rows = store.timeline_event_rows(limit=0)
+            self.assertEqual(len(rows), 1)
+            # Excessive limit is clamped down to 1000.
+            rows = store.timeline_event_rows(limit=10_000)
+            self.assertEqual(len(rows), 5)
+
+    def test_timeline_event_rows_does_not_write_or_alter_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "state.sqlite")
+            store.init()
+            before = store.latest_events(50)
+            _ = store.timeline_event_rows(limit=10)
+            after = store.latest_events(50)
+            self.assertEqual([row["seq"] for row in before], [row["seq"] for row in after])
+
 
 if __name__ == "__main__":
     unittest.main()

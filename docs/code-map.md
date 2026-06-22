@@ -86,6 +86,32 @@ CLI (cli.py)
   A row-level bug can hide a policy violation from the
   dashboard.
 
+## Run timeline
+
+### `agentops/timeline.py` and [`docs/observability.md`](observability.md)
+
+* **Owns:** the pure event-projection layer behind
+  `agentops timeline`, `GET /api/timeline`, the
+  `timeline_summary` block in `GET /api/admin`, and the
+  **Run timeline** card on the local dashboard. Classifies
+  severity (`info` / `warning` / `error`), builds a safe
+  one-line summary per event type, and maps the event to a
+  copyable CLI hint.
+* **Must not own:** state writes, subprocess logic, any
+  file read outside the SQLite DB. The module is pure: no DB
+  access, no file reads, no imports from `web.py` / `cli.py`.
+* **Good first ideas:** add a known-event-type test in
+  `tests/test_timeline.py`; add a per-event-type summary for
+  a new event the orchestrator recently learned to emit;
+  widen the `failure_category` token set if a new
+  orchestrator-side category should map to `error`.
+* **Safety notes:** **yes, primary boundary.** The timeline
+  must never expose raw prompt bodies, raw logs, env vars,
+  secrets, or full local paths. The drop-list for dangerous
+  keys lives in `agentops.timeline.DANGEROUS_PAYLOAD_KEYS`
+  and `agentops.timeline.PATHLIKE_KEYS`; widening them
+  without a test is a safety regression.
+
 ## Usage ledger
 
 ### `agentops/usage.py` and [`docs/usage-ledger.md`](usage-ledger.md)
