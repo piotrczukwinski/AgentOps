@@ -141,7 +141,7 @@ public-release package adds:
 
 The application is honest about these limits (they are
 also in [`README.md`](../../README.md) and the
-Codex-for-OSS prep doc):
+Codex-for-OSS application record):
 
 * Not a kernel / container sandbox.
 * Not a hosted service. No multi-tenant backend, no cloud
