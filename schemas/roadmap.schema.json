@@ -1,0 +1,1504 @@
+{
+  "$defs": {
+    "budget": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "max_review_calls": {
+          "type": "integer"
+        },
+        "max_run_seconds": {
+          "type": "integer"
+        },
+        "max_task_attempts": {
+          "type": "integer"
+        },
+        "max_tasks": {
+          "type": "integer"
+        },
+        "max_total_task_attempts": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "defaults": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "allowed_files": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "auto_commit": {
+          "type": "boolean"
+        },
+        "auto_push": {
+          "type": "boolean"
+        },
+        "branch_prefix": {
+          "type": "string"
+        },
+        "codex_model": {
+          "type": "string"
+        },
+        "codex_model_reasoning_effort": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "codex_risk_threshold": {
+          "type": "integer"
+        },
+        "commit_message": {
+          "type": "string"
+        },
+        "continue_on_blocked": {
+          "type": "boolean"
+        },
+        "depends_on": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "execution_mode": {
+          "enum": [
+            "worktree_branch",
+            "gitless_mirror"
+          ],
+          "type": "string"
+        },
+        "executor": {
+          "enum": [
+            "claude",
+            "claude-minimax",
+            "codex",
+            "opencode",
+            "minimax",
+            "minimax-m3",
+            "shell"
+          ],
+          "type": "string"
+        },
+        "executor_command": {
+          "type": "string"
+        },
+        "executor_options": {
+          "type": "object"
+        },
+        "forbidden_globs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "max_attempts": {
+          "type": "integer"
+        },
+        "max_attempts_per_task": {
+          "type": "integer"
+        },
+        "max_repair_attempts": {
+          "type": "integer"
+        },
+        "max_review_repairs": {
+          "description": "Legacy alias for max_repair_attempts.",
+          "type": "integer"
+        },
+        "max_tasks": {
+          "type": "integer"
+        },
+        "merge_protected_branches": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "merge_strategy": {
+          "enum": [
+            "cherry_pick",
+            "ff",
+            "no_ff"
+          ],
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer"
+        },
+        "reasoning_effort": {
+          "description": "Legacy alias for codex_model_reasoning_effort.",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "require_clean_validations": {
+          "type": "boolean"
+        },
+        "require_executor_result": {
+          "type": "boolean"
+        },
+        "require_safe_to_merge": {
+          "type": "boolean"
+        },
+        "review": {
+          "oneOf": [
+            {
+              "enum": [
+                "auto",
+                "required",
+                "never",
+                "milestone_only"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "patternProperties": {
+                "^x_": true
+              },
+              "properties": {
+                "codex": {
+                  "enum": [
+                    "auto",
+                    "required",
+                    "never",
+                    "milestone_only"
+                  ],
+                  "type": "string"
+                },
+                "default_mode": {
+                  "description": "Legacy alias for codex. Prefer codex or mode.",
+                  "enum": [
+                    "auto",
+                    "required",
+                    "never",
+                    "milestone_only"
+                  ],
+                  "type": "string"
+                },
+                "fallback_heuristic": {
+                  "type": "boolean"
+                },
+                "mode": {
+                  "enum": [
+                    "auto",
+                    "required",
+                    "never",
+                    "milestone_only"
+                  ],
+                  "type": "string"
+                },
+                "model": {
+                  "description": "Codex model id.",
+                  "type": "string"
+                },
+                "model_reasoning_effort": {
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "type": "string"
+                },
+                "reasoning_effort": {
+                  "description": "Legacy alias for model_reasoning_effort.",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "type": "string"
+                },
+                "reviewer": {
+                  "enum": [
+                    "codex",
+                    "heuristic"
+                  ],
+                  "type": "string"
+                },
+                "risk_threshold": {
+                  "type": "integer"
+                },
+                "schema": {
+                  "type": "string"
+                },
+                "schema_path": {
+                  "type": "string"
+                },
+                "self_fix": {
+                  "type": "boolean"
+                },
+                "self_fix_max_lines": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            }
+          ]
+        },
+        "review_default_mode": {
+          "description": "Legacy alias for review.codex / review.mode.",
+          "enum": [
+            "auto",
+            "required",
+            "never",
+            "milestone_only"
+          ],
+          "type": "string"
+        },
+        "review_fallback_heuristic": {
+          "type": "boolean"
+        },
+        "review_policy": {
+          "description": "Legacy alias for review.codex / review.mode.",
+          "enum": [
+            "auto",
+            "required",
+            "never",
+            "milestone_only"
+          ],
+          "type": "string"
+        },
+        "review_self_fix": {
+          "type": "boolean"
+        },
+        "review_self_fix_max_lines": {
+          "type": "integer"
+        },
+        "reviewer": {
+          "enum": [
+            "codex",
+            "heuristic"
+          ],
+          "type": "string"
+        },
+        "risk": {
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "type": "integer"
+        },
+        "validations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "merge_policy": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "auto_merge": {
+          "type": "boolean"
+        },
+        "protected_branches": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "require_clean_validations": {
+          "type": "boolean"
+        },
+        "require_safe_to_merge": {
+          "type": "boolean"
+        },
+        "strategy": {
+          "enum": [
+            "cherry_pick",
+            "ff",
+            "no_ff"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "policies": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "forbidden_branches": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "forbidden_globs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "repo": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "base_branch": {
+          "description": "Base branch (defaults to HEAD).",
+          "type": "string"
+        },
+        "id": {
+          "description": "Repo identifier (defaults to path basename).",
+          "type": "string"
+        },
+        "integration_branch": {
+          "description": "Stable merge branch.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Filesystem path to the repo.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "review": {
+      "oneOf": [
+        {
+          "enum": [
+            "auto",
+            "required",
+            "never",
+            "milestone_only"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x_": true
+          },
+          "properties": {
+            "codex": {
+              "enum": [
+                "auto",
+                "required",
+                "never",
+                "milestone_only"
+              ],
+              "type": "string"
+            },
+            "default_mode": {
+              "description": "Legacy alias for codex. Prefer codex or mode.",
+              "enum": [
+                "auto",
+                "required",
+                "never",
+                "milestone_only"
+              ],
+              "type": "string"
+            },
+            "fallback_heuristic": {
+              "type": "boolean"
+            },
+            "mode": {
+              "enum": [
+                "auto",
+                "required",
+                "never",
+                "milestone_only"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "description": "Codex model id.",
+              "type": "string"
+            },
+            "model_reasoning_effort": {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            "reasoning_effort": {
+              "description": "Legacy alias for model_reasoning_effort.",
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            "reviewer": {
+              "enum": [
+                "codex",
+                "heuristic"
+              ],
+              "type": "string"
+            },
+            "risk_threshold": {
+              "type": "integer"
+            },
+            "schema": {
+              "type": "string"
+            },
+            "schema_path": {
+              "type": "string"
+            },
+            "self_fix": {
+              "type": "boolean"
+            },
+            "self_fix_max_lines": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "runtime_budget": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "max_codex_calls": {
+          "type": "integer"
+        },
+        "max_codex_input_tokens": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "string_array": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "task": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "allowed_files": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "auto_commit": {
+          "type": "boolean"
+        },
+        "auto_push": {
+          "type": "boolean"
+        },
+        "branch_prefix": {
+          "type": "string"
+        },
+        "commit_message": {
+          "type": "string"
+        },
+        "depends_on": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "execution_mode": {
+          "enum": [
+            "worktree_branch",
+            "gitless_mirror"
+          ],
+          "type": "string"
+        },
+        "executor": {
+          "enum": [
+            "claude",
+            "claude-minimax",
+            "codex",
+            "opencode",
+            "minimax",
+            "minimax-m3",
+            "shell"
+          ],
+          "type": "string"
+        },
+        "executor_command": {
+          "type": "string"
+        },
+        "executor_options": {
+          "description": "Provider-specific executor options. Keys are not constrained here so executor implementations can evolve.",
+          "type": "object"
+        },
+        "forbidden_globs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "description": "Stable task id (required, unique).",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "max_attempts": {
+          "type": "integer"
+        },
+        "max_repair_attempts": {
+          "type": "integer"
+        },
+        "max_review_repairs": {
+          "description": "Legacy alias for max_repair_attempts.",
+          "type": "integer"
+        },
+        "model": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer"
+        },
+        "prompt": {
+          "description": "Path to the task prompt file.",
+          "type": "string"
+        },
+        "require_executor_result": {
+          "type": "boolean"
+        },
+        "review": {
+          "oneOf": [
+            {
+              "enum": [
+                "auto",
+                "required",
+                "never",
+                "milestone_only"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "patternProperties": {
+                "^x_": true
+              },
+              "properties": {
+                "codex": {
+                  "enum": [
+                    "auto",
+                    "required",
+                    "never",
+                    "milestone_only"
+                  ],
+                  "type": "string"
+                },
+                "default_mode": {
+                  "description": "Legacy alias for codex. Prefer codex or mode.",
+                  "enum": [
+                    "auto",
+                    "required",
+                    "never",
+                    "milestone_only"
+                  ],
+                  "type": "string"
+                },
+                "fallback_heuristic": {
+                  "type": "boolean"
+                },
+                "mode": {
+                  "enum": [
+                    "auto",
+                    "required",
+                    "never",
+                    "milestone_only"
+                  ],
+                  "type": "string"
+                },
+                "model": {
+                  "description": "Codex model id.",
+                  "type": "string"
+                },
+                "model_reasoning_effort": {
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "type": "string"
+                },
+                "reasoning_effort": {
+                  "description": "Legacy alias for model_reasoning_effort.",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "type": "string"
+                },
+                "reviewer": {
+                  "enum": [
+                    "codex",
+                    "heuristic"
+                  ],
+                  "type": "string"
+                },
+                "risk_threshold": {
+                  "type": "integer"
+                },
+                "schema": {
+                  "type": "string"
+                },
+                "schema_path": {
+                  "type": "string"
+                },
+                "self_fix": {
+                  "type": "boolean"
+                },
+                "self_fix_max_lines": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            }
+          ]
+        },
+        "review_policy": {
+          "description": "Legacy alias for review.codex / review.mode.",
+          "enum": [
+            "auto",
+            "required",
+            "never",
+            "milestone_only"
+          ],
+          "type": "string"
+        },
+        "risk": {
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "type": "integer"
+        },
+        "validations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "prompt"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/piotrczukwinski/AgentOps/main/schemas/roadmap.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Public editor / CI contract for AgentOps roadmap files. The internal validator (agentops.roadmap_schema) implements the same rules in stdlib Python so the schema file and the loader cannot drift. Semantic checks (repo existence, prompt file, dependency graph, git state) are NOT covered here; they are owned by `agentops plan` and are not part of the structural schema.",
+  "patternProperties": {
+    "^x_": true
+  },
+  "properties": {
+    "base_branch": {
+      "type": "string"
+    },
+    "budget": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "max_review_calls": {
+          "type": "integer"
+        },
+        "max_run_seconds": {
+          "type": "integer"
+        },
+        "max_task_attempts": {
+          "type": "integer"
+        },
+        "max_tasks": {
+          "type": "integer"
+        },
+        "max_total_task_attempts": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "continue_on_blocked": {
+      "type": "boolean"
+    },
+    "defaults": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "allowed_files": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "auto_commit": {
+          "type": "boolean"
+        },
+        "auto_push": {
+          "type": "boolean"
+        },
+        "branch_prefix": {
+          "type": "string"
+        },
+        "codex_model": {
+          "type": "string"
+        },
+        "codex_model_reasoning_effort": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "codex_risk_threshold": {
+          "type": "integer"
+        },
+        "commit_message": {
+          "type": "string"
+        },
+        "continue_on_blocked": {
+          "type": "boolean"
+        },
+        "depends_on": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "execution_mode": {
+          "enum": [
+            "worktree_branch",
+            "gitless_mirror"
+          ],
+          "type": "string"
+        },
+        "executor": {
+          "enum": [
+            "claude",
+            "claude-minimax",
+            "codex",
+            "opencode",
+            "minimax",
+            "minimax-m3",
+            "shell"
+          ],
+          "type": "string"
+        },
+        "executor_command": {
+          "type": "string"
+        },
+        "executor_options": {
+          "type": "object"
+        },
+        "forbidden_globs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "max_attempts": {
+          "type": "integer"
+        },
+        "max_attempts_per_task": {
+          "type": "integer"
+        },
+        "max_repair_attempts": {
+          "type": "integer"
+        },
+        "max_review_repairs": {
+          "description": "Legacy alias for max_repair_attempts.",
+          "type": "integer"
+        },
+        "max_tasks": {
+          "type": "integer"
+        },
+        "merge_protected_branches": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "merge_strategy": {
+          "enum": [
+            "cherry_pick",
+            "ff",
+            "no_ff"
+          ],
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer"
+        },
+        "reasoning_effort": {
+          "description": "Legacy alias for codex_model_reasoning_effort.",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "require_clean_validations": {
+          "type": "boolean"
+        },
+        "require_executor_result": {
+          "type": "boolean"
+        },
+        "require_safe_to_merge": {
+          "type": "boolean"
+        },
+        "review": {
+          "oneOf": [
+            {
+              "enum": [
+                "auto",
+                "required",
+                "never",
+                "milestone_only"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "patternProperties": {
+                "^x_": true
+              },
+              "properties": {
+                "codex": {
+                  "enum": [
+                    "auto",
+                    "required",
+                    "never",
+                    "milestone_only"
+                  ],
+                  "type": "string"
+                },
+                "default_mode": {
+                  "description": "Legacy alias for codex. Prefer codex or mode.",
+                  "enum": [
+                    "auto",
+                    "required",
+                    "never",
+                    "milestone_only"
+                  ],
+                  "type": "string"
+                },
+                "fallback_heuristic": {
+                  "type": "boolean"
+                },
+                "mode": {
+                  "enum": [
+                    "auto",
+                    "required",
+                    "never",
+                    "milestone_only"
+                  ],
+                  "type": "string"
+                },
+                "model": {
+                  "description": "Codex model id.",
+                  "type": "string"
+                },
+                "model_reasoning_effort": {
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "type": "string"
+                },
+                "reasoning_effort": {
+                  "description": "Legacy alias for model_reasoning_effort.",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "type": "string"
+                },
+                "reviewer": {
+                  "enum": [
+                    "codex",
+                    "heuristic"
+                  ],
+                  "type": "string"
+                },
+                "risk_threshold": {
+                  "type": "integer"
+                },
+                "schema": {
+                  "type": "string"
+                },
+                "schema_path": {
+                  "type": "string"
+                },
+                "self_fix": {
+                  "type": "boolean"
+                },
+                "self_fix_max_lines": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            }
+          ]
+        },
+        "review_default_mode": {
+          "description": "Legacy alias for review.codex / review.mode.",
+          "enum": [
+            "auto",
+            "required",
+            "never",
+            "milestone_only"
+          ],
+          "type": "string"
+        },
+        "review_fallback_heuristic": {
+          "type": "boolean"
+        },
+        "review_policy": {
+          "description": "Legacy alias for review.codex / review.mode.",
+          "enum": [
+            "auto",
+            "required",
+            "never",
+            "milestone_only"
+          ],
+          "type": "string"
+        },
+        "review_self_fix": {
+          "type": "boolean"
+        },
+        "review_self_fix_max_lines": {
+          "type": "integer"
+        },
+        "reviewer": {
+          "enum": [
+            "codex",
+            "heuristic"
+          ],
+          "type": "string"
+        },
+        "risk": {
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "type": "integer"
+        },
+        "validations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "integration_branch": {
+      "type": "string"
+    },
+    "max_attempts_per_task": {
+      "type": "integer"
+    },
+    "max_repair_attempts": {
+      "description": "Default total executor attempts per task (initial + repair).",
+      "type": "integer"
+    },
+    "max_review_repairs": {
+      "description": "Legacy alias for max_repair_attempts.",
+      "type": "integer"
+    },
+    "max_tasks": {
+      "type": "integer"
+    },
+    "merge_policy": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "auto_merge": {
+          "type": "boolean"
+        },
+        "protected_branches": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "require_clean_validations": {
+          "type": "boolean"
+        },
+        "require_safe_to_merge": {
+          "type": "boolean"
+        },
+        "strategy": {
+          "enum": [
+            "cherry_pick",
+            "ff",
+            "no_ff"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "policies": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "forbidden_branches": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "forbidden_globs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "repo": {
+      "oneOf": [
+        {
+          "description": "Filesystem path to the repo.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x_": true
+          },
+          "properties": {
+            "base_branch": {
+              "description": "Base branch (defaults to HEAD).",
+              "type": "string"
+            },
+            "id": {
+              "description": "Repo identifier (defaults to path basename).",
+              "type": "string"
+            },
+            "integration_branch": {
+              "description": "Stable merge branch.",
+              "type": "string"
+            },
+            "path": {
+              "description": "Filesystem path to the repo.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "review": {
+      "oneOf": [
+        {
+          "enum": [
+            "auto",
+            "required",
+            "never",
+            "milestone_only"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x_": true
+          },
+          "properties": {
+            "codex": {
+              "enum": [
+                "auto",
+                "required",
+                "never",
+                "milestone_only"
+              ],
+              "type": "string"
+            },
+            "default_mode": {
+              "description": "Legacy alias for codex. Prefer codex or mode.",
+              "enum": [
+                "auto",
+                "required",
+                "never",
+                "milestone_only"
+              ],
+              "type": "string"
+            },
+            "fallback_heuristic": {
+              "type": "boolean"
+            },
+            "mode": {
+              "enum": [
+                "auto",
+                "required",
+                "never",
+                "milestone_only"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "description": "Codex model id.",
+              "type": "string"
+            },
+            "model_reasoning_effort": {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            "reasoning_effort": {
+              "description": "Legacy alias for model_reasoning_effort.",
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            "reviewer": {
+              "enum": [
+                "codex",
+                "heuristic"
+              ],
+              "type": "string"
+            },
+            "risk_threshold": {
+              "type": "integer"
+            },
+            "schema": {
+              "type": "string"
+            },
+            "schema_path": {
+              "type": "string"
+            },
+            "self_fix": {
+              "type": "boolean"
+            },
+            "self_fix_max_lines": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "reviewer": {
+      "enum": [
+        "codex",
+        "heuristic"
+      ],
+      "type": "string"
+    },
+    "roadmap_id": {
+      "type": "string"
+    },
+    "runtime_budget": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x_": true
+      },
+      "properties": {
+        "max_codex_calls": {
+          "type": "integer"
+        },
+        "max_codex_input_tokens": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "tasks": {
+      "items": {
+        "additionalProperties": false,
+        "patternProperties": {
+          "^x_": true
+        },
+        "properties": {
+          "allowed_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "auto_commit": {
+            "type": "boolean"
+          },
+          "auto_push": {
+            "type": "boolean"
+          },
+          "branch_prefix": {
+            "type": "string"
+          },
+          "commit_message": {
+            "type": "string"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "execution_mode": {
+            "enum": [
+              "worktree_branch",
+              "gitless_mirror"
+            ],
+            "type": "string"
+          },
+          "executor": {
+            "enum": [
+              "claude",
+              "claude-minimax",
+              "codex",
+              "opencode",
+              "minimax",
+              "minimax-m3",
+              "shell"
+            ],
+            "type": "string"
+          },
+          "executor_command": {
+            "type": "string"
+          },
+          "executor_options": {
+            "description": "Provider-specific executor options. Keys are not constrained here so executor implementations can evolve.",
+            "type": "object"
+          },
+          "forbidden_globs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "description": "Stable task id (required, unique).",
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "max_attempts": {
+            "type": "integer"
+          },
+          "max_repair_attempts": {
+            "type": "integer"
+          },
+          "max_review_repairs": {
+            "description": "Legacy alias for max_repair_attempts.",
+            "type": "integer"
+          },
+          "model": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "prompt": {
+            "description": "Path to the task prompt file.",
+            "type": "string"
+          },
+          "require_executor_result": {
+            "type": "boolean"
+          },
+          "review": {
+            "oneOf": [
+              {
+                "enum": [
+                  "auto",
+                  "required",
+                  "never",
+                  "milestone_only"
+                ],
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "patternProperties": {
+                  "^x_": true
+                },
+                "properties": {
+                  "codex": {
+                    "enum": [
+                      "auto",
+                      "required",
+                      "never",
+                      "milestone_only"
+                    ],
+                    "type": "string"
+                  },
+                  "default_mode": {
+                    "description": "Legacy alias for codex. Prefer codex or mode.",
+                    "enum": [
+                      "auto",
+                      "required",
+                      "never",
+                      "milestone_only"
+                    ],
+                    "type": "string"
+                  },
+                  "fallback_heuristic": {
+                    "type": "boolean"
+                  },
+                  "mode": {
+                    "enum": [
+                      "auto",
+                      "required",
+                      "never",
+                      "milestone_only"
+                    ],
+                    "type": "string"
+                  },
+                  "model": {
+                    "description": "Codex model id.",
+                    "type": "string"
+                  },
+                  "model_reasoning_effort": {
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high"
+                    ],
+                    "type": "string"
+                  },
+                  "reasoning_effort": {
+                    "description": "Legacy alias for model_reasoning_effort.",
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high"
+                    ],
+                    "type": "string"
+                  },
+                  "reviewer": {
+                    "enum": [
+                      "codex",
+                      "heuristic"
+                    ],
+                    "type": "string"
+                  },
+                  "risk_threshold": {
+                    "type": "integer"
+                  },
+                  "schema": {
+                    "type": "string"
+                  },
+                  "schema_path": {
+                    "type": "string"
+                  },
+                  "self_fix": {
+                    "type": "boolean"
+                  },
+                  "self_fix_max_lines": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            ]
+          },
+          "review_policy": {
+            "description": "Legacy alias for review.codex / review.mode.",
+            "enum": [
+              "auto",
+              "required",
+              "never",
+              "milestone_only"
+            ],
+            "type": "string"
+          },
+          "risk": {
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "type": "integer"
+          },
+          "validations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "version": {
+      "description": "Schema version (always 1 today).",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "repo",
+    "tasks"
+  ],
+  "title": "AgentOps Roadmap",
+  "type": "object"
+}

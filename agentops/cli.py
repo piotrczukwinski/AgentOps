@@ -245,6 +245,38 @@ def build_parser() -> argparse.ArgumentParser:
     plan = sub.add_parser("plan", help="Lint a roadmap file without running it. Does not call models or create worktrees.")
     plan.add_argument("--roadmap", required=True, help="Path to roadmap JSON/YAML file.")
     plan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+    plan.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Fail on unknown roadmap keys and type/enum mismatches before "
+            "semantic linting. Equivalent to passing strict=True to "
+            "agentops.plan.lint_roadmap / agentops.config.load_roadmap. "
+            "Default: off (legacy non-strict lint)."
+        ),
+    )
+
+    schema_cmd = sub.add_parser(
+        "schema",
+        help="Print the AgentOps roadmap JSON Schema path and document.",
+        description=(
+            "Print information about the checked-in AgentOps roadmap JSON "
+            "Schema (schemas/roadmap.schema.json). Use --path to print the "
+            "absolute path, --json to print the schema document, or no "
+            "arguments to print a short human summary. The command does "
+            "not perform network calls and does not write any files."
+        ),
+    )
+    schema_cmd.add_argument(
+        "--path",
+        action="store_true",
+        help="Print the absolute path to schemas/roadmap.schema.json and exit.",
+    )
+    schema_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full JSON Schema document and exit.",
+    )
 
     sub.add_parser("doctor", help="Check local dependencies.")
 
@@ -809,7 +841,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_timeline(state, args)
 
         if args.command == "plan":
-            return _cmd_plan(args.roadmap, args.json)
+            return _cmd_plan(args.roadmap, args.json, strict=args.strict)
+
+        if args.command == "schema":
+            return _cmd_schema(args)
 
         if args.command == "doctor":
             return _cmd_doctor()
@@ -1290,8 +1325,8 @@ def _cmd_review_queue(state: StateStore, roadmap_id: str | None) -> int:
     return 0
 
 
-def _cmd_plan(roadmap_path: str, as_json: bool) -> int:
-    report = lint_roadmap(roadmap_path)
+def _cmd_plan(roadmap_path: str, as_json: bool, *, strict: bool = False) -> int:
+    report = lint_roadmap(roadmap_path, strict=strict)
     if as_json:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     else:
@@ -1300,7 +1335,9 @@ def _cmd_plan(roadmap_path: str, as_json: bool) -> int:
 
 
 def _print_plan_report(report: PlanReport) -> None:
+    strict_label = "Strict schema validation: enabled" if report.strict else "Strict schema validation: disabled"
     print(f"Plan for {report.roadmap_path}  (roadmap_id={report.roadmap_id})")
+    print(f"  {strict_label}")
     if not report.issues:
         print("  OK - no issues found.")
         return
@@ -1311,6 +1348,30 @@ def _print_plan_report(report: PlanReport) -> None:
         elif issue.path:
             target = f" path={issue.path}"
         print(f"  [{issue.severity}] {issue.code}{target}: {issue.message}")
+
+
+def _cmd_schema(args: argparse.Namespace) -> int:
+    from .roadmap_schema import (
+        checked_in_schema_path,
+        load_checked_in_schema,
+        roadmap_schema_document,
+    )
+
+    path = checked_in_schema_path()
+    if getattr(args, "path", False):
+        print(str(path))
+        return 0
+    if getattr(args, "json", False):
+        doc = roadmap_schema_document()
+        print(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    # Also accept --path-only if anyone sets it via the JSON branch.
+    print(f"AgentOps roadmap JSON Schema: {path}")
+    print("Use: agentops schema --json > roadmap.schema.json")
+    # Touch load_checked_in_schema so the helper stays referenced; the JSON
+    # subcommand also exercises it through roadmap_schema_document().
+    del load_checked_in_schema
+    return 0
 
 
 def _cmd_doctor() -> int:

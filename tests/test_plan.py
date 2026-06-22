@@ -397,7 +397,103 @@ class PlanLintTests(unittest.TestCase):
         self.assertIn("ok", data)
         self.assertIn("errors", data)
         self.assertIn("warnings", data)
+        self.assertIn("strict", data)
+        self.assertFalse(data["strict"])
         json.dumps(data)  # must be JSON-serializable
+
+    def test_strict_lint_reports_schema_errors_before_semantic_checks(self) -> None:
+        repo = _init_repo(self.root)
+        prompt = _write_prompt(self.root)
+        roadmap_path = self.root / "r.json"
+        roadmap_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "repo": {"id": "x", "path": str(repo)},
+                    "weird_key": 1,
+                    "tasks": [
+                        {
+                            "id": "T1",
+                            "prompt": str(prompt),
+                            "executor": "weird",
+                            "allowed_files": ["a.txt"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        report = lint_roadmap(roadmap_path, strict=True)
+        codes = {issue.code for issue in report.issues}
+        # Schema errors fire before semantic checks (unknown_key, not
+        # task.executor_unknown). The semantic lint would also have flagged
+        # executor_unknown but the schema check short-circuits it.
+        self.assertIn("schema.unknown_key", codes)
+        self.assertNotIn("task.executor_unknown", codes)
+
+    def test_strict_lint_includes_schema_warnings(self) -> None:
+        repo = _init_repo(self.root)
+        prompt = _write_prompt(self.root)
+        roadmap_path = self.root / "r.json"
+        roadmap_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "repo": {"id": "x", "path": str(repo)},
+                    "max_review_repairs": 3,
+                    "tasks": [
+                        {
+                            "id": "T1",
+                            "prompt": str(prompt),
+                            "executor": "shell",
+                            "executor_command": "true",
+                            "branch_prefix": "agentops",
+                            "allowed_files": ["a.txt"],
+                            "review": {"codex": "never"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        report = lint_roadmap(roadmap_path, strict=True)
+        self.assertTrue(report.ok)
+        # Warnings live on ``report.warnings`` (legacy alias warning), and
+        # they are also projected into ``to_dict()["warnings"]``.
+        codes = {issue.code for issue in report.warnings}
+        self.assertIn("schema.legacy_alias", codes)
+        data = report.to_dict()
+        warning_codes = {w["code"] for w in data["warnings"]}
+        self.assertIn("schema.legacy_alias", warning_codes)
+
+    def test_plan_report_to_dict_includes_strict(self) -> None:
+        repo = _init_repo(self.root)
+        prompt = _write_prompt(self.root)
+        roadmap_path = self.root / "r.json"
+        roadmap_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "repo": {"id": "x", "path": str(repo)},
+                    "tasks": [
+                        {
+                            "id": "T1",
+                            "prompt": str(prompt),
+                            "executor": "shell",
+                            "executor_command": "true",
+                            "branch_prefix": "agentops",
+                            "allowed_files": ["a.txt"],
+                            "review": {"codex": "never"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        report = lint_roadmap(roadmap_path, strict=True)
+        data = report.to_dict()
+        self.assertTrue(data["strict"])
+        self.assertTrue(data["ok"])
 
 
 if __name__ == "__main__":
