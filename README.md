@@ -485,6 +485,13 @@ tests/
 * [`docs/gated-roadmap-runner.md`](docs/gated-roadmap-runner.md)
   — verdict schema, repair loop, and the integration-branch
   merge gate.
+* [`docs/model-profile-registry.md`](docs/model-profile-registry.md)
+  — the typed model / profile registry (issue #52): decouples
+  model, transport, and role. Documents the executor and
+  reviewer profile examples, the security rules, the
+  precedence, the migration guide, and the troubleshooting
+  recipes. Companion to `agentops profiles validate|show|resolve`
+  and to the executor / reviewer dropdowns in the admin panel.
 
 ### Run, triage, and operations
 

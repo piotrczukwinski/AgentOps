@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "profiles": {
+    "executors": {
+      "minimax-via-codex": {
+        "provider": "codex_cli",
+        "profile": "minimax",
+        "model": "MiniMax-M3",
+        "reasoning_effort": "medium",
+        "command_template": [
+          "codex",
+          "exec",
+          "-p",
+          "{profile}",
+          "--dangerously-bypass-approvals-and-sandbox",
+          "-C",
+          "{cwd}",
+          "{prompt_file}"
+        ],
+        "timeout_seconds": 5400
+      },
+      "minimax-via-opencode": {
+        "provider": "opencode",
+        "model": "minimax/MiniMax-M3",
+        "timeout_seconds": 5400
+      }
+    },
+    "reviewers": {
+      "codex-high": {
+        "provider": "codex_cli",
+        "profile": "default",
+        "reasoning_effort": "high"
+      },
+      "heuristic": {
+        "provider": "heuristic"
+      }
+    }
+  }
+}

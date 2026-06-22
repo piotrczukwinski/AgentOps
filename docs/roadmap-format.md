@@ -123,8 +123,10 @@ Unknown top-level keys are errors in strict mode.
 | `prompt` | string | **yes** | Path to the task prompt file. |
 | `risk` | integer | no | 1..5; Codex auto-review defaults to threshold 4. |
 | `priority` | integer | no | Lower runs first; default `100`. |
-| `executor` | string | no | One of `claude`, `claude-minimax`, `codex`, `opencode`, `minimax`, `minimax-m3`, `shell`. |
-| `model` | string | no | OpenCode model id, for example `minimax/MiniMax-M3`. |
+| `executor` | string | no | One of `claude`, `claude-minimax`, `codex`, `codex_cli`, `opencode`, `minimax`, `minimax-m3`, `shell`. `codex_cli` is the profile-registry driven Codex CLI executor (issue #52). |
+| `model` | string | no | OpenCode model id, for example `minimax/MiniMax-M3`. Ignored when `executor_profile` selects a profile from the registry. |
+| `executor_profile` | string | no | Profile name from the resolved profile registry. When set, the runner honours the profile's `provider` / `command_template` / `model` instead of the legacy `executor` / `model` fields. Resolution order: CLI override > task > roadmap/default > registry > legacy. See [`docs/model-profile-registry.md`](model-profile-registry.md). |
+| `executor_reasoning_effort` | string | no | `low`, `medium`, or `high`. Overrides the profile's reasoning effort for the executor side. |
 | `execution_mode` | string | no | `worktree_branch` or `gitless_mirror`. |
 | `branch_prefix` | string | no | Worktree branch prefix; defaults to `agentops`. |
 | `allowed_files` | array of strings | no (yes for write tasks) | Explicit allow-list / glob list. |
@@ -355,3 +357,28 @@ The checked-in schema is byte-equal to
 `agentops.roadmap_schema.roadmap_schema_document()`; this is
 guaranteed by
 `tests/test_roadmap_schema.py::SchemaDocumentTests::test_checked_in_schema_matches_generated_schema`.
+
+
+## Profile registry (issue #52)
+
+New roadmaps can opt into the typed profile registry by setting any
+of these top-level / task / defaults fields:
+
+| Field                              | Level   | Effect                                                  |
+|------------------------------------|---------|---------------------------------------------------------|
+| `profiles_path`                    | roadmap | Path to a profile registry JSON file. Relative paths resolve against the roadmap's directory. |
+| `defaults.executor_profile`        | roadmap | Default executor profile (inherited by every task).     |
+| `defaults.executor_reasoning_effort` | roadmap | Default executor reasoning effort (`low` / `medium` / `high`). |
+| `defaults.reviewer_profile`        | roadmap | Default reviewer profile.                              |
+| `task.executor_profile`            | task    | Per-task executor profile override.                    |
+| `task.executor_reasoning_effort`   | task    | Per-task executor reasoning effort override.           |
+| `task.review.profile`              | task    | Per-task reviewer profile.                             |
+| `task.review.reasoning_effort`     | task    | Per-task reviewer reasoning effort (alias of `model_reasoning_effort`). |
+
+When none of these are set, the resolver uses the legacy
+`executor` / `model` / `review.codex_model` /
+`AGENTOPS_CODEX_MODEL` env var fallback. The legacy fields keep
+working unchanged. See
+[`docs/model-profile-registry.md`](model-profile-registry.md) for
+the full precedence, the validation rules, and the migration
+guide.

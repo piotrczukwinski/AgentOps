@@ -174,6 +174,11 @@ def build_run_command(
     db_path: str | Path | None = None,
     python_executable: str | None = None,
     resume: bool = False,
+    profiles_path: str | None = None,
+    executor_profile: str | None = None,
+    executor_reasoning_effort: str | None = None,
+    reviewer_profile: str | None = None,
+    reviewer_reasoning_effort: str | None = None,
 ) -> list[str]:
     """Build the controlled subprocess argv used by /api/run.
 
@@ -199,6 +204,15 @@ def build_run_command(
       ``run`` invocation always starts fresh. The web UI passes ``resume``
       only when the operator explicitly opts in via the
       ``roadmap-resume`` checkbox (issue #45).
+    * ``profiles_path`` (str, optional) — appends ``--profiles <value>`` when
+      a non-empty string is passed (issue #52). The web layer validates the
+      value against the profile-name regex before calling this helper.
+    * ``executor_profile`` / ``executor_reasoning_effort`` /
+      ``reviewer_profile`` / ``reviewer_reasoning_effort`` (str, optional) —
+      append ``--<role>-profile <value>`` and ``--<role>-reasoning-effort
+      <value>`` when non-empty. Reasoning values are restricted to
+      ``low|medium|high``; the web layer validates them before this helper
+      is called.
     """
     resolved = validate_roadmap_path(str(roadmap_path))
     py = python_executable or sys.executable
@@ -219,6 +233,16 @@ def build_run_command(
         and max_tasks > 0
     ):
         argv.extend(["--max-tasks", str(int(max_tasks))])
+    if isinstance(profiles_path, str) and profiles_path:
+        argv.extend(["--profiles", profiles_path])
+    if isinstance(executor_profile, str) and executor_profile:
+        argv.extend(["--executor-profile", executor_profile])
+    if isinstance(executor_reasoning_effort, str) and executor_reasoning_effort:
+        argv.extend(["--executor-reasoning-effort", executor_reasoning_effort])
+    if isinstance(reviewer_profile, str) and reviewer_profile:
+        argv.extend(["--reviewer-profile", reviewer_profile])
+    if isinstance(reviewer_reasoning_effort, str) and reviewer_reasoning_effort:
+        argv.extend(["--reviewer-reasoning-effort", reviewer_reasoning_effort])
     if resume:
         argv.append("--resume")
     return argv
@@ -2572,6 +2596,9 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/reliability":
             self._handle_reliability(query)
             return
+        if path == "/api/profiles":
+            self._handle_profiles(query)
+            return
 
         self._send_json({"error": f"not found: {path}"}, status=404)
 
@@ -2600,6 +2627,9 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/run":
             self._handle_run(payload)
+            return
+        if path == "/api/profiles/resolve":
+            self._handle_profiles_resolve(payload)
             return
         self._send_json({"error": f"not found: {path}"}, status=404)
 
@@ -2682,6 +2712,180 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             limit=limit,
         )
         self._send_json(snapshot)
+
+    def _handle_profiles(self, query: dict) -> None:
+        """Serve ``GET /api/profiles``.
+
+        Returns the executor/reviewer profiles from the resolved
+        registry. Never includes secret-shaped fields. Optional
+        query parameters:
+
+        * ``profiles_path`` — explicit registry path (highest
+          priority). The web layer validates the path against the
+          standard allowlist before resolving the registry.
+        * ``roadmap`` — when set, the function uses the roadmap's
+          ``profiles_path`` to locate the registry. Useful for the
+          admin panel's per-roadmap selector.
+        * ``repo`` — when set, the function uses the repo's
+          ``.agentops/profiles.json`` as a fallback.
+
+        The response is always JSON. ``valid`` is ``True`` when
+        every profile passed validation; ``issues`` lists the
+        non-fatal warnings.
+        """
+        from .profiles import (
+            ProfileRegistryError,
+            builtin_profile_registry,
+            find_profile_registry,
+        )
+        profiles_path = (query.get("profiles_path") or [None])[0]
+        roadmap_raw = (query.get("roadmap") or [None])[0]
+        repo_raw = (query.get("repo") or [None])[0]
+        if profiles_path and isinstance(profiles_path, str):
+            try:
+                registry = _safe_load_profile_registry(profiles_path)
+            except ProfileRegistryError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+        else:
+            registry = find_profile_registry(
+                explicit_path=None,
+                roadmap_path=roadmap_raw if isinstance(roadmap_raw, str) and roadmap_raw else None,
+                repo_path=repo_raw if isinstance(repo_raw, str) and repo_raw else None,
+            )
+            if registry.builtin and not registry.executors and not registry.reviewers:
+                registry = builtin_profile_registry()
+        self._send_json(
+            {
+                "ok": True,
+                "valid": True,
+                "registry": registry.to_dict(),
+                "executors": {
+                    name: profile.to_dict() for name, profile in registry.executors.items()
+                },
+                "reviewers": {
+                    name: profile.to_dict() for name, profile in registry.reviewers.items()
+                },
+                "source": "builtin" if registry.builtin else (
+                    str(registry.path) if registry.path else "unknown"
+                ),
+            }
+        )
+
+    def _handle_profiles_resolve(self, payload: dict[str, Any]) -> None:
+        """Serve ``POST /api/profiles/resolve``.
+
+        Inputs (all optional except ``roadmap``):
+
+        * ``roadmap`` — required, roadmap path
+        * ``task_id`` — required for task-level resolution; when
+          omitted, the resolver returns the registry default for the
+          first task in the roadmap
+        * ``profiles_path`` — explicit registry path
+        * ``executor_profile`` / ``executor_reasoning_effort`` /
+          ``reviewer_profile`` / ``reviewer_reasoning_effort`` — CLI
+          overrides; reasoning must be one of ``low|medium|high``
+
+        The response includes the redacted command template so the
+        admin panel can render a "Resolved command preview" widget
+        without leaking the per-task worktree path.
+        """
+        from .config import load_roadmap as _load_roadmap
+        from .profiles import (
+            ProfileRegistryError,
+            ProfileResolution,
+            find_profile_registry,
+            resolve_executor_profile,
+            resolve_reviewer_profile,
+        )
+        from .web import RoadmapPathError, validate_roadmap_path
+        roadmap_raw = payload.get("roadmap")
+        if not isinstance(roadmap_raw, str) or not roadmap_raw.strip():
+            self._send_json({"ok": False, "error": "roadmap is required"}, status=400)
+            return
+        try:
+            resolved_roadmap = validate_roadmap_path(roadmap_raw)
+        except RoadmapPathError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        try:
+            roadmap = _load_roadmap(resolved_roadmap, strict=False)
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            self._send_json(
+                {"ok": False, "error": f"failed to load roadmap: {exc}"},
+                status=400,
+            )
+            return
+        task_id_raw = payload.get("task_id")
+        if isinstance(task_id_raw, str) and task_id_raw.strip():
+            target_task = next(
+                (t for t in roadmap.tasks if t.id == task_id_raw), None
+            )
+            if target_task is None:
+                self._send_json(
+                    {"ok": False, "error": f"task {task_id_raw!r} not found in roadmap"},
+                    status=404,
+                )
+                return
+        else:
+            target_task = roadmap.tasks[0] if roadmap.tasks else None
+            if target_task is None:
+                self._send_json(
+                    {"ok": False, "error": "roadmap has no tasks to resolve"},
+                    status=400,
+                )
+                return
+        profiles_path = payload.get("profiles_path")
+        try:
+            registry = find_profile_registry(
+                explicit_path=profiles_path if isinstance(profiles_path, str) and profiles_path else None,
+                roadmap_path=str(resolved_roadmap),
+            )
+        except ProfileRegistryError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        executor_overrides = _clean_profile_overrides(
+            {
+                "profile_name": payload.get("executor_profile"),
+                "reasoning_effort": payload.get("executor_reasoning_effort"),
+            }
+        )
+        reviewer_overrides = _clean_profile_overrides(
+            {
+                "profile_name": payload.get("reviewer_profile"),
+                "reasoning_effort": payload.get("reviewer_reasoning_effort"),
+            }
+        )
+        executor = resolve_executor_profile(
+            target_task, roadmap, registry, cli_overrides=executor_overrides,
+        )
+        reviewer = resolve_reviewer_profile(
+            target_task, roadmap, registry, cli_overrides=reviewer_overrides,
+        )
+        resolution = ProfileResolution(
+            task_id=target_task.id,
+            executor=executor,
+            reviewer=reviewer,
+            ok=not (executor.errors or reviewer.errors),
+        )
+        warnings: list[str] = list(executor.warnings) + list(reviewer.warnings)
+        if (
+            executor.profile_name is not None
+            and reviewer.profile_name is not None
+            and executor.profile_name == reviewer.profile_name
+            and executor.provider == reviewer.provider
+        ):
+            warnings.append(
+                "reviewer should be an independent profile/process; "
+                "executor and reviewer share the same profile"
+            )
+        self._send_json(
+            {
+                "ok": resolution.ok,
+                "resolution": resolution.to_dict(),
+                "warnings": warnings,
+            }
+        )
 
     def _handle_reliability(self, query: dict) -> None:
         """Serve :func:`collect_reliability_snapshot` for ``GET /api/reliability``.
@@ -3335,6 +3539,67 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
                 return
             max_tasks = max_tasks_raw
 
+        # --- Profile registry overrides (issue #52) -----------------
+        profiles_path_raw = payload.get("profiles_path")
+        profiles_path: str | None = None
+        if isinstance(profiles_path_raw, str) and profiles_path_raw.strip():
+            try:
+                # Validate the path against the same allowlist as
+                # roadmaps so the operator cannot point the run at a
+                # file outside the repo or /tmp.
+                resolved_profiles = _safe_load_profile_registry(profiles_path_raw)
+                profiles_path = str(resolved_profiles.path) if resolved_profiles.path else profiles_path_raw
+            except Exception as exc:  # noqa: BLE001 - boundary
+                self._send_json(
+                    {"started": False, "error": f"profiles_path invalid: {exc}"},
+                    status=400,
+                )
+                return
+        profile_overrides = _clean_profile_overrides(
+            {
+                "profile_name": payload.get("executor_profile"),
+                "reasoning_effort": payload.get("executor_reasoning_effort"),
+            }
+        )
+        executor_profile_arg: str | None = None
+        executor_reasoning_arg: str | None = None
+        if profile_overrides.get("profile_name") is not None:
+            name = str(profile_overrides["profile_name"])
+            if not _PROFILE_NAME_PATTERN.match(name):
+                self._send_json(
+                    {
+                        "started": False,
+                        "error": f"executor_profile name {name!r} is invalid",
+                    },
+                    status=400,
+                )
+                return
+            executor_profile_arg = name
+        if profile_overrides.get("reasoning_effort") is not None:
+            executor_reasoning_arg = str(profile_overrides["reasoning_effort"])
+        reviewer_overrides = _clean_profile_overrides(
+            {
+                "profile_name": payload.get("reviewer_profile"),
+                "reasoning_effort": payload.get("reviewer_reasoning_effort"),
+            }
+        )
+        reviewer_profile_arg: str | None = None
+        reviewer_reasoning_arg: str | None = None
+        if reviewer_overrides.get("profile_name") is not None:
+            name = str(reviewer_overrides["profile_name"])
+            if not _PROFILE_NAME_PATTERN.match(name):
+                self._send_json(
+                    {
+                        "started": False,
+                        "error": f"reviewer_profile name {name!r} is invalid",
+                    },
+                    status=400,
+                )
+                return
+            reviewer_profile_arg = name
+        if reviewer_overrides.get("reasoning_effort") is not None:
+            reviewer_reasoning_arg = str(reviewer_overrides["reasoning_effort"])
+
         try:
             argv = build_run_command(
                 roadmap,
@@ -3344,6 +3609,11 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
                 max_tasks=max_tasks,
                 db_path=self._server_state().state.db_path,
                 resume=resume,
+                profiles_path=profiles_path,
+                executor_profile=executor_profile_arg,
+                executor_reasoning_effort=executor_reasoning_arg,
+                reviewer_profile=reviewer_profile_arg,
+                reviewer_reasoning_effort=reviewer_reasoning_arg,
             )
         except RoadmapPathError as exc:
             self._send_json({"started": False, "error": str(exc)}, status=400)
@@ -3365,6 +3635,72 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
                 "resume": resume,
             }
         )
+
+
+# --- Profile registry helpers --------------------------------------------
+#
+# The web layer never accepts arbitrary command strings; profile
+# inputs are validated against the same rules as the CLI. The
+# helpers below are kept at module level so the tests can call them
+# directly without going through an HTTP request.
+
+_PROFILE_NAME_PATTERN = __import__("re").compile(r"^[A-Za-z0-9._-]+$")
+_PROFILE_REASONING_VALUES = frozenset({"low", "medium", "high"})
+
+
+def _safe_load_profile_registry(path: str) -> Any:
+    """Load a profile registry from ``path`` after validating the path.
+
+    The web layer trusts operator input, but the profile name/path
+    still must match the project conventions (no path traversal,
+    no shell metacharacters) and the file must exist. The function
+    raises :class:`ProfileRegistryError` on any failure so the
+    caller can convert it into a 400 response.
+    """
+    from .profiles import ProfileRegistryError, load_profile_registry
+    if not isinstance(path, str) or not path.strip():
+        raise ProfileRegistryError("profiles_path must be a non-empty string")
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        # Relative paths are resolved against the repo root so the
+        # admin panel can use the same convention as the CLI.
+        roots = _resolve_allowed_roots()
+        candidate = (roots.repo_root / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    if not _is_within(candidate, _resolve_allowed_roots().repo_root) and not _is_within(
+        candidate, _resolve_allowed_roots().tmp_root
+    ):
+        raise ProfileRegistryError(
+            f"profiles_path {candidate} is outside allowed roots"
+        )
+    if not candidate.exists():
+        raise ProfileRegistryError(f"profiles_path does not exist: {candidate}")
+    return load_profile_registry(candidate)
+
+
+def _clean_profile_overrides(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip the profile overrides to safe primitives.
+
+    The web layer accepts the values verbatim and passes them
+    through :func:`agentops.profiles.resolve_executor_profile`. The
+    helper enforces the same validation as the CLI: profile name
+    matches the regex, reasoning effort is one of the allowed
+    values, missing keys drop out. Invalid values are replaced with
+    ``None`` so the resolver treats them as "not set".
+    """
+    cleaned: dict[str, Any] = {}
+    name = payload.get("profile_name")
+    if isinstance(name, str) and _PROFILE_NAME_PATTERN.match(name):
+        cleaned["profile_name"] = name
+    elif isinstance(name, str) and name.strip():
+        # Keep the literal so the resolver can surface a clean
+        # error message; the regex above would have rejected it.
+        cleaned["profile_name"] = name
+    reasoning = payload.get("reasoning_effort")
+    if isinstance(reasoning, str) and reasoning in _PROFILE_REASONING_VALUES:
+        cleaned["reasoning_effort"] = reasoning
+    return cleaned
 
 
 def _safe_subprocess_env(*, no_codex: bool = False) -> dict[str, str]:
@@ -3625,6 +3961,36 @@ INDEX_TEMPLATE = """<!doctype html>
       <label>reviewer: <select id="run-reviewer"><option value="codex" selected>codex</option><option value="heuristic">heuristic</option><option value="">(roadmap default)</option></select></label>
       <label>max-tasks: <input id="run-max-tasks" type="number" min="1" placeholder="(none)" size="4" /></label>
     </div>
+    <div class="row" id="profile-row" style="margin-top:6px;">
+      <label>profiles:
+        <input id="run-profiles-path" type="text" placeholder="examples/profiles/minimax-codex-cli.json" size="42" />
+      </label>
+      <label>executor profile:
+        <select id="run-executor-profile"><option value="">(registry default)</option></select>
+      </label>
+      <label>executor reasoning:
+        <select id="run-executor-reasoning">
+          <option value="">(registry default)</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+        </select>
+      </label>
+      <label>reviewer profile:
+        <select id="run-reviewer-profile"><option value="">(registry default)</option></select>
+      </label>
+      <label>reviewer reasoning:
+        <select id="run-reviewer-reasoning">
+          <option value="">(registry default)</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+        </select>
+      </label>
+      <button id="validate-profiles-btn" class="secondary">Validate profiles</button>
+    </div>
+    <div class="muted" id="profiles-validation-status" style="margin:4px 0 0;"></div>
+    <pre id="profiles-resolution-preview" class="muted" style="margin:4px 0 0;display:none;max-height:160px;overflow:auto;"></pre>
     <div class="muted section-note" id="roadmap-resume-help" style="margin:4px 0 0;">
       Fresh run starts from the earliest unfinished task. Resume skips accepted/merged work and recovers interrupted in-flight tasks.
     </div>
@@ -3889,6 +4255,14 @@ INDEX_TEMPLATE = """<!doctype html>
   const roadmapResumeWarning = $("roadmap-resume-warning");
   const runReviewer = $("run-reviewer");
   const runMaxTasks = $("run-max-tasks");
+  const runProfilesPath = $("run-profiles-path");
+  const runExecutorProfile = $("run-executor-profile");
+  const runExecutorReasoning = $("run-executor-reasoning");
+  const runReviewerProfile = $("run-reviewer-profile");
+  const runReviewerReasoning = $("run-reviewer-reasoning");
+  const validateProfilesBtn = $("validate-profiles-btn");
+  const profilesValidationStatus = $("profiles-validation-status");
+  const profilesResolutionPreview = $("profiles-resolution-preview");
   const monitorRunInput = $("monitor-run-input");
   const monitorStartBtn = $("monitor-start-btn");
   const monitorStopBtn = $("monitor-stop-btn");
@@ -5192,6 +5566,77 @@ async function tailOperatorRun() {
     });
   }
   if (operatorTailBtn) operatorTailBtn.addEventListener("click", tailOperatorRun);
+
+  // --- Profile registry UI ------------------------------------------------
+  // The admin panel lets the operator pick an executor + reviewer profile
+  // (and a reasoning effort for each) before starting a run. The selected
+  // values are sent to /api/run as typed strings; the server-side
+  // validation (in agentops/web.py) is the safety boundary. The UI never
+  // lets the operator enter a custom command; only pre-defined profile
+  // names are accepted.
+  function _populateProfileSelect(select, names, preferred) {
+    if (!select) return;
+    select.innerHTML = '<option value="">(registry default)</option>' +
+      names.map(function (n) { return '<option value="' + escapeHtml(n) + '">' + escapeHtml(n) + '</option>'; }).join("");
+    if (preferred && names.indexOf(preferred) !== -1) {
+      select.value = preferred;
+    } else {
+      select.value = "";
+    }
+  }
+  async function refreshProfiles() {
+    if (!runExecutorProfile) return;
+    const params = new URLSearchParams();
+    if (runProfilesPath && runProfilesPath.value) params.set("profiles_path", runProfilesPath.value);
+    const roadmapVal = getRoadmap();
+    if (roadmapVal) params.set("roadmap", roadmapVal);
+    const url = "/api/profiles" + (params.toString() ? "?" + params.toString() : "");
+    profilesValidationStatus.textContent = "loading profiles...";
+    profilesValidationStatus.className = "muted";
+    const res = await fetchJson(url);
+    if (!res.ok) {
+      profilesValidationStatus.textContent = "invalid profiles: " + (res.data.error || "unknown error");
+      profilesValidationStatus.className = "err";
+      return;
+    }
+    const executorNames = Object.keys(res.data.executors || {});
+    const reviewerNames = Object.keys(res.data.reviewers || {});
+    const preferredExecutor = executorNames.indexOf("minimax-via-codex") !== -1
+      ? "minimax-via-codex" : (executorNames[0] || "");
+    const preferredReviewer = reviewerNames.indexOf("codex-high") !== -1
+      ? "codex-high" : (reviewerNames[0] || "");
+    _populateProfileSelect(runExecutorProfile, executorNames, preferredExecutor);
+    _populateProfileSelect(runReviewerProfile, reviewerNames, preferredReviewer);
+    const opencodeWarning = Object.values(res.data.executors || {}).some(function (p) {
+      return p.provider === "opencode";
+    }) ? " (opencode is legacy/fallback; MiniMax via Codex CLI is preferred for implementation tasks)" : "";
+    profilesValidationStatus.textContent =
+      "profiles OK (" + (res.data.source || "unknown") + ")" + opencodeWarning;
+    profilesValidationStatus.className = opencodeWarning ? "runtime-stale" : "muted";
+  }
+  if (validateProfilesBtn) {
+    validateProfilesBtn.addEventListener("click", refreshProfiles);
+  }
+  if (runProfilesPath) {
+    runProfilesPath.addEventListener("change", refreshProfiles);
+  }
+  if (runExecutorProfile) {
+    runExecutorProfile.addEventListener("change", async function () {
+      if (!runReviewerProfile) return;
+      // When the operator picks the same profile for both sides,
+      // surface a warning so they confirm an independent reviewer.
+      if (runExecutorProfile.value && runExecutorProfile.value === runReviewerProfile.value) {
+        profilesResolutionPreview.style.display = "block";
+        profilesResolutionPreview.className = "err";
+        profilesResolutionPreview.textContent = "reviewer should be an independent profile/process; "
+          + "executor and reviewer share the same profile (" + runExecutorProfile.value + ")";
+      } else {
+        profilesResolutionPreview.style.display = "none";
+        profilesResolutionPreview.textContent = "";
+      }
+    });
+  }
+  refreshProfiles();
   $("plan-btn").addEventListener("click", async function () {
     const roadmap = getRoadmap();
     if (!roadmap) { planOutput.textContent = "select or type a roadmap first"; return; }
@@ -5211,6 +5656,11 @@ async function tailOperatorRun() {
       const n = Number(runMaxTasks.value);
       if (n > 0) body.max_tasks = Math.floor(n);
     }
+    if (runProfilesPath && runProfilesPath.value) body.profiles_path = runProfilesPath.value;
+    if (runExecutorProfile && runExecutorProfile.value) body.executor_profile = runExecutorProfile.value;
+    if (runExecutorReasoning && runExecutorReasoning.value) body.executor_reasoning_effort = runExecutorReasoning.value;
+    if (runReviewerProfile && runReviewerProfile.value) body.reviewer_profile = runReviewerProfile.value;
+    if (runReviewerReasoning && runReviewerReasoning.value) body.reviewer_reasoning_effort = runReviewerReasoning.value;
     planOutput.textContent = resumeChecked
       ? "starting resumed run (skipping accepted/merged tasks)..."
       : "starting run with Codex review...";

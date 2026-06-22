@@ -455,3 +455,16 @@ clipboard only, no suggested action is ever executed, and the
 cockpit reads only from the already-safe `/api/admin`,
 `/api/status`, `/api/operator-runs`, `/api/usage`, `/api/timeline`,
 and `/api/reliability` payloads.
+
+## Profile registry controls (issue #52)
+
+The cockpit renders a small set of profile controls in the
+Roadmap launcher card. The controls are populated by `GET
+/api/profiles` and are constrained to the registered profile
+names — there is no free-form command entry, and the server
+rejects any profile name that does not match the registered
+regex. The launcher's `POST /api/run` payload is extended with
+`profiles_path`, `executor_profile`, `executor_reasoning_effort`,
+`reviewer_profile`, and `reviewer_reasoning_effort`; the server
+threads those into `build_run_command` without ever using a
+shell.

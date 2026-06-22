@@ -14,7 +14,7 @@ from .artifacts import safe_name
 from .config import ConfigError, load_roadmap
 from .models import TaskState
 from .orchestrator import Orchestrator, RunOptions
-from .plan import PlanReport, lint_roadmap
+from .plan import PlanIssue, PlanReport, lint_roadmap
 from .review import (
     VALID_VERDICTS,
     CodexReviewService,
@@ -115,6 +115,55 @@ def build_parser() -> argparse.ArgumentParser:
             "codex process group if the file has not grown for this many "
             "seconds. Prevents a wedged codex call from blocking the whole "
             "roadmap. Default: no codex idle timeout (only --timeout applies)."
+        ),
+    )
+    run.add_argument(
+        "--profiles",
+        default=None,
+        help=(
+            "Path to a profile registry JSON file (issue #52). When set, the "
+            "executor and reviewer are resolved from the registry instead of "
+            "from the legacy ``executor`` / ``model`` / ``review.codex_model`` "
+            "fields. Resolution order: ``--profiles`` -> roadmap ``profiles_path`` "
+            "-> ``<repo>/.agentops/profiles.json`` -> ``$XDG_CONFIG_HOME/agentops/"
+            "profiles.json`` -> built-in defaults."
+        ),
+    )
+    run.add_argument(
+        "--executor-profile",
+        default=None,
+        help=(
+            "Override the executor profile name. The profile must exist in the "
+            "resolved registry; the runner fails fast if it is missing. "
+            "Default: honor the task / roadmap / registry choice."
+        ),
+    )
+    run.add_argument(
+        "--executor-reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=None,
+        help=(
+            "Override the executor reasoning effort. Values are restricted to "
+            "low/medium/high to match the codex CLI's ``-c model_reasoning_effort=`` "
+            "knob. Default: honor the task / roadmap / registry choice."
+        ),
+    )
+    run.add_argument(
+        "--reviewer-profile",
+        default=None,
+        help=(
+            "Override the reviewer profile name. The profile must exist in the "
+            "resolved registry; the runner fails fast if it is missing. "
+            "Default: honor the task / roadmap / registry choice."
+        ),
+    )
+    run.add_argument(
+        "--reviewer-reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=None,
+        help=(
+            "Override the reviewer reasoning effort. Values are restricted to "
+            "low/medium/high. Default: honor the task / roadmap / registry choice."
         ),
     )
     run.add_argument(
@@ -257,6 +306,118 @@ def build_parser() -> argparse.ArgumentParser:
             "agentops.plan.lint_roadmap / agentops.config.load_roadmap. "
             "Default: off (legacy non-strict lint)."
         ),
+    )
+    plan.add_argument(
+        "--profiles",
+        default=None,
+        help=(
+            "Path to a profile registry JSON file. When set, every task is "
+            "resolved against the registry and a missing/invalid profile "
+            "fails the plan. Resolution order matches ``--profiles`` on the "
+            "run command. Default: do not validate the registry."
+        ),
+    )
+    plan.add_argument(
+        "--validate-profiles",
+        action="store_true",
+        help=(
+            "Resolve executor/reviewer profiles for every task against the "
+            "profile registry. Fails when a task selects a missing or invalid "
+            "profile. Without this flag the registry is not consulted and "
+            "legacy behaviour is preserved."
+        ),
+    )
+
+    # --- profiles subcommand group ------------------------------------
+    profiles_cmd = sub.add_parser(
+        "profiles",
+        help="Validate, show, and resolve profile registries (issue #52).",
+        description=(
+            "Manage the typed model/profile registry that decouples the "
+            "executor transport, the model, and the role. The registry is a "
+            "JSON file with executor / reviewer profiles. The CLI only "
+            "validates and renders the file; it never executes the resolved "
+            "command and never reads or stores credentials."
+        ),
+    )
+    profiles_sub = profiles_cmd.add_subparsers(dest="profiles_command", required=True)
+
+    profiles_validate = profiles_sub.add_parser(
+        "validate",
+        help="Validate a profile registry file and exit non-zero on errors.",
+    )
+    profiles_validate.add_argument(
+        "--path",
+        required=True,
+        help="Path to a profile registry JSON file.",
+    )
+    profiles_validate.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON output.",
+    )
+
+    profiles_show = profiles_sub.add_parser(
+        "show",
+        help="Print executor/reviewer profiles from a registry file (no resolution).",
+    )
+    profiles_show.add_argument(
+        "--path",
+        default=None,
+        help=(
+            "Path to a profile registry JSON file. When omitted, the resolved "
+            "registry is located via the standard lookup order (CLI flag, "
+            "roadmap, repo-local, user-local, built-in). When neither --path "
+            "nor a registry file is available, the built-in defaults are "
+            "rendered."
+        ),
+    )
+
+    profiles_resolve = profiles_sub.add_parser(
+        "resolve",
+        help="Resolve the executor/reviewer profile for a single task.",
+    )
+    profiles_resolve.add_argument(
+        "--roadmap",
+        required=True,
+        help="Path to a roadmap JSON/YAML file (used to load the task).",
+    )
+    profiles_resolve.add_argument(
+        "--task-id",
+        required=True,
+        help="Task id inside the roadmap to resolve.",
+    )
+    profiles_resolve.add_argument(
+        "--profiles",
+        default=None,
+        help="Optional path to a profile registry JSON file. Default: use the standard lookup order.",
+    )
+    profiles_resolve.add_argument(
+        "--executor-profile",
+        default=None,
+        help="Override the executor profile name (mirrors ``--executor-profile`` on run).",
+    )
+    profiles_resolve.add_argument(
+        "--executor-reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=None,
+        help="Override the executor reasoning effort.",
+    )
+    profiles_resolve.add_argument(
+        "--reviewer-profile",
+        default=None,
+        help="Override the reviewer profile name.",
+    )
+    profiles_resolve.add_argument(
+        "--reviewer-reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=None,
+        help="Override the reviewer reasoning effort.",
+    )
+    profiles_resolve.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON output.",
     )
 
     schema_cmd = sub.add_parser(
@@ -1049,6 +1210,16 @@ def main(argv: list[str] | None = None) -> int:
                 executor_startup_timeout=args.executor_startup_timeout,
                 executor_idle_timeout=args.executor_idle_timeout,
                 codex_idle_timeout=getattr(args, "codex_idle_timeout", None),
+                # Profile-registry overrides (issue #57). The CLI
+                # values are passed through verbatim; the
+                # orchestrator resolves them against the
+                # registry with the documented precedence
+                # (CLI > task > roadmap/default > registry > legacy).
+                profiles_path=getattr(args, "profiles", None),
+                executor_profile=getattr(args, "executor_profile", None),
+                executor_reasoning_effort=getattr(args, "executor_reasoning_effort", None),
+                reviewer_profile=getattr(args, "reviewer_profile", None),
+                reviewer_reasoning_effort=getattr(args, "reviewer_reasoning_effort", None),
             )
             orch = Orchestrator(state, options)
             if args.resume:
@@ -1089,7 +1260,16 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_timeline(state, args)
 
         if args.command == "plan":
-            return _cmd_plan(args.roadmap, args.json, strict=args.strict)
+            return _cmd_plan(
+                args.roadmap,
+                args.json,
+                strict=args.strict,
+                profiles_path=getattr(args, "profiles", None),
+                validate_profiles=bool(getattr(args, "validate_profiles", False)),
+            )
+
+        if args.command == "profiles":
+            return _cmd_profiles(args)
 
         if args.command == "schema":
             return _cmd_schema(args)
@@ -1585,13 +1765,109 @@ def _cmd_review_queue(state: StateStore, roadmap_id: str | None) -> int:
     return 0
 
 
-def _cmd_plan(roadmap_path: str, as_json: bool, *, strict: bool = False) -> int:
+def _cmd_plan(
+    roadmap_path: str,
+    as_json: bool,
+    *,
+    strict: bool = False,
+    profiles_path: str | None = None,
+    validate_profiles: bool = False,
+) -> int:
     report = lint_roadmap(roadmap_path, strict=strict)
+    if validate_profiles:
+        from .profiles import (
+            ProfileRegistryError,
+            find_profile_registry,
+            resolve_executor_profile,
+            resolve_reviewer_profile,
+        )
+        try:
+            registry = find_profile_registry(
+                explicit_path=profiles_path,
+                roadmap_path=roadmap_path,
+            )
+        except ProfileRegistryError as exc:
+            from dataclasses import replace
+            report = replace(
+                report,
+                issues=(
+                    *report.issues,
+                    _plan_issue_from_profile(
+                        "profiles.invalid",
+                        "error",
+                        str(exc),
+                    ),
+                ),
+            )
+            _emit_plan(report, as_json)
+            return 1
+        try:
+            roadmap = load_roadmap(roadmap_path, strict=False)
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            from dataclasses import replace
+            report = replace(
+                report,
+                issues=(
+                    *report.issues,
+                    _plan_issue_from_profile(
+                        "profiles.roadmap_load",
+                        "error",
+                        f"failed to load roadmap for profile resolution: {exc}",
+                    ),
+                ),
+            )
+            _emit_plan(report, as_json)
+            return 1
+        from dataclasses import replace
+        extra_errors: list[PlanIssue] = []
+        extra_warnings: list[PlanIssue] = []
+        for task in roadmap.tasks:
+            executor = resolve_executor_profile(task, roadmap, registry)
+            reviewer = resolve_reviewer_profile(task, roadmap, registry)
+            for warning in (*executor.warnings, *reviewer.warnings):
+                extra_warnings.append(
+                    _plan_issue_from_profile(
+                        "profiles.warning",
+                        "warning",
+                        warning,
+                        task_id=task.id,
+                    )
+                )
+            for err in (*executor.errors, *reviewer.errors):
+                extra_errors.append(
+                    _plan_issue_from_profile(
+                        "profiles.invalid",
+                        "error",
+                        err,
+                        task_id=task.id,
+                    )
+                )
+        report = replace(
+            report,
+            issues=(*report.issues, *extra_errors),
+            warnings=(*report.warnings, *extra_warnings),
+        )
+    _emit_plan(report, as_json)
+    return 0 if report.ok else 1
+
+
+def _emit_plan(report: PlanReport, as_json: bool) -> None:
     if as_json:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     else:
         _print_plan_report(report)
-    return 0 if report.ok else 1
+
+
+def _plan_issue_from_profile(
+    code: str, severity: str, message: str, *, task_id: str | None = None,
+) -> PlanIssue:
+    return PlanIssue(
+        code=code,
+        severity=severity,
+        message=message,
+        task_id=task_id,
+        path=None,
+    )
 
 
 def _print_plan_report(report: PlanReport) -> None:
@@ -1608,6 +1884,174 @@ def _print_plan_report(report: PlanReport) -> None:
         elif issue.path:
             target = f" path={issue.path}"
         print(f"  [{issue.severity}] {issue.code}{target}: {issue.message}")
+
+
+def _cmd_profiles(args: argparse.Namespace) -> int:
+    from .profiles import (
+        ProfileRegistryError,
+        ProfileResolution,
+        builtin_profile_registry,
+        find_profile_registry,
+        load_profile_registry,
+        render_resolved_profile_json,
+        resolve_executor_profile,
+        resolve_reviewer_profile,
+    )
+
+    if args.profiles_command == "validate":
+        try:
+            registry = load_profile_registry(args.path)
+        except ProfileRegistryError as exc:
+            payload = {
+                "ok": False,
+                "path": str(args.path),
+                "error": str(exc),
+            }
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print(f"INVALID: {exc}", file=sys.stderr)
+            return 1
+        payload = {
+            "ok": True,
+            "path": str(registry.path) if registry.path else None,
+            "version": registry.version,
+            "executors": {name: profile.to_dict() for name, profile in registry.executors.items()},
+            "reviewers": {name: profile.to_dict() for name, profile in registry.reviewers.items()},
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(
+                f"OK profiles registry {registry.path or '(unknown)'} "
+                f"(version={registry.version})"
+            )
+            print(f"  executors: {', '.join(registry.executor_names()) or '(none)'}")
+            print(f"  reviewers: {', '.join(registry.reviewer_names()) or '(none)'}")
+        return 0
+
+    if args.profiles_command == "show":
+        if args.path:
+            try:
+                registry = load_profile_registry(args.path)
+            except ProfileRegistryError as exc:
+                print(f"failed to load registry: {exc}", file=sys.stderr)
+                return 1
+        else:
+            registry = find_profile_registry(explicit_path=None, roadmap_path=None, repo_path=None)
+            if registry.builtin and not registry.executors and not registry.reviewers:
+                registry = builtin_profile_registry()
+        print(
+            f"Profiles registry (version={registry.version}, "
+            f"source={'builtin' if registry.builtin else (registry.path or 'unknown')})"
+        )
+        print("  Executors:")
+        if registry.executors:
+            for name in registry.executor_names():
+                _print_profile_row(name, registry.executors[name])
+        else:
+            print("    (none)")
+        print("  Reviewers:")
+        if registry.reviewers:
+            for name in registry.reviewer_names():
+                _print_profile_row(name, registry.reviewers[name])
+        else:
+            print("    (none)")
+        return 0
+
+    if args.profiles_command == "resolve":
+        try:
+            registry = find_profile_registry(
+                explicit_path=args.profiles,
+                roadmap_path=args.roadmap,
+            )
+        except ProfileRegistryError as exc:
+            print(f"failed to resolve registry: {exc}", file=sys.stderr)
+            return 1
+        try:
+            roadmap = load_roadmap(args.roadmap, strict=False)
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            print(f"failed to load roadmap: {exc}", file=sys.stderr)
+            return 1
+        task = next((t for t in roadmap.tasks if t.id == args.task_id), None)
+        if task is None:
+            print(
+                f"task {args.task_id!r} not found in roadmap {args.roadmap}",
+                file=sys.stderr,
+            )
+            return 1
+        cli_overrides_executor = {
+            "profile_name": args.executor_profile,
+            "reasoning_effort": args.executor_reasoning_effort,
+        }
+        cli_overrides_reviewer = {
+            "profile_name": args.reviewer_profile,
+            "reasoning_effort": args.reviewer_reasoning_effort,
+        }
+        executor = resolve_executor_profile(
+            task, roadmap, registry, cli_overrides=cli_overrides_executor,
+        )
+        reviewer = resolve_reviewer_profile(
+            task, roadmap, registry, cli_overrides=cli_overrides_reviewer,
+        )
+        resolution = ProfileResolution(
+            task_id=task.id,
+            executor=executor,
+            reviewer=reviewer,
+            ok=not (executor.errors or reviewer.errors),
+        )
+        if args.json:
+            print(render_resolved_profile_json(resolution), end="")
+            return 0 if resolution.ok else 1
+        print(
+            f"Resolved profile for task={task.id} "
+            f"(registry source={'builtin' if registry.builtin else (registry.path or 'unknown')})"
+        )
+        _print_resolved("executor", executor)
+        _print_resolved("reviewer", reviewer)
+        return 0 if resolution.ok else 1
+
+    print(f"unknown profiles subcommand: {args.profiles_command}", file=sys.stderr)
+    return 2
+
+
+def _print_profile_row(name: str, profile: Any) -> None:
+    provider = getattr(profile, "provider", "?")
+    model = getattr(profile, "model", None)
+    profile_name = getattr(profile, "profile", None)
+    reasoning = getattr(profile, "reasoning_effort", None)
+    bits: list[str] = [f"provider={provider}"]
+    if profile_name:
+        bits.append(f"profile={profile_name}")
+    if model:
+        bits.append(f"model={model}")
+    if reasoning:
+        bits.append(f"reasoning={reasoning}")
+    print(f"    - {name}: " + ", ".join(bits))
+
+
+def _print_resolved(label: str, resolved: Any) -> None:
+    bits: list[str] = [f"provider={resolved.provider}"]
+    if resolved.profile_name:
+        bits.append(f"profile={resolved.profile_name}")
+    if resolved.model:
+        bits.append(f"model={resolved.model}")
+    if resolved.reasoning_effort:
+        bits.append(f"reasoning={resolved.reasoning_effort}")
+    bits.append(f"source={resolved.source}")
+    if resolved.used_legacy:
+        bits.append("legacy=true")
+    if getattr(resolved, "timeout_seconds", None):
+        bits.append(f"timeout={resolved.timeout_seconds}s")
+    print(f"  {label}: " + ", ".join(bits))
+    if resolved.command_template_redacted:
+        print("    command_template (redacted):")
+        for item in resolved.command_template_redacted:
+            print(f"      {item}")
+    for warning in resolved.warnings:
+        print(f"    warning: {warning}")
+    for error in resolved.errors:
+        print(f"    error: {error}")
 
 
 def _cmd_schema(args: argparse.Namespace) -> int:

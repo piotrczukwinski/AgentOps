@@ -97,6 +97,47 @@ def _merge_executor_options(
     return merged
 
 
+
+
+def _as_optional_str(value: Any, *, field: str) -> str | None:
+    """Return a stripped string for non-empty values, ``None`` for ``None`` / empty.
+
+    The function is intentionally tolerant: it never raises for a
+    legitimate "not set" value (empty string, missing key). A wrong
+    type still raises :class:`ConfigError` so a typo in the roadmap
+    surfaces at plan time, not at first codex call.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"{field} must be a string, got {type(value).__name__}")
+    stripped = value.strip()
+    return stripped or None
+
+
+def _normalize_reasoning_effort(value: Any, *, field: str) -> str | None:
+    """Normalize a reasoning effort value to lowercase and validate it.
+
+    Mirrors :data:`ALLOWED_MODEL_REASONING_EFFORTS`; an unknown value
+    raises :class:`ConfigError` so a bad roadmap fails at plan time
+    rather than at the first codex call.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(
+            f"{field} must be a string, got {type(value).__name__}"
+        )
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized not in ALLOWED_MODEL_REASONING_EFFORTS:
+        raise ConfigError(
+            f"{field} must be one of {sorted(ALLOWED_MODEL_REASONING_EFFORTS)}, got {value!r}"
+        )
+    return normalized
+
+
 def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
     roadmap_path = Path(path).expanduser().resolve()
     data = load_mapping(roadmap_path)
@@ -205,6 +246,14 @@ def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
                 self_fix_max_lines=int(
                     review_data.get("self_fix_max_lines", roadmap_review.self_fix_max_lines)
                 ),
+                profile=_as_optional_str(
+                    review_data.get("profile"),
+                    field=f"{task_id}.review.profile",
+                ),
+                reasoning_effort=_normalize_reasoning_effort(
+                    review_data.get("reasoning_effort"),
+                    field=f"{task_id}.review.reasoning_effort",
+                ),
             )
         else:
             raise ConfigError(f"task {task_id}: review must be string or object")
@@ -265,6 +314,14 @@ def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
                 # True/False from the roadmap/task config wins.
                 require_executor_result=_require_executor_result,
                 metadata={k: v for k, v in item.items() if k.startswith("x_")},
+                executor_profile=_as_optional_str(
+                    item.get("executor_profile"),
+                    field=f"{task_id}.executor_profile",
+                ),
+                executor_reasoning_effort=_normalize_reasoning_effort(
+                    item.get("executor_reasoning_effort"),
+                    field=f"{task_id}.executor_reasoning_effort",
+                ),
             )
         )
 
@@ -301,6 +358,34 @@ def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
         ),
         review=_build_roadmap_review(data.get("review", {}) or {}, defaults, base=roadmap_path.parent),
         reviewer=str(data.get("reviewer", defaults.get("reviewer", "codex"))),
+        profiles_path=_as_optional_str(
+            data.get("profiles_path"),
+            field="profiles_path",
+        ),
+        executor_profile=_as_optional_str(
+            data.get("executor_profile"),
+            field="executor_profile",
+        )
+        or _as_optional_str(
+            defaults.get("executor_profile"),
+            field="defaults.executor_profile",
+        ),
+        executor_reasoning_effort=_normalize_reasoning_effort(
+            data.get("executor_reasoning_effort"),
+            field="executor_reasoning_effort",
+        )
+        or _normalize_reasoning_effort(
+            defaults.get("executor_reasoning_effort"),
+            field="defaults.executor_reasoning_effort",
+        ),
+        reviewer_profile=_as_optional_str(
+            data.get("reviewer_profile"),
+            field="reviewer_profile",
+        )
+        or _as_optional_str(
+            defaults.get("reviewer_profile"),
+            field="defaults.reviewer_profile",
+        ),
     )
 
 
@@ -363,6 +448,11 @@ def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -
         model_reasoning_effort=_resolve_model_reasoning_effort(value, defaults),
         self_fix=bool(value.get("self_fix", defaults.get("review_self_fix", True))),
         self_fix_max_lines=int(value.get("self_fix_max_lines", defaults.get("review_self_fix_max_lines", 30))),
+        profile=_as_optional_str(value.get("profile"), field="review.profile"),
+        reasoning_effort=_normalize_reasoning_effort(
+            value.get("reasoning_effort"),
+            field="review.reasoning_effort",
+        ),
     )
 
 
