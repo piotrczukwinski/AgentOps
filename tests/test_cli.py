@@ -106,6 +106,118 @@ class CliPlanTests(unittest.TestCase):
             data = json.loads(result.stdout)
             self.assertIn("errors", data)
             self.assertFalse(data["ok"])
+            self.assertIn("strict", data)
+            self.assertFalse(data["strict"])
+
+    def test_plan_strict_succeeds_on_demo_shell(self) -> None:
+        result = _Runner().run(
+            [
+                "--db",
+                str(Path(tempfile.mkdtemp()) / "state.sqlite"),
+                "plan",
+                "--roadmap",
+                "examples/roadmaps/demo-shell.json",
+                "--strict",
+            ]
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("Strict schema validation: enabled", result.stdout)
+        self.assertIn("no issues found", result.stdout)
+
+    def test_plan_strict_json_includes_strict_flag(self) -> None:
+        result = _Runner().run(
+            [
+                "--db",
+                str(Path(tempfile.mkdtemp()) / "state.sqlite"),
+                "plan",
+                "--roadmap",
+                "examples/roadmaps/demo-shell.json",
+                "--strict",
+                "--json",
+            ]
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        data = json.loads(result.stdout)
+        self.assertTrue(data["strict"])
+        self.assertTrue(data["ok"])
+
+    def test_plan_strict_fails_on_unknown_top_level_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            git(repo, "init")
+            git(repo, "config", "user.email", "agentops@example.invalid")
+            git(repo, "config", "user.name", "AgentOps Test")
+            (repo / "README.md").write_text("seed\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "initial")
+            prompt = root / "prompt.md"
+            prompt.write_text("hello", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "repo": {"id": "x", "path": str(repo)},
+                        "weird_key": 1,
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "prompt": str(prompt),
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "branch_prefix": "agentops",
+                                "allowed_files": ["a.txt"],
+                                "review": {"codex": "never"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = _Runner().run(
+                [
+                    "--db",
+                    str(root / "state.sqlite"),
+                    "plan",
+                    "--roadmap",
+                    str(roadmap_path),
+                    "--strict",
+                ]
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("weird_key", result.stdout)
+            # Non-strict plan does not gate on schema-only issues.
+            non_strict = _Runner().run(
+                [
+                    "--db",
+                    str(root / "state.sqlite"),
+                    "plan",
+                    "--roadmap",
+                    str(roadmap_path),
+                ]
+            )
+            self.assertEqual(non_strict.returncode, 0, msg=non_strict.stdout + non_strict.stderr)
+
+
+class CliSchemaCommandTests(unittest.TestCase):
+    def test_schema_path_prints_file_path(self) -> None:
+        result = _Runner().run(["schema", "--path"])
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertTrue(result.stdout.strip().endswith("schemas/roadmap.schema.json"), msg=result.stdout)
+
+    def test_schema_json_emits_valid_json(self) -> None:
+        result = _Runner().run(["schema", "--json"])
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["title"], "AgentOps Roadmap")
+
+    def test_schema_no_args_prints_summary(self) -> None:
+        result = _Runner().run(["schema"])
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("AgentOps roadmap JSON Schema:", result.stdout)
+        self.assertIn("schemas/roadmap.schema.json", result.stdout)
 
 
 class CliRunSmokeTests(unittest.TestCase):

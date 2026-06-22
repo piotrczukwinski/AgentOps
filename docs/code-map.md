@@ -138,18 +138,34 @@ CLI (cli.py)
 
 ## Roadmap and config model
 
-### `agentops/models.py` and `agentops/config.py`
+### `agentops/models.py`, `agentops/config.py`, and `agentops/roadmap_schema.py`
 
 * **Owns:** the dataclasses / enums (`RoadmapConfig`,
   `TaskConfig`, `TaskState`, verdict enums, review-packet
   shapes) and the JSON / YAML loader that turns a roadmap
   file into a `RoadmapConfig`. The loader rejects unknown
-  top-level keys and unknown per-task fields.
+  top-level keys and unknown per-task fields when called
+  with `strict=True`. `roadmap_schema.py` owns the public
+  JSON Schema document generation and the stdlib structural
+  validator (`schemas/roadmap.schema.json`,
+  `validate_roadmap_mapping`, `RoadmapSchemaIssue`,
+  `format_schema_issues`). The internal validator and the
+  checked-in schema file are kept in sync by a unit test.
 * **Must not own:** executor subprocess logic, web rendering.
+  `roadmap_schema.py` must not own semantic checks
+  (repo existence, prompt file existence, dependency graph,
+  git state, executor binary on `PATH`, allowed-files /
+  forbidden-globs / branch-prefix policy).
 * **Good first ideas:** add an edge-case test for an unknown
-  top-level key in `tests/test_config.py`; tighten a docstring.
+  top-level key in `tests/test_config.py`; tighten a docstring;
+  add a `RoadmapSchemaIssue` regression test in
+  `tests/test_roadmap_schema.py`.
 * **Safety notes:** indirectly. A permissive loader is a
-  footgun. New keys default to "rejected at plan time".
+  footgun. New keys default to "rejected at plan time" in
+  strict mode; legacy aliases warn but do not fail.
+* **Tests:** `tests/test_roadmap_schema.py` is the
+  authoritative test set for the schema document, the
+  checked-in schema sync, and the structural validator.
 
 ## Orchestration
 

@@ -97,9 +97,23 @@ def _merge_executor_options(
     return merged
 
 
-def load_roadmap(path: str | Path) -> RoadmapConfig:
+def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
     roadmap_path = Path(path).expanduser().resolve()
     data = load_mapping(roadmap_path)
+
+    if strict:
+        from .roadmap_schema import (
+            format_schema_issues,
+            has_schema_errors,
+            validate_roadmap_mapping,
+        )
+
+        schema_issues = validate_roadmap_mapping(data, strict=True)
+        if has_schema_errors(schema_issues):
+            message = format_schema_issues(schema_issues)
+            raise ConfigError(
+                f"Roadmap failed strict structural validation at {roadmap_path}:\n{message}"
+            )
 
     try:
         repo_data = data["repo"]

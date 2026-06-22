@@ -25,6 +25,7 @@ class PlanReport:
     roadmap_id: str
     issues: tuple[PlanIssue, ...] = ()
     warnings: tuple[PlanIssue, ...] = field(default_factory=tuple)
+    strict: bool = False
 
     @property
     def ok(self) -> bool:
@@ -35,8 +36,9 @@ class PlanReport:
             "ok": self.ok,
             "roadmap_id": self.roadmap_id,
             "roadmap_path": str(self.roadmap_path),
+            "strict": self.strict,
             "errors": [issue.__dict__ for issue in self.issues if issue.severity == "error"],
-            "warnings": [issue.__dict__ for issue in self.issues if issue.severity == "warning"],
+            "warnings": [issue.__dict__ for issue in self.warnings if issue.severity == "warning"],
         }
 
 
@@ -55,11 +57,16 @@ WRITE_KINDS = {"implementation", "docs", "guard", "test", "refactor", "fix", "co
 REVIEW_ONLY_KINDS = {"review", "audit", "observation"}
 
 
-def lint_roadmap(roadmap_path: str | Path) -> PlanReport:
+def lint_roadmap(roadmap_path: str | Path, *, strict: bool = False) -> PlanReport:
     """Deterministic, model-free preflight for a roadmap file.
 
     Returns a PlanReport with errors and warnings. Does not create worktrees,
     does not call models, and does not require network access.
+
+    When ``strict`` is True the loader also runs the structural schema
+    validator (unknown keys, type mistakes, invalid enum values,
+    malformed arrays). Schema errors short-circuit semantic linting;
+    schema warnings are kept on the report and linting continues.
     """
     path = Path(str(roadmap_path)).expanduser()
     errors: list[PlanIssue] = []
@@ -68,16 +75,69 @@ def lint_roadmap(roadmap_path: str | Path) -> PlanReport:
 
     if not path.exists():
         errors.append(PlanIssue("roadmap.missing", "error", f"Roadmap file does not exist: {path}"))
-        return PlanReport(path, roadmap_id, tuple(errors), tuple(warnings))
+        return PlanReport(path, roadmap_id, tuple(errors), tuple(warnings), strict=strict)
+
+    schema_errors: list[PlanIssue] = []
+    schema_warnings: list[PlanIssue] = []
+
+    if strict:
+        from .config import load_mapping
+        from .roadmap_schema import validate_roadmap_mapping
+
+        try:
+            data = load_mapping(path)
+        except ConfigError as exc:
+            errors.append(PlanIssue("roadmap.parse", "error", str(exc)))
+            return PlanReport(path, roadmap_id, tuple(errors), tuple(warnings), strict=strict)
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            errors.append(PlanIssue("roadmap.parse", "error", f"Failed to load roadmap: {exc}"))
+            return PlanReport(path, roadmap_id, tuple(errors), tuple(warnings), strict=strict)
+
+        for issue in validate_roadmap_mapping(data, strict=True):
+            plan_issue = PlanIssue(
+                code=f"schema.{issue.code.split('.', 1)[-1]}",
+                severity=issue.severity,
+                message=issue.message,
+                path=issue.path,
+            )
+            if issue.severity == "error":
+                schema_errors.append(plan_issue)
+            else:
+                schema_warnings.append(plan_issue)
+
+        if schema_errors:
+            return PlanReport(
+                path,
+                roadmap_id,
+                tuple(schema_errors),
+                tuple(schema_warnings),
+                strict=strict,
+            )
 
     try:
-        roadmap = load_roadmap(path)
+        roadmap = load_roadmap(path, strict=strict)
     except ConfigError as exc:
         errors.append(PlanIssue("roadmap.parse", "error", str(exc)))
-        return PlanReport(path, roadmap_id, tuple(errors), tuple(warnings))
+        combined_errors = tuple(schema_errors) + tuple(errors)
+        combined_warnings = tuple(schema_warnings) + tuple(warnings)
+        return PlanReport(
+            path,
+            roadmap_id,
+            combined_errors,
+            combined_warnings,
+            strict=strict,
+        )
     except Exception as exc:  # noqa: BLE001 - CLI boundary
         errors.append(PlanIssue("roadmap.parse", "error", f"Failed to load roadmap: {exc}"))
-        return PlanReport(path, roadmap_id, tuple(errors), tuple(warnings))
+        combined_errors = tuple(schema_errors) + tuple(errors)
+        combined_warnings = tuple(schema_warnings) + tuple(warnings)
+        return PlanReport(
+            path,
+            roadmap_id,
+            combined_errors,
+            combined_warnings,
+            strict=strict,
+        )
 
     roadmap_id = roadmap.roadmap_id
 
@@ -86,7 +146,15 @@ def lint_roadmap(roadmap_path: str | Path) -> PlanReport:
     _check_dependencies(roadmap, errors)
     _check_tasks(roadmap, errors, warnings)
 
-    return PlanReport(path, roadmap_id, tuple(errors), tuple(warnings))
+    combined_errors = tuple(schema_errors) + tuple(errors)
+    combined_warnings = tuple(schema_warnings) + tuple(warnings)
+    return PlanReport(
+        path,
+        roadmap_id,
+        combined_errors,
+        combined_warnings,
+        strict=strict,
+    )
 
 
 def _check_repo(roadmap: RoadmapConfig, errors: list[PlanIssue], warnings: list[PlanIssue]) -> None:

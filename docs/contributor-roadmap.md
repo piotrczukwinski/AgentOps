@@ -184,20 +184,41 @@ passes.
 
 ### Roadmap JSON Schema
 
-* **Description:** a formal JSON-Schema for the roadmap config
-  (`RoadmapConfig`) so editors and CI can lint roadmaps without
-  loading Python. Mirrors the rejection rules in
-  `agentops/config.py`.
+* **Description:** maintain the public roadmap JSON Schema
+  (`schemas/roadmap.schema.json`) and the stdlib internal
+  structural validator (`agentops/roadmap_schema.py`). Both
+  are already baseline: the schema is a JSON Schema 2020-12
+  document covering top-level keys, repo, tasks, review,
+  merge_policy, policies, runtime_budget, budget, and
+  defaults, plus `x_*` extension keys at every level. The
+  internal validator and the schema file are kept in sync by
+  a unit test. Future contributions can add new examples,
+  new provider keys, or new enum values, but they MUST
+  update three things in the same PR: the schema document
+  (generated via `agentops.roadmap_schema.roadmap_schema_document()`),
+  the internal validator constants and helpers, and the
+  matching tests in `tests/test_roadmap_schema.py`.
 * **Recommended issue:** open one using the
   `feature_request` template.
-* **Files:** `schemas/roadmap.schema.json` (new),
-  `agentops/config.py` (optional: cross-check on load),
-  `tests/test_config.py`.
-* **Tests:** a JSON-Schema validation test in
-  `tests/test_config.py` for every roadmap in
-  `examples/roadmaps/`.
-* **Risk:** medium. The loader is a contract surface; changes
-  there need a maintainer review.
+* **Files:** `schemas/roadmap.schema.json`,
+  `agentops/roadmap_schema.py`, `agentops/cli.py` (for the
+  `agentops schema` and `--strict` surfaces), `agentops/plan.py`
+  (for the `--strict` lint flag), `agentops/config.py`
+  (for the strict `load_roadmap` path), `tests/test_roadmap_schema.py`,
+  `tests/test_config.py`, `tests/test_plan.py`,
+  `tests/test_cli.py`, `docs/roadmap-format.md`.
+* **Tests:** at minimum one happy-path, one error-path, and
+  one legacy-alias-warning test per new field. The checked-in
+  schema must remain byte-equal to the generated document;
+  this is enforced by
+  `SchemaDocumentTests::test_checked_in_schema_matches_generated_schema`.
+  All four example roadmaps in `examples/roadmaps/` must
+  continue to validate with zero errors and zero warnings.
+* **Risk:** medium. The schema and the loader are public
+  contract surfaces; changes there need a maintainer review.
+  Strict mode is opt-in (`agentops plan --strict`,
+  `load_roadmap(strict=True)`); the default non-strict path
+  must remain backward-compatible.
 
 ### Release workflow
 

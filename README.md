@@ -377,7 +377,8 @@ agentops/
   models.py          dataclasses and enums
   operator_run.py    Operator Run Harness (long operator prompts)
   orchestrator.py    durable task loop
-  plan.py            offline roadmap lint
+  plan.py            offline roadmap lint (with --strict for structural schema validation)
+  roadmap_schema.py  public roadmap JSON Schema generator + stdlib structural validator
   policy.py          file and branch policy checks
   pr_loop.py         PR repair loop (review JSON -> repair prompt -> executor)
   prompting.py       executor / review / repair prompt compiler
@@ -420,6 +421,7 @@ examples/
 schemas/
   codex_review.schema.json
   review_verdict.schema.json
+  roadmap.schema.json
 
 tests/
 ```
@@ -447,7 +449,14 @@ tests/
 * [`docs/roadmap-format.md`](docs/roadmap-format.md) and
   [`docs/roadmap-planning-guidelines.md`](docs/roadmap-planning-guidelines.md)
   — the JSON / YAML roadmap schema and the planning contract
-  to follow when generating roadmaps with another model.
+  to follow when generating roadmaps with another model. The
+  machine-readable source of truth is
+  [`schemas/roadmap.schema.json`](schemas/roadmap.schema.json)
+  (a JSON Schema 2020-12 document). Use
+  `agentops schema --json` to print it, `agentops schema --path`
+  to print its on-disk path, and
+  `agentops plan --strict` to fail on unknown keys, type
+  mistakes, and invalid enum values before semantic linting.
 * [`docs/prompt-authoring-guidelines.md`](docs/prompt-authoring-guidelines.md)
   — task prompt and Codex review prompt rules, including the
   `allowed_files` hint semantics.
