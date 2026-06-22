@@ -9,6 +9,7 @@ template result, or no marker at all.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -857,6 +858,138 @@ class ResultGuardCodexTakeoverTests(unittest.TestCase):
                 ]
             self.assertNotIn("task.codex_takeover_queued", types)
             self.assertIn("task.result_guard_blocked", types)
+
+    def test_codex_takeover_does_not_fire_for_shell_executor(self) -> None:
+        """Regression: shell executor + missing result must stay terminal-blocked.
+
+        Shell tasks report success via exit code, not the
+        ``AGENTOPS_RESULT_JSON`` marker, so a Codex takeover after
+        marker exhaustion is meaningless and would silently swap the
+        executor. The bounded takeover predicate must reject shell
+        even when the run mode otherwise allows Codex
+        (``autonomous=True``, ``review.codex="required"``, fake codex
+        service available).
+
+        Asserts:
+        * task ends in ``blocked`` via the result-guard path,
+        * no ``task.codex_takeover_queued`` event is emitted,
+        * no transition payload carries
+          ``reason="result_guard_codex_takeover"``,
+        * no ``next_executor="codex"`` is recorded.
+        """
+        if shutil.which("true") is None:
+            self.skipTest("true binary not available on PATH")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            # Seed a tracked file so the executor has something to
+            # touch; the executor_command below intentionally does
+            # NOT print AGENTOPS_RESULT_JSON.
+            (repo / "out.txt").write_text("seed\n", encoding="utf-8")
+            _git(repo, "add", "out.txt")
+            _git(repo, "commit", "-m", "seed out")
+
+            prompt = root / "prompt.md"
+            prompt.write_text("do the thing", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "shell-takeover-test",
+                        "repo": {"id": "r", "path": str(repo), "base_branch": "HEAD"},
+                        "integration_branch": "agentops/integration/shell-takeover-test",
+                        "merge_policy": {
+                            "auto_merge": True,
+                            "strategy": "cherry_pick",
+                            "require_clean_validations": True,
+                            "require_safe_to_merge": True,
+                            "protected_branches": ["main", "master"],
+                        },
+                        "defaults": {
+                            "executor": "shell",
+                            "execution_mode": "worktree_branch",
+                            "max_attempts": 1,
+                            "timeout_seconds": 120,
+                        },
+                        "tasks": [
+                            {
+                                "id": "SHELL-CT-1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                # exit 0 with no marker — the canonical
+                                # missing_result / template_result
+                                # case for the result guard.
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "branch_prefix": "agentops",
+                                "allowed_files": ["out.txt"],
+                                "x_allow_empty_diff": True,
+                                "require_executor_result": True,
+                                "review": {"codex": "required"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            fake_codex = _FakeAvailableCodex()
+            # ``no_codex=False`` so the takeover predicate only fails
+            # on the shell-executor gate. ``autonomous=True`` is the
+            # operator opt-in that enables the takeover. The fake
+            # codex service reports available. All other gates pass.
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    no_codex=False,
+                    autonomous=True,
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+            )
+            orch.run_roadmap(roadmap)
+
+            # Terminal state: blocked via the result-guard path,
+            # never via the bounded Codex takeover.
+            rows = {r["id"]: r["state"] for r in state.task_rows("shell-takeover-test")}
+            self.assertEqual(rows["SHELL-CT-1"], "blocked")
+
+            with state.connect() as conn:
+                events = list(
+                    conn.execute(
+                        "SELECT type, payload_json FROM events "
+                        "WHERE roadmap_id='shell-takeover-test' "
+                        "AND task_id='SHELL-CT-1' ORDER BY seq"
+                    ).fetchall()
+                )
+            types = [e["type"] for e in events]
+
+            # The bounded takeover MUST NOT fire for shell.
+            self.assertNotIn("task.codex_takeover_queued", types)
+            # The terminal result-guard block MUST fire.
+            self.assertIn("task.result_guard_blocked", types)
+            self.assertIn("task.blocked_by_result_guard", types)
+            # No takeover transition payload must appear anywhere.
+            for row in events:
+                payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+                self.assertNotEqual(
+                    payload.get("reason"),
+                    "result_guard_codex_takeover",
+                    msg=f"unexpected takeover reason in {row['type']}: {payload}",
+                )
+                self.assertNotEqual(
+                    payload.get("next_executor"),
+                    "codex",
+                    msg=f"unexpected codex executor in {row['type']}: {payload}",
+                )
+            # And the fake codex service must never have been asked
+            # to review — the takeover predicate rejects before any
+            # codex_service.review() call.
+            self.assertEqual(fake_codex.calls, [])
 
 
 if __name__ == "__main__":

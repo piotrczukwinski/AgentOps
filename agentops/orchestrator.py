@@ -1190,6 +1190,7 @@ class Orchestrator:
                     )
                     _codex_allowed = (
                         self.options.autonomous
+                        and not _shell_executor
                         and task.executor != "codex"
                         and task.review.codex in {"required", "auto", "milestone_only"}
                         and not self.options.no_codex
