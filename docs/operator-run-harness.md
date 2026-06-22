@@ -1007,6 +1007,28 @@ python -m agentops operator-run \
   --idle-timeout 600
 ```
 
+### Same-session metadata in the Admin / Operator panel
+
+The Admin / Operator panel surfaces the same-session resume
+metadata the harness already writes to `status.json` (`runner_session_id`,
+`runner_session_source`, `same_session_resume_available`,
+`same_session_resume_reason`) without re-implementing any of the
+extraction logic. The `_project_operator_run_for_api` helper in
+`agentops/web.py` forwards these as `session_id` /
+`session_source` / `same_session_available` /
+`same_session_reason` keys on each run row.
+
+The new **Executor reliability** card (`/api/reliability`)
+counts how many runs carry same-session metadata and how many
+of those report `same_session_available=true`, but the actual
+`operator-resume <run-id> --same-session --dry-run` and
+`operator-retry <run-id>` invocations stay CLI-driven. The
+panel never starts a resume or a retry itself; the suggested
+action strings are plain text and are never bound to a click
+handler that runs shell. The runner probe CLI is also
+intentionally not called from the web UI; the card surfaces
+which CLI command to run instead.
+
 ## PR repair loop (`agentops pr-loop`)
 
 `operator-run` covers the *outer* operator prompt. `agentops pr-loop`

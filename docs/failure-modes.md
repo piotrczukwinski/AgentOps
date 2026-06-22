@@ -34,6 +34,27 @@ grep for, and the operator playbook for each.
   3. Re-run the prompt with a closing `AGENTOPS_RESULT_JSON`
      marker after the executor has done real work.
 
+## Operator-facing dashboard surfaces
+
+The result-guard retry / blocked events are surfaced in the
+local Admin / Operator panel as a read-only **Executor
+reliability** card backed by `GET /api/reliability`. A
+compact `reliability_summary` is also embedded in the
+`GET /api/admin` snapshot. The card counts:
+
+* `task.result_guard_retry_queued` events (`retry_queued`)
+* `task.result_guard_blocked` and `task.blocked_by_result_guard`
+  events (`blocked`)
+* per-category totals for `missing_result` and `template_result`
+  from the safe projected event payloads
+
+and links them to copyable `agentops timeline --task <id>` /
+`agentops logs <id>` CLI hints. Runner probes are CLI-only;
+the card surfaces the corresponding `agentops runner-probe
+--runner <name> --json` command but never invokes it from the
+web UI. See `docs/admin-panel-architecture.md` for the full
+contract.
+
 ## Template result
 
 * **Category:** `template_result`

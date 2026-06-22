@@ -293,6 +293,22 @@ and a compact `timeline_summary` is also embedded in
 full contract and the safety properties the timeline
 preserves.
 
+A fourth **Executor reliability** card sits beside the
+timeline. Backed by `GET /api/reliability`, it is a
+read-only rollup of the result-guard retry / blocked events
+plus the operator-run same-session metadata already written
+to `status.json`. Counts include `task.result_guard_retry_queued`
+events, `task.result_guard_blocked` / `task.blocked_by_result_guard`
+events, per-category totals for `missing_result` and
+`template_result`, and how many operator runs carry
+`same_session_available=true` metadata. The card never
+executes the suggested actions (each line is plain text and
+never bound to a click handler), and the runner probe CLI is
+also intentionally not invoked from the web UI. The compact
+`reliability_summary` block is embedded in `GET /api/admin`.
+See [`docs/admin-panel-architecture.md`](docs/admin-panel-architecture.md)
+for the full contract.
+
 ## Roadmap budget
 
 Roadmaps can declare a `budget` block that caps the run:
@@ -487,6 +503,16 @@ tests/
   properties the timeline preserves (no raw prompt bodies,
   no raw logs, no env vars, no secrets, no full local
   paths).
+* [`docs/admin-panel-architecture.md`](docs/admin-panel-architecture.md)
+  §10 — the executor reliability surface (`GET /api/reliability`,
+  the `Executor reliability` dashboard card, the
+  `reliability_summary` block in `GET /api/admin`): the
+  result-guard retry / blocked rollup, the per-category
+  counts for `missing_result` / `template_result`, the
+  operator-run same-session metadata counters, and the
+  safety properties the reliability view preserves (no
+  raw `payload_json`, no runner probes from the web UI,
+  no shell, suggested actions are text only).
 
 ### CLI and reference
 

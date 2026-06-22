@@ -169,6 +169,8 @@ Top-level keys (locked by `tests/test_web.py`):
 | `recommended_commands` | static list of 9 CLI hints | — | — |
 | `diagnostics` | `db_path`, `repo_root`, `operator_runs_root`, `pr_loop_root`, `generated_at` | — | — |
 | `usage_summary` | `state.model_call_rows()` rollup | full ledger | `totals.known_calls=0` when no calls recorded |
+| `timeline_summary` | `state.timeline_event_rows()` (limit 50) | 50 events | `count=0` when events table empty |
+| `reliability_summary` | `collect_reliability_summary()` | 100 newest events | zeroed counts when nothing recorded |
 
 The snapshot is **safe by construction**:
 
@@ -284,3 +286,111 @@ The timeline is safe by construction:
 The card auto-refreshes every 3 seconds alongside the rest of
 the dashboard and is empty-safe: a fresh checkout renders an
 "no events recorded yet" hint instead of an error.
+
+## 10. Executor reliability summary
+
+After the Run timeline card, the dashboard renders a fourth
+**Executor reliability** card. It is backed by
+`GET /api/reliability` and surfaces the operator-friendly
+rollup of the result-guard retry / blocked events recorded in
+the SQLite `events` table plus the operator-run same-session
+metadata already in `status.json`.
+
+The contract is locked by `tests/test_web.py`; the collector
+itself lives in `agentops/web.py` (`collect_reliability_snapshot`
+and `collect_reliability_summary`).
+
+### `GET /api/reliability`
+
+Query parameters (all optional):
+
+* `limit` — newest-N clamp; `1..500`, default `100`.
+
+Response shape (always present, even on a fresh checkout):
+
+```json
+{
+  "generated_at": "<iso ts>",
+  "result_guard": {
+    "retry_queued": 0,
+    "blocked": 0,
+    "latest_retry": null,
+    "latest_block": null,
+    "failure_categories": {"missing_result": 0, "template_result": 0}
+  },
+  "operator_runs": {
+    "total": 0,
+    "stale_pid": 0,
+    "needs_operator": 0,
+    "same_session_metadata": 0,
+    "same_session_available": 0,
+    "same_session_unavailable": 0,
+    "latest_attention": null
+  },
+  "runner_probe": {
+    "opencode": {"direct_run_supported": true, "note": "Use CLI: agentops runner-probe --runner opencode --json"},
+    "mmx":     {"direct_run_supported": false, "note": "Use CLI: agentops runner-probe --runner mmx --json"}
+  },
+  "suggested_actions": [
+    "agentops timeline --json",
+    "agentops usage --json",
+    "agentops operator-status --format json",
+    "agentops operator-resume <run-id> --same-session --dry-run",
+    "agentops operator-retry <run-id>"
+  ],
+  "notes": [
+    "This panel is read-only.",
+    "Runner probes are CLI-only and are not executed by the web UI.",
+    "Suggested actions are text only."
+  ]
+}
+```
+
+A compact `reliability_summary` block (count + stale-pid /
+needs-operator / same-session counters + the
+`latest_attention` row) is embedded in the `GET /api/admin`
+snapshot so the operator panel can show the reliability
+headline without fetching another endpoint.
+
+### Safety
+
+The reliability view is safe by construction:
+
+* The endpoint is GET only, loopback-only, and never invokes
+  subprocesses.
+* Runner probes are CLI-only; the web UI never calls
+  `agentops runner-probe`. The `runner_probe` block is a static
+  hint telling the operator which CLI command to run.
+* `latest_retry` / `latest_block` rows carry a copyable
+  `suggested_action` CLI hint (e.g. `agentops timeline --task
+  <id>`, `agentops logs <id>`) but the raw `payload_json`
+  column is never forwarded.
+* `latest_attention` carries a copyable `first_cli` hint
+  derived from the same operator-run attention reasons the
+  Admin / Operator panel already uses; the raw on-disk path /
+  prompt body is never forwarded.
+* Suggested-action strings only embed task / run ids that pass
+  the conservative single-component id check (no `/`,
+  no `\`, no `..`, no whitespace). Unsafe ids fall back to a
+  generic command such as `agentops timeline` so the operator
+  is never given a hint that interpolates an unsafe token.
+* The endpoint never reads files outside the state DB and the
+  operator-runs projection; no `/api/exec`, `/api/shell`,
+  `/api/command`, or `/api/run_command` endpoint is introduced
+  (the existing `tests/test_web.py::test_no_exec_or_shell_endpoint_exists`
+  test continues to pass).
+
+### Dashboard card
+
+The card (`#reliability-card`) is rendered with vanilla JS
+and a `renderReliability()` function that fetches
+`/api/reliability?limit=100` and renders the headline pills
+(result retries / result blocks / stale pid / needs operator /
+same-session metadata / missing-template counts), the latest
+attention row, and the suggested-actions list as plain text.
+Nothing in the card executes the suggestions; they are not
+bound to a click handler, never run shell, and never trigger a
+runner probe.
+
+The card auto-refreshes every 3 seconds alongside the rest of
+the dashboard.
