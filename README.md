@@ -278,6 +278,21 @@ equivalent is `agentops usage [--json]`. See
 [`docs/usage-ledger.md`](docs/usage-ledger.md) for the full
 contract.
 
+A third **Run timeline** card sits beside them. Backed by
+`GET /api/timeline`, it is a read-only projection of the
+SQLite events table: severity counts (`info` / `warning` /
+`error`), the latest warning and the latest error with a
+short safe summary, and a chronological table of the most
+recent 100 events with a copyable "suggested action" CLI
+hint per row. The timeline deliberately never exposes raw
+prompt bodies, raw logs, env vars, secrets, or full local
+paths. The CLI equivalent is `agentops timeline [--json]`,
+and a compact `timeline_summary` is also embedded in
+`GET /api/admin`. See
+[`docs/observability.md`](docs/observability.md) for the
+full contract and the safety properties the timeline
+preserves.
+
 ## Roadmap budget
 
 Roadmaps can declare a `budget` block that caps the run:
@@ -371,6 +386,7 @@ agentops/
   runners.py         shell, OpenCode, and Codex subprocess runners
   self_fix.py        bounded self-fix helpers
   state.py           SQLite schema and event log
+  timeline.py        read-only event projection (run timeline)
   usage.py           model usage normalization + summarization
   validation.py      validation command runner
   web.py             local HTTP server and dashboard
@@ -392,6 +408,7 @@ docs/
   codex-for-oss-application.md
   public-release-audit.md
   usage-ledger.md
+  observability.md
   demo.md
   case-studies/
     agentops-self-maintenance.md
@@ -452,6 +469,15 @@ tests/
   recorded, what stays `unknown`, what the
   `AGENTOPS_USAGE_JSON` marker is for, and the explicit
   safety properties the ledger preserves.
+* [`docs/observability.md`](docs/observability.md) — the run
+  timeline observability surface (`GET /api/timeline`,
+  `agentops timeline`, the `Run timeline` dashboard card,
+  the `timeline_summary` block in `GET /api/admin`): the
+  exact projection rules, the suggested-action mapping,
+  the per-event-type summary contract, and the safety
+  properties the timeline preserves (no raw prompt bodies,
+  no raw logs, no env vars, no secrets, no full local
+  paths).
 
 ### CLI and reference
 

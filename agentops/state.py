@@ -507,6 +507,60 @@ class StateStore:
             cur = conn.execute("SELECT * FROM events ORDER BY seq DESC LIMIT ?", (limit,))
             return list(cur.fetchall())
 
+    def timeline_event_rows(
+        self,
+        roadmap_id: str | None = None,
+        task_id: str | None = None,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        """Return ``events`` rows newest-first, with optional filters.
+
+        Filtering rules:
+
+        * ``roadmap_id`` — when truthy, restrict to events for that
+          ``roadmap_id``. Falsy / ``None`` means "no filter".
+        * ``task_id`` — when truthy, restrict to events for that
+          ``task_id``. Falsy / ``None`` means "no filter".
+        * When both filters are set the clauses are AND-ed.
+
+        ``limit`` is clamped to ``[1, 1000]``; values that are not
+        real integers (``bool``, ``None``, strings, etc.) fall back
+        to the default of ``100``. ``bool`` is explicitly rejected
+        even though ``bool`` is a subclass of ``int`` in Python, so
+        a future caller cannot smuggle ``True`` / ``False`` past
+        the limit check.
+
+        No schema migration, no writes. Used by the CLI
+        (``agentops timeline``) and by the dashboard
+        (``/api/timeline`` and the ``timeline_summary`` block of
+        ``/api/admin``). The collector reverses the result for
+        chronological display order.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            clamped = 100
+        else:
+            clamped = max(1, min(int(limit), 1000))
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if isinstance(roadmap_id, str) and roadmap_id:
+            clauses.append("roadmap_id = ?")
+            params.append(roadmap_id)
+        if isinstance(task_id, str) and task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            "SELECT seq, roadmap_id, task_id, attempt_id, type, "
+            "payload_json, created_at FROM events"
+            + where_sql
+            + " ORDER BY seq DESC LIMIT ?"
+        )
+        params.append(clamped)
+        with self.connect() as conn:
+            cur = conn.execute(sql, params)
+            return list(cur.fetchall())
+
     def artifacts_for_task(self, task_id: str) -> list[sqlite3.Row]:
         with self.connect() as conn:
             cur = conn.execute("SELECT * FROM artifacts WHERE task_id=? ORDER BY created_at", (task_id,))

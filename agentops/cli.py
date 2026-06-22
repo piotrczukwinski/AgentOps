@@ -225,6 +225,23 @@ def build_parser() -> argparse.ArgumentParser:
     usage_cmd.add_argument("--roadmap", default=None, help="Filter by roadmap id.")
     usage_cmd.add_argument("--task", default=None, help="Filter by task id.")
 
+    timeline_cmd = sub.add_parser(
+        "timeline",
+        help="Show a read-only projection of recorded run events.",
+        description=(
+            "Read the ``events`` table from the local SQLite state DB and print a "
+            "safe, read-only projection of the run timeline. The projection never "
+            "exposes raw prompt bodies, raw logs, env vars, secrets, or full local "
+            "paths. Missing/corrupt payloads degrade to a safe summary instead of "
+            "crashing. Use ``--json`` for machine-readable output that matches the "
+            "``/api/timeline`` contract."
+        ),
+    )
+    timeline_cmd.add_argument("--json", action="store_true", help="Emit JSON instead of a text table.")
+    timeline_cmd.add_argument("--limit", type=int, default=100, help="How many of the newest events to show. Clamped to 1..500. Default: 100.")
+    timeline_cmd.add_argument("--roadmap", default=None, help="Filter by roadmap id.")
+    timeline_cmd.add_argument("--task", default=None, help="Filter by task id.")
+
     plan = sub.add_parser("plan", help="Lint a roadmap file without running it. Does not call models or create worktrees.")
     plan.add_argument("--roadmap", required=True, help="Path to roadmap JSON/YAML file.")
     plan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
@@ -787,6 +804,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "usage":
             return _cmd_usage(state, args)
+
+        if args.command == "timeline":
+            return _cmd_timeline(state, args)
 
         if args.command == "plan":
             return _cmd_plan(args.roadmap, args.json)
@@ -1692,6 +1712,143 @@ def _cmd_usage(state: StateStore, args: argparse.Namespace) -> int:
         print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True, indent=2))
     else:
         _print_usage_text(snapshot)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# timeline
+# ---------------------------------------------------------------------------
+
+
+TIMELINE_CLI_DEFAULT_LIMIT = 100
+TIMELINE_CLI_MAX_LIMIT = 500
+
+
+def _timeline_snapshot_for_cli(
+    state: StateStore,
+    *,
+    limit: int,
+    roadmap: str | None,
+    task: str | None,
+) -> dict[str, Any]:
+    """Build the JSON-shaped timeline payload for the ``agentops timeline`` CLI.
+
+    Mirrors the shape of :func:`agentops.web.collect_timeline_snapshot`
+    so the CLI does not have to import :mod:`agentops.web`. The DB
+    rows are projected through the pure
+    :mod:`agentops.timeline` helpers, so the JSON is identical to
+    what ``/api/timeline`` returns (modulo the ``generated_at``
+    timestamp and the applied filter).
+    """
+    from .timeline import (
+        severity_counts as _severity_counts,
+    )
+    from .timeline import (
+        timeline_rows_from_events,
+    )
+
+    state.init()
+    rows = state.timeline_event_rows(
+        roadmap_id=roadmap if roadmap else None,
+        task_id=task if task else None,
+        limit=limit,
+    )
+    # DB returns newest-first; reverse for chronological display
+    # order (oldest-first), which matches the dashboard.
+    chronological = list(reversed(rows))
+    projected = timeline_rows_from_events(chronological)
+    counts = _severity_counts(projected)
+    notes = [
+        "Timeline is local-only and read from the SQLite event log.",
+        "Raw payloads, prompts and logs are not exposed.",
+    ]
+    return {
+        "generated_at": utc_now_iso(),
+        "filter": {"roadmap_id": roadmap, "task_id": task},
+        "limit": int(limit),
+        "count": len(projected),
+        "severity_counts": counts,
+        "rows": projected,
+        "notes": notes,
+    }
+
+
+def _print_timeline_text(snapshot: dict[str, Any]) -> None:
+    """Pretty-print a timeline snapshot as a human-readable table."""
+    print(f"AgentOps timeline (snapshot: {snapshot.get('generated_at')})")
+    filter_block = snapshot.get("filter") or {}
+    if filter_block.get("roadmap_id") or filter_block.get("task_id"):
+        filters = ", ".join(
+            f"{key}={value}" for key, value in filter_block.items() if value
+        )
+        if filters:
+            print(f"  filter: {filters}")
+    counts = snapshot.get("severity_counts") or {}
+    print()
+    print("Severity counts")
+    print(f"  info    : {int(counts.get('info', 0))}")
+    print(f"  warning : {int(counts.get('warning', 0))}")
+    print(f"  error   : {int(counts.get('error', 0))}")
+    rows = snapshot.get("rows") or []
+    if not rows:
+        print()
+        print("No timeline events recorded yet.")
+        return
+    print()
+    headers = ("time", "sev", "roadmap", "task", "attempt", "type", "summary", "action")
+    rows_text: list[tuple[str, ...]] = []
+    for row in rows:
+        rows_text.append(
+            (
+                str(row.get("created_at") or "-"),
+                str(row.get("severity") or "info"),
+                str(row.get("roadmap_id") or "-"),
+                str(row.get("task_id") or "-"),
+                str(row.get("attempt_id") or "-"),
+                str(row.get("type") or "-"),
+                str(row.get("summary") or ""),
+                str(row.get("suggested_action") or ""),
+            )
+        )
+    widths = [len(h) for h in headers]
+    for r in rows_text:
+        widths = [max(w, len(c)) for w, c in zip(widths, r, strict=True)]
+    line = "  ".join(h.ljust(w) for h, w in zip(headers, widths, strict=True))
+    sep = "  ".join("-" * w for w in widths)
+    print(line)
+    print(sep)
+    for r in rows_text:
+        print("  ".join(c.ljust(w) for c, w in zip(r, widths, strict=True)))
+    print()
+    notes = snapshot.get("notes") or []
+    if notes:
+        print("Notes:")
+        for note in notes:
+            print(f"  - {note}")
+
+
+def _cmd_timeline(state: StateStore, args: argparse.Namespace) -> int:
+    """Entry point for ``agentops timeline``.
+
+    Emits the same JSON shape as ``/api/timeline`` when ``--json``
+    is set, so a downstream consumer can switch between the CLI
+    and the web API without a shape conversion.
+    """
+    limit_raw = getattr(args, "limit", TIMELINE_CLI_DEFAULT_LIMIT)
+    try:
+        limit = int(limit_raw)
+    except (TypeError, ValueError):
+        limit = TIMELINE_CLI_DEFAULT_LIMIT
+    if isinstance(limit, bool) or limit <= 0:
+        limit = TIMELINE_CLI_DEFAULT_LIMIT
+    limit = min(limit, TIMELINE_CLI_MAX_LIMIT)
+    roadmap = getattr(args, "roadmap", None) or None
+    task = getattr(args, "task", None) or None
+    snapshot = _timeline_snapshot_for_cli(state, limit=limit, roadmap=roadmap, task=task)
+    if getattr(args, "json", False):
+        print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True, indent=2))
+    else:
+        _print_timeline_text(snapshot)
     return 0
 
 

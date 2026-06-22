@@ -51,6 +51,15 @@ from . import bundles
 from .artifacts import safe_name
 from .plan import lint_roadmap
 from .state import StateStore
+from .timeline import (
+    latest_by_severity as _timeline_latest_by_severity,
+)
+from .timeline import (
+    severity_counts as _timeline_severity_counts,
+)
+from .timeline import (
+    timeline_rows_from_events as _timeline_rows_from_events,
+)
 from .usage import summarize_model_calls
 
 log = logging.getLogger("agentops.web")
@@ -1189,6 +1198,144 @@ def _totals_from_summary(summary: dict[str, Any], rollup: dict[str, Any]) -> dic
 
 
 # ---------------------------------------------------------------------------
+# Run timeline (read-only, loopback-only)
+# ---------------------------------------------------------------------------
+#
+# The timeline is a safe projection over the SQLite events table. The
+# raw ``payload_json`` (which can carry prompt bodies, raw logs,
+# env vars, or secrets) is never forwarded; instead the pure
+# helpers in :mod:`agentops.timeline` produce a short summary
+# plus a conservative severity and a copyable CLI hint. Mirrors
+# the safety-first PR expectations in ``AGENTS.md``.
+
+TIMELINE_NOTES: tuple[str, ...] = (
+    "Timeline is local-only and read from the SQLite event log.",
+    "Raw payloads, prompts and logs are not exposed.",
+)
+
+
+def _timeline_empty_snapshot(
+    *,
+    limit: int,
+    roadmap_id: str | None,
+    task_id: str | None,
+    notes_extra: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    notes: list[str] = list(TIMELINE_NOTES)
+    notes.extend(notes_extra)
+    return {
+        "generated_at": _utc_now_iso(),
+        "filter": {"roadmap_id": roadmap_id, "task_id": task_id},
+        "limit": int(limit),
+        "count": 0,
+        "severity_counts": {"info": 0, "warning": 0, "error": 0},
+        "latest_error": None,
+        "latest_warning": None,
+        "rows": [],
+        "notes": notes,
+    }
+
+
+def collect_timeline_snapshot(
+    state: StateStore,
+    *,
+    roadmap_id: str | None = None,
+    task_id: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Return the dashboard/API-ready timeline snapshot.
+
+    The shape is the single source of truth for both the
+    ``/api/timeline`` endpoint and the ``Run timeline`` card. It
+    is read-only, loopback-only, never invokes subprocesses, and
+    never exposes ``payload_json``.
+
+    Top-level keys:
+
+    * ``generated_at`` — ISO timestamp the snapshot was computed.
+    * ``filter`` — the ``roadmap_id`` / ``task_id`` filter that was
+      applied (both ``None`` for "no filter").
+    * ``limit`` — the newest-N clamp that was applied.
+    * ``count`` — number of rows in the snapshot.
+    * ``severity_counts`` — ``{"info", "warning", "error"}`` counts.
+    * ``latest_error`` / ``latest_warning`` — newest matching row
+      or ``None``; convenient for the dashboard hero pills.
+    * ``rows`` — projected event rows (chronological order).
+    * ``notes`` — short human-readable explanations.
+
+    A corrupt event payload must never raise; on read failure
+    the snapshot degrades to the empty shape with an extra
+    "Timeline read failed" note.
+    """
+    try:
+        state.init()
+        rows = state.timeline_event_rows(
+            roadmap_id=roadmap_id,
+            task_id=task_id,
+            limit=limit,
+        )
+    except Exception as exc:  # noqa: BLE001 - never raise out of the snapshot
+        log.warning("collect_timeline_snapshot: state lookup failed: %s", exc)
+        snap = _timeline_empty_snapshot(
+            limit=limit,
+            roadmap_id=roadmap_id,
+            task_id=task_id,
+            notes_extra=("Timeline read failed.",),
+        )
+        return snap
+    # DB returns newest-first; reverse for chronological display
+    # (oldest-first) so the dashboard reads top-to-bottom.
+    chronological = list(reversed(rows))
+    projected = _timeline_rows_from_events(chronological)
+    counts = _timeline_severity_counts(projected)
+    latest_error = _timeline_latest_by_severity(projected, "error")
+    latest_warning = _timeline_latest_by_severity(projected, "warning")
+    return {
+        "generated_at": _utc_now_iso(),
+        "filter": {"roadmap_id": roadmap_id, "task_id": task_id},
+        "limit": int(limit),
+        "count": len(projected),
+        "severity_counts": counts,
+        "latest_error": latest_error,
+        "latest_warning": latest_warning,
+        "rows": projected,
+        "notes": list(TIMELINE_NOTES),
+    }
+
+
+def collect_timeline_summary(state: StateStore) -> dict[str, Any]:
+    """Return the compact ``timeline_summary`` block for ``/api/admin``.
+
+    Bounded to the 50 newest events (the operator panel only needs
+    a headline, not the full timeline). Same projection rules as
+    :func:`collect_timeline_snapshot`; the payload is identical
+    except for the ``limit`` and the row list.
+    """
+    try:
+        snap = collect_timeline_snapshot(state, limit=50)
+    except Exception as exc:  # noqa: BLE001 - never raise out of the snapshot
+        log.warning("collect_timeline_summary: state lookup failed: %s", exc)
+        return {
+            "generated_at": _utc_now_iso(),
+            "count": 0,
+            "severity_counts": {"info": 0, "warning": 0, "error": 0},
+            "latest_event": None,
+            "latest_error": None,
+            "latest_warning": None,
+            "notes": list(TIMELINE_NOTES),
+        }
+    return {
+        "generated_at": snap["generated_at"],
+        "count": snap["count"],
+        "severity_counts": snap["severity_counts"],
+        "latest_event": snap["rows"][-1] if snap["rows"] else None,
+        "latest_error": snap["latest_error"],
+        "latest_warning": snap["latest_warning"],
+        "notes": list(TIMELINE_NOTES),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Admin / Operator panel snapshot (read-only, loopback-only)
 # ---------------------------------------------------------------------------
 #
@@ -1646,6 +1793,7 @@ def collect_admin_snapshot(state: StateStore) -> dict[str, Any]:
         "recommended_commands": list(ADMIN_RECOMMENDED_COMMANDS),
         "diagnostics": diagnostics,
         "usage_summary": collect_usage_summary(state),
+        "timeline_summary": collect_timeline_summary(state),
     }
 
 
@@ -1934,6 +2082,9 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/usage":
             self._handle_usage(query)
             return
+        if path == "/api/timeline":
+            self._handle_timeline(query)
+            return
 
         self._send_json({"error": f"not found: {path}"}, status=404)
 
@@ -2008,6 +2159,41 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             )
         else:
             snapshot = collect_usage_snapshot(self._server_state().state, limit=limit)
+        self._send_json(snapshot)
+
+    def _handle_timeline(self, query: dict) -> None:
+        """Serve :func:`collect_timeline_snapshot` for ``GET /api/timeline``.
+
+        Query parameters (all optional):
+
+        * ``limit`` — newest-N clamp; ``1..500``, default ``100``.
+        * ``roadmap`` — filter by ``roadmap_id``.
+        * ``task`` — filter by ``task_id``.
+
+        The endpoint is GET only, read-only, never reads files
+        outside the DB, never invokes subprocesses, and never
+        includes the raw ``payload_json`` column. Empty filters
+        return the global snapshot so the dashboard can call it
+        without arguments.
+        """
+        limit_raw = (query.get("limit") or ["100"])[0]
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 500))
+        roadmap_raw = (query.get("roadmap") or [None])[0]
+        task_raw = (query.get("task") or [None])[0]
+        roadmap_filter = (
+            roadmap_raw if isinstance(roadmap_raw, str) and roadmap_raw.strip() else None
+        )
+        task_filter = task_raw if isinstance(task_raw, str) and task_raw.strip() else None
+        snapshot = collect_timeline_snapshot(
+            self._server_state().state,
+            roadmap_id=roadmap_filter,
+            task_id=task_filter,
+            limit=limit,
+        )
         self._send_json(snapshot)
 
     def _filtered_usage_snapshot(
@@ -2709,6 +2895,9 @@ INDEX_TEMPLATE = """<!doctype html>
   .status-dot.stale { background: #d97706; }
   .runtime-stale { color: #d97706; font-weight: 600; }
   @media (prefers-color-scheme: dark) { .runtime-stale { color: #f0a830; } }
+  .timeline-sev-info { background: #8883; }
+  .timeline-sev-warning { background: #d97706; color: #fff; }
+  .timeline-sev-error { background: #b00020; color: #fff; }
 </style>
 </head>
 <body>
@@ -2781,6 +2970,31 @@ INDEX_TEMPLATE = """<!doctype html>
     </table>
     <h3 style="font-size:13px;margin:12px 0 4px;">Recommended CLI commands</h3>
     <ul id="admin-recommended-commands" class="muted" style="margin:0;padding-left:18px;"></ul>
+  </section>
+
+  <section class="card" id="timeline-card">
+    <h2 style="margin-top:0;font-size:15px;">Run timeline <span class="muted" id="timeline-generated-at"></span></h2>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="pill" id="timeline-info-count">info: -</span>
+      <span class="pill" id="timeline-warning-count">warning: -</span>
+      <span class="pill" id="timeline-error-count">error: -</span>
+    </div>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="muted" id="timeline-latest-warning">latest warning: -</span>
+    </div>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="muted" id="timeline-latest-error">latest error: -</span>
+    </div>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="muted" id="timeline-refresh-note">local read from the SQLite event log; no raw payloads are rendered.</span>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Severity</th><th>Roadmap</th><th>Task</th><th>Attempt</th><th>Event type</th><th>Summary</th><th>Suggested action</th></tr>
+      </thead>
+      <tbody id="timeline-rows"><tr><td colspan="8" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <div class="muted" id="timeline-empty" style="display:none;">No timeline events recorded yet.</div>
   </section>
 
   <section class="card">
@@ -2981,6 +3195,14 @@ INDEX_TEMPLATE = """<!doctype html>
   const adminPrLoopSummary = $("admin-pr-loop-summary");
   const adminPrLoopRows = $("admin-pr-loop-rows");
   const adminRecommendedCommands = $("admin-recommended-commands");
+  const timelineInfoCount = $("timeline-info-count");
+  const timelineWarningCount = $("timeline-warning-count");
+  const timelineErrorCount = $("timeline-error-count");
+  const timelineLatestWarning = $("timeline-latest-warning");
+  const timelineLatestError = $("timeline-latest-error");
+  const timelineRows = $("timeline-rows");
+  const timelineEmpty = $("timeline-empty");
+  const timelineGeneratedAt = $("timeline-generated-at");
   const usageGeneratedAt = $("usage-generated-at");
   const usageEmptyPill = $("usage-empty-pill");
   const usageSummary = $("usage-summary");
@@ -3775,6 +3997,61 @@ async function tailOperatorRun() {
     }
   }
 
+  async function renderTimeline() {
+    if (!timelineRows) return;
+    const res = await fetchJson("/api/timeline?limit=100");
+    if (!res.ok || !res.data) {
+      if (timelineInfoCount) timelineInfoCount.textContent = "info: ?";
+      if (timelineWarningCount) timelineWarningCount.textContent = "warning: ?";
+      if (timelineErrorCount) timelineErrorCount.textContent = "error: ?";
+      if (timelineLatestWarning) timelineLatestWarning.textContent = "latest warning: unavailable";
+      if (timelineLatestError) timelineLatestError.textContent = "latest error: unavailable";
+      timelineRows.innerHTML = '<tr><td colspan="8" class="muted">timeline snapshot unavailable</td></tr>';
+      return;
+    }
+    const data = res.data;
+    const counts = data.severity_counts || {};
+    if (timelineInfoCount) timelineInfoCount.textContent = "info: " + (counts.info || 0);
+    if (timelineWarningCount) timelineWarningCount.textContent = "warning: " + (counts.warning || 0);
+    if (timelineErrorCount) timelineErrorCount.textContent = "error: " + (counts.error || 0);
+    if (timelineGeneratedAt) {
+      timelineGeneratedAt.textContent = data.generated_at ? "snapshot: " + data.generated_at : "";
+    }
+    if (timelineLatestWarning) {
+      const w = data.latest_warning;
+      timelineLatestWarning.textContent = w
+        ? "latest warning: " + (w.type || "?") + (w.summary ? " - " + w.summary : "")
+        : "latest warning: none";
+    }
+    if (timelineLatestError) {
+      const e = data.latest_error;
+      timelineLatestError.textContent = e
+        ? "latest error: " + (e.type || "?") + (e.summary ? " - " + e.summary : "")
+        : "latest error: none";
+    }
+    const rows = data.rows || [];
+    if (!rows.length) {
+      timelineRows.innerHTML = '<tr><td colspan="8" class="muted">no events</td></tr>';
+      if (timelineEmpty) timelineEmpty.style.display = "block";
+      return;
+    }
+    if (timelineEmpty) timelineEmpty.style.display = "none";
+    timelineRows.innerHTML = rows.map(function (r) {
+      const sev = r.severity || "info";
+      const action = r.suggested_action || "";
+      return "<tr>"
+        + "<td>" + escapeHtml(r.created_at) + "</td>"
+        + '<td><span class="pill timeline-sev-' + escapeHtml(sev) + '">' + escapeHtml(sev) + "</span></td>"
+        + "<td>" + escapeHtml(r.roadmap_id || "-") + "</td>"
+        + "<td>" + escapeHtml(r.task_id || "-") + "</td>"
+        + "<td>" + escapeHtml(r.attempt_id || "-") + "</td>"
+        + "<td>" + escapeHtml(r.type) + "</td>"
+        + "<td>" + escapeHtml(r.summary || "") + "</td>"
+        + "<td><code>" + escapeHtml(action) + "</code></td>"
+        + "</tr>";
+    }).join("");
+  }
+
   async function validateBundle(name) {
     if (!name) return;
     bundleValidateOutput.className = "muted";
@@ -3792,11 +4069,13 @@ async function tailOperatorRun() {
   loadRoadmaps();
   renderAdmin();
   renderUsage();
+  renderTimeline();
   refresh();
   autoTimer = setInterval(function () {
     refresh();
     renderAdmin();
     renderUsage();
+    renderTimeline();
   }, 3000);
 })();
 </script>

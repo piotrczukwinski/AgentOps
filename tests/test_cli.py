@@ -462,5 +462,163 @@ class CliUsageTests(unittest.TestCase):
             self.assertEqual(len(payload["latest_calls"]), 2)
 
 
+class CliTimelineTests(unittest.TestCase):
+    """End-to-end tests for ``agentops timeline`` (the run timeline CLI)."""
+
+    def _seed(self, store: StateStore) -> None:
+        store.event("r", None, None, "roadmap.imported", {"tasks": 1})
+        store.event("r", "T1", "A1", "attempt.started", {"attempt_no": 1})
+        store.event(
+            "r",
+            "T1",
+            "A1",
+            "attempt.finished",
+            {"exit_code": 0, "head_sha": "deadbeef12345678"},
+        )
+        store.event(
+            "r",
+            "T1",
+            "A1",
+            "task.awaiting_review",
+            {"reviewer": "codex"},
+        )
+        store.event(
+            "r",
+            "T1",
+            "A1",
+            "task.validation_failed",
+            {
+                "failure_category": "validation_failed",
+                "prompt_body": "SECRET-PROMPT-BODY",
+            },
+        )
+
+    def test_timeline_json_shape_on_empty_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite"
+            result = _Runner().run(
+                ["--db", str(db_path), "timeline", "--json"]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["count"], 0)
+            self.assertEqual(payload["rows"], [])
+            self.assertEqual(
+                payload["severity_counts"],
+                {"info": 0, "warning": 0, "error": 0},
+            )
+            self.assertIn("notes", payload)
+
+    def test_timeline_text_output_on_empty_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite"
+            result = _Runner().run(["--db", str(db_path), "timeline"])
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("AgentOps timeline", result.stdout)
+            self.assertIn("No timeline events recorded yet.", result.stdout)
+
+    def test_timeline_json_shape_with_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite"
+            store = StateStore(db_path)
+            store.init()
+            self._seed(store)
+            result = _Runner().run(
+                ["--db", str(db_path), "timeline", "--json"]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["count"], 5)
+            self.assertGreaterEqual(
+                payload["severity_counts"]["info"], 2
+            )
+            self.assertGreaterEqual(
+                payload["severity_counts"]["warning"], 1
+            )
+            self.assertEqual(payload["severity_counts"]["error"], 1)
+            # Prompt body MUST NOT leak into the JSON.
+            serialized = json.dumps(payload, sort_keys=True)
+            self.assertNotIn("SECRET-PROMPT-BODY", serialized)
+            self.assertNotIn("prompt_body", serialized)
+
+    def test_timeline_text_output_renders_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite"
+            store = StateStore(db_path)
+            store.init()
+            self._seed(store)
+            result = _Runner().run(["--db", str(db_path), "timeline"])
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("Severity counts", result.stdout)
+            self.assertIn("attempt.finished", result.stdout)
+            self.assertIn("task.validation_failed", result.stdout)
+            # Secret body MUST NOT leak into the text output either.
+            self.assertNotIn("SECRET-PROMPT-BODY", result.stdout)
+
+    def test_timeline_filters_by_roadmap_and_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite"
+            store = StateStore(db_path)
+            store.init()
+            store.event("r-a", "T1", "A1", "task.ready", {})
+            store.event("r-a", "T2", "A1", "task.ready", {})
+            store.event("r-b", "T1", "A1", "task.ready", {})
+            result = _Runner().run(
+                [
+                    "--db",
+                    str(db_path),
+                    "timeline",
+                    "--roadmap",
+                    "r-a",
+                    "--task",
+                    "T1",
+                    "--json",
+                ]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["filter"]["roadmap_id"], "r-a")
+            self.assertEqual(payload["filter"]["task_id"], "T1")
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["rows"][0]["roadmap_id"], "r-a")
+            self.assertEqual(payload["rows"][0]["task_id"], "T1")
+
+    def test_timeline_text_filter_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite"
+            store = StateStore(db_path)
+            store.init()
+            self._seed(store)
+            result = _Runner().run(
+                [
+                    "--db",
+                    str(db_path),
+                    "timeline",
+                    "--roadmap",
+                    "r",
+                ]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("filter: roadmap_id=r", result.stdout)
+
+    def test_timeline_limit_clamped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite"
+            result = _Runner().run(
+                [
+                    "--db",
+                    str(db_path),
+                    "timeline",
+                    "--limit",
+                    "99999",
+                    "--json",
+                ]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            # CLI clamp at 500.
+            self.assertLessEqual(payload["limit"], 500)
+
+
 if __name__ == "__main__":
     unittest.main()
