@@ -117,7 +117,10 @@ class ProfilesCLITests(unittest.TestCase):
                                 "executor": "shell",
                                 "executor_command": "true",
                                 "allowed_files": ["out.txt"],
-                                "review": {"codex": "never"},
+                                "review": {
+                                    "codex": "never",
+                                    "profile": "codex-high",
+                                },
                             }
                         ],
                     }
@@ -168,7 +171,10 @@ class ProfilesCLITests(unittest.TestCase):
                                 "executor": "shell",
                                 "executor_command": "true",
                                 "allowed_files": ["out.txt"],
-                                "review": {"codex": "never"},
+                                "review": {
+                                    "codex": "never",
+                                    "profile": "codex-high",
+                                },
                             }
                         ],
                     }
@@ -212,7 +218,10 @@ class ProfilesCLITests(unittest.TestCase):
                                 "executor": "shell",
                                 "executor_command": "true",
                                 "allowed_files": ["out.txt"],
-                                "review": {"codex": "never"},
+                                "review": {
+                                    "codex": "never",
+                                    "profile": "codex-high",
+                                },
                             }
                         ],
                     }

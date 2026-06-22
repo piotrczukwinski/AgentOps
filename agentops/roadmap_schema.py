@@ -98,6 +98,7 @@ REVIEW_KEYS: frozenset[str] = frozenset(
         "schema",
         "self_fix",
         "self_fix_max_lines",
+        "profile",
     }
 )
 

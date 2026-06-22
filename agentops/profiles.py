@@ -1430,20 +1430,27 @@ def resolve_executor_profile(
     if chosen is not None and chosen.profile_name:
         profile = _lookup_executor(registry, chosen.profile_name, issues=issues)
 
-    # Registry default: pick the first executor that satisfies the
-    # task's kind, falling back to the first executor in the
-    # registry. We never auto-pick a profile just because a task
-    # says "executor_profile" is empty; the explicit choice wins.
+    # Registry default: when no profile is selected anywhere, fall
+    # back to the first executor in the registry. This is the
+    # documented registry-default path (issue #57): a task that
+    # does not declare a profile still benefits from the registry
+    # when the operator has installed one. The branch also
+    # covers the case where the task declares
+    # ``executor: codex_cli`` but no ``executor_profile``: the
+    # operator is opting into the profile system.
     if (
         profile is None
-        and chosen is not None
-        and chosen.profile_name is None
         and registry.executors
+        and (chosen is None or chosen.profile_name is None)
     ):
-        # No explicit request; the resolver falls back to the
-        # registry's first executor.
-        first = next(iter(registry.executors))
-        profile = registry.executors[first]
+        task_executor = _get_task_field(task, "executor")
+        # Only fall back to the registry default when the
+        # task has opted into the codex_cli transport. The
+        # legacy ``shell`` / ``opencode`` executors keep
+        # their behaviour unchanged.
+        if task_executor == "codex_cli":
+            first = next(iter(registry.executors))
+            profile = registry.executors[first]
 
     if profile is None:
         # No registry match. Build a synthetic profile from the
@@ -1576,9 +1583,35 @@ def resolve_reviewer_profile(
     profile: ReviewerProfile | None = None
     if chosen is not None and chosen.profile_name:
         profile = _lookup_reviewer(registry, chosen.profile_name, issues=issues)
-    if profile is None and registry.reviewers:
-        first = next(iter(registry.reviewers))
-        profile = registry.reviewers[first]
+    if (
+        profile is None
+        and registry.reviewers
+        and (chosen is None or chosen.profile_name is None)
+    ):
+        task_review = _get_task_review(task)
+        roadmap_review = _get_roadmap_review(roadmap)
+        # The "operator opted into the profile system" signal
+        # is broader than just ``review.profile``: a CLI
+        # override on the executor side also signals
+        # adoption, as do the typed ``reviewer_profile`` /
+        # ``reviewer_reasoning_effort`` defaults on the
+        # roadmap. The legacy ``codex_model`` / env var path
+        # is intentionally NOT an opt-in: existing
+        # roadmaps that only set those keep their MVP
+        # behaviour unchanged.
+        cli_overrides_local = cli_overrides or {}
+        has_cli = bool(
+            cli_overrides_local.get("profile_name")
+            or cli_overrides_local.get("reasoning_effort")
+        )
+        has_profile_opt_in = bool(
+            task_review.get("profile")
+            or roadmap_review.get("profile")
+            or has_cli
+        )
+        if has_profile_opt_in:
+            first = next(iter(registry.reviewers))
+            profile = registry.reviewers[first]
 
     if profile is None:
         # No registry match; use legacy codex/heuristic behaviour.

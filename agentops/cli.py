@@ -1210,6 +1210,16 @@ def main(argv: list[str] | None = None) -> int:
                 executor_startup_timeout=args.executor_startup_timeout,
                 executor_idle_timeout=args.executor_idle_timeout,
                 codex_idle_timeout=getattr(args, "codex_idle_timeout", None),
+                # Profile-registry overrides (issue #57). The CLI
+                # values are passed through verbatim; the
+                # orchestrator resolves them against the
+                # registry with the documented precedence
+                # (CLI > task > roadmap/default > registry > legacy).
+                profiles_path=getattr(args, "profiles", None),
+                executor_profile=getattr(args, "executor_profile", None),
+                executor_reasoning_effort=getattr(args, "executor_reasoning_effort", None),
+                reviewer_profile=getattr(args, "reviewer_profile", None),
+                reviewer_reasoning_effort=getattr(args, "reviewer_reasoning_effort", None),
             )
             orch = Orchestrator(state, options)
             if args.resume:

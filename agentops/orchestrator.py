@@ -58,7 +58,7 @@ from .review import (
     ReviewDecision,
     ReviewRouter,
 )
-from .runners import BaseRunner, runner_for
+from .runners import BaseRunner, CodexCliProfileRunner, runner_for
 from .self_fix import (
     SelfFixOutcome,
     changed_line_count,
@@ -332,6 +332,19 @@ class RunOptions:
     # ``timed_out=True`` with ``failure_category="codex_idle_timeout"``
     # so a wedged codex call does not block the whole roadmap.
     codex_idle_timeout: float | None = None
+    # Profile-registry overrides (issue #52 / #57). When any of
+    # these are set, the orchestrator pre-resolves the profile
+    # registry once per ``run_roadmap`` invocation and applies
+    # the overrides onto each task before runner selection.
+    # ``None`` means "honor the task / roadmap / registry choice";
+    # the precedence is CLI > task > roadmap/default > registry >
+    # legacy. See :func:`agentops.profiles.resolve_executor_profile`
+    # and :func:`agentops.profiles.resolve_reviewer_profile`.
+    profiles_path: str | None = None
+    executor_profile: str | None = None
+    executor_reasoning_effort: str | None = None
+    reviewer_profile: str | None = None
+    reviewer_reasoning_effort: str | None = None
 
 
 @dataclass
@@ -436,6 +449,13 @@ class Orchestrator:
         """
         self.state.init()
         self.state.import_roadmap(roadmap)
+        # Resolve the profile registry once per roadmap so the
+        # per-task override path can read it without re-reading
+        # disk. The registry is also injected into the codex_cli
+        # runner (issue #57) so the runner never has to call
+        # ``find_profile_registry`` with ``task.prompt_path`` as
+        # the roadmap path.
+        self._profile_registry = self._resolve_profile_registry(roadmap)
         if resume:
             self._reconcile_inflight_for_resume(roadmap)
         policy = PolicyEngine(roadmap)
@@ -598,6 +618,14 @@ class Orchestrator:
         budget: BudgetManager,
     ) -> None:
         runtime = _TaskRuntime()
+        # Apply profile-registry overrides (issue #57) so
+        # ``task.executor_profile`` / ``task.executor`` / ``task.model``
+        # / ``task.review`` reflect the CLI overrides (and the
+        # registry default) before any other code path reads them.
+        # The resolved task is then used as the source of truth for
+        # runner selection, the prompt compiler, the policy engine,
+        # and the reviewer dispatcher.
+        task = self._apply_profile_overrides(task, roadmap)
         self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.PREFLIGHT)
         # When the integration branch exists (i.e. a prior task has
         # already been merged into it), base the new task branch on the
@@ -2326,7 +2354,125 @@ class Orchestrator:
             and self._injected_opencode_runner is not None
         ):
             return self._injected_opencode_runner
-        return runner_for(task)
+        runner = runner_for(task)
+        # Inject the pre-resolved profile registry into the
+        # CodexCliProfileRunner so it never has to call
+        # ``find_profile_registry`` with ``task.prompt_path`` as
+        # the roadmap path (issue #57). The runner falls back to
+        # ``None`` for tests that do not pre-resolve the registry.
+        if isinstance(runner, CodexCliProfileRunner):
+            runner.set_profile_registry(getattr(self, "_profile_registry", None))
+        return runner
+
+    def _resolve_profile_registry(self, roadmap: RoadmapConfig) -> Any:
+        """Return the profile registry to use for this roadmap.
+
+        Honors the standard lookup order: explicit
+        ``RunOptions.profiles_path`` (CLI ``--profiles``) > the
+        roadmap's ``profiles_path`` field > the repo-local
+        ``<repo>/.agentops/profiles.json`` > the user-local
+        ``$XDG_CONFIG_HOME/agentops/profiles.json`` > the built-in
+        defaults. The orchestrator caches the result on
+        ``self._profile_registry`` so the codex_cli runner does
+        not have to re-read the disk.
+        """
+        from .profiles import (
+            ProfileRegistry,
+            find_profile_registry,
+        )
+        try:
+            return find_profile_registry(
+                explicit_path=self.options.profiles_path,
+                roadmap_path=str(roadmap.path) if roadmap.path else None,
+                repo_path=str(roadmap.repo.path) if roadmap.repo.path else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - boundary
+            log.warning(
+                "failed to resolve profile registry for roadmap %s: %s; "
+                "falling back to built-in defaults",
+                roadmap.roadmap_id,
+                exc,
+            )
+            return ProfileRegistry(
+                version=1,
+                executors={},
+                reviewers={},
+                path=None,
+                builtin=True,
+            )
+
+    def _apply_profile_overrides(
+        self,
+        task: TaskConfig,
+        roadmap: RoadmapConfig,
+    ) -> TaskConfig:
+        """Return a copy of ``task`` with profile-registry overrides applied.
+
+        The override precedence matches :func:`agentops.profiles.resolve_executor_profile`
+        and :func:`agentops.profiles.resolve_reviewer_profile`: CLI >
+        task > roadmap/default > registry > legacy. The method never
+        mutates the original task; the returned value is a new
+        frozen dataclass instance (via :func:`dataclasses.replace`).
+        """
+        from .profiles import (
+            resolve_executor_profile,
+            resolve_reviewer_profile,
+        )
+        registry = getattr(self, "_profile_registry", None)
+        if registry is None:
+            return task
+        executor_cli = {
+            "profile_name": self.options.executor_profile,
+            "reasoning_effort": self.options.executor_reasoning_effort,
+        }
+        resolved_exec = resolve_executor_profile(
+            task, roadmap, registry, cli_overrides=executor_cli,
+        )
+        effective = task
+        if resolved_exec.profile is not None:
+            new_executor = resolved_exec.provider
+            new_model = resolved_exec.model or effective.model
+            new_profile = resolved_exec.profile_name
+            new_reasoning = (
+                resolved_exec.reasoning_effort
+                or effective.executor_reasoning_effort
+            )
+            effective = replace(
+                effective,
+                executor=new_executor,
+                model=new_model,
+                executor_profile=new_profile,
+                executor_reasoning_effort=new_reasoning,
+            )
+        reviewer_cli = {
+            "profile_name": self.options.reviewer_profile,
+            "reasoning_effort": self.options.reviewer_reasoning_effort,
+        }
+        resolved_rev = resolve_reviewer_profile(
+            effective, roadmap, registry, cli_overrides=reviewer_cli,
+        )
+        if resolved_rev.profile is not None:
+            review = effective.review
+            new_review_model = (
+                resolved_rev.model
+                or review.codex_model
+            )
+            new_review_reasoning = (
+                resolved_rev.reasoning_effort
+                or review.reasoning_effort
+                or review.model_reasoning_effort
+            )
+            effective = replace(
+                effective,
+                review=replace(
+                    review,
+                    profile=resolved_rev.profile_name,
+                    codex_model=new_review_model or review.codex_model,
+                    reasoning_effort=new_review_reasoning,
+                    model_reasoning_effort=new_review_reasoning or review.model_reasoning_effort,
+                ),
+            )
+        return effective
 
     @staticmethod
     def _provider_for_executor(executor: str) -> str:
