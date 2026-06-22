@@ -108,6 +108,19 @@ If a change touches one of the above on purpose (for example, a
 new operator-opt-in flag), call it out in the PR description and
 add a test that proves the **default** is still safe.
 
+## Operator task settlement
+
+`agentops task-settle` is the only sanctioned way to record a
+task whose work has been merged outside the normal AgentOps flow
+(for example, a Codex-supervised rescue branch). The CLI has a
+single new escape hatch: `--allow-ready-external` permits a
+`ready` -> `merged` transition only when an explicit
+`--external-commit` (hex SHA) and a non-empty `--reason` are
+also provided. Every other in-flight state, every transition to
+`accepted`, and `--force` alone remain refused. Do not edit the
+state DB by hand to bypass the safety matrix; if the settlement
+path does not fit, file a follow-up issue.
+
 ## Do not modify `main` directly
 
 * Open PRs from a topic branch (e.g.

@@ -52,6 +52,23 @@ from .models import TaskState
 # Safety matrix
 # ---------------------------------------------------------------------------
 
+def _is_valid_external_commit(commit: str | None) -> bool:
+    """Return True when ``commit`` looks like a hex SHA (7..40 chars).
+
+    Loose validation: any 7-40 char hex string is accepted. Loose
+    enough for short test SHAs (``deadbeef``) and full 40-char git
+    SHAs, strict enough to refuse arbitrary text. The check is only
+    enforced on the new ``--allow-ready-external`` path so the
+    existing ``task-settle`` flow is unchanged.
+    """
+    if not commit:
+        return False
+    text = str(commit).strip()
+    if not (7 <= len(text) <= 40):
+        return False
+    return all(ch in "0123456789abcdefABCDEF" for ch in text)
+
+
 #: States the operator may settle to ``accepted`` / ``merged`` by
 #: default without ``--force``.
 DEFAULT_OPENABLE_STATES: frozenset[str] = frozenset(
@@ -133,6 +150,7 @@ class TaskSettlementDecision:
     external_commit: str | None
     include_dependents: bool
     force: bool
+    allow_ready_external: bool = False
     refusal_reason: str = ""
     dependent_ids: tuple[str, ...] = ()
     events: tuple[str, ...] = (
@@ -151,6 +169,7 @@ class TaskSettlementDecision:
             "external_commit": self.external_commit,
             "include_dependents": self.include_dependents,
             "force": self.force,
+            "allow_ready_external": self.allow_ready_external,
             "dependent_ids": list(self.dependent_ids),
             "events": list(self.events),
         }
@@ -217,6 +236,7 @@ def evaluate_task_settle(
     external_commit: str | None,
     include_dependents: bool = False,
     force: bool = False,
+    allow_ready_external: bool = False,
 ) -> TaskSettlementDecision:
     """Decide whether the requested settlement is permitted.
 
@@ -240,6 +260,63 @@ def evaluate_task_settle(
             include_dependents=include_dependents,
             force=force,
             refusal_reason=error,
+        )
+
+    # ------------------------------------------------------------------
+    # Narrow escape hatch for externally merged READY tasks.
+    # Only ``ready`` (no executor actually running) and only when the
+    # operator provides an explicit ``--allow-ready-external`` flag
+    # plus ``--external-commit`` plus ``--reason``. ``--force`` alone
+    # does not unlock this path. All other in-flight states
+    # (planned/preflight/executor_*/validating/...) remain refused.
+    # ------------------------------------------------------------------
+    if previous_state == TaskState.READY.value and allow_ready_external:
+        if target_state != TaskState.MERGED.value:
+            return TaskSettlementDecision(
+                allowed=False,
+                target_state=target_state,
+                previous_state=previous_state,
+                reason=reason,
+                external_commit=(external_commit or None),
+                include_dependents=include_dependents,
+                force=force,
+                allow_ready_external=True,
+                refusal_reason=(
+                    "refusing settlement: --allow-ready-external only "
+                    f"permits READY -> merged; got target={target_state!r}"
+                ),
+            )
+        if not _is_valid_external_commit(external_commit):
+            return TaskSettlementDecision(
+                allowed=False,
+                target_state=target_state,
+                previous_state=previous_state,
+                reason=reason,
+                external_commit=(external_commit or None),
+                include_dependents=include_dependents,
+                force=force,
+                allow_ready_external=True,
+                refusal_reason=(
+                    "refusing settlement: --allow-ready-external requires "
+                    "--external-commit to be a hex SHA (7..40 chars, "
+                    "0-9a-fA-F)"
+                ),
+            )
+        return TaskSettlementDecision(
+            allowed=True,
+            target_state=target_state,
+            previous_state=previous_state,
+            reason=reason,
+            external_commit=(external_commit or None),
+            include_dependents=include_dependents,
+            force=force,
+            allow_ready_external=True,
+            dependent_ids=(),
+            events=(
+                "task.operator_settle_requested",
+                "task.settled_external",
+                "task.settled_external_ready",
+            ),
         )
 
     if previous_state in IN_FLIGHT_STATES:
@@ -266,6 +343,7 @@ def evaluate_task_settle(
             external_commit=(external_commit or None),
             include_dependents=include_dependents,
             force=force,
+            allow_ready_external=allow_ready_external,
             refusal_reason=(
                 f"refusing settlement: task is already in protected "
                 f"terminal state {previous_state!r}; pass --force to override"
@@ -281,6 +359,7 @@ def evaluate_task_settle(
             external_commit=(external_commit or None),
             include_dependents=include_dependents,
             force=force,
+            allow_ready_external=allow_ready_external,
             refusal_reason=(
                 f"refusing settlement: state {previous_state!r} is not in the "
                 f"settlement allowlist "
@@ -296,6 +375,7 @@ def evaluate_task_settle(
         external_commit=(external_commit or None),
         include_dependents=include_dependents,
         force=force,
+        allow_ready_external=allow_ready_external,
     )
 
 
@@ -495,6 +575,7 @@ def apply_task_settle(
         "requested_by": "operator_cli",
         "include_dependents": bool(decision.include_dependents),
         "force": bool(decision.force),
+        "allow_ready_external": bool(decision.allow_ready_external),
     }
 
     if dry_run:
@@ -543,8 +624,25 @@ def apply_task_settle(
             "requested_by": "operator_cli",
             "include_dependents": bool(decision.include_dependents),
             "force": bool(decision.force),
+            "allow_ready_external": bool(decision.allow_ready_external),
         },
     )
+    if bool(decision.allow_ready_external):
+        state.event(
+            roadmap_id,
+            task_id,
+            None,
+            "task.settled_external_ready",
+            {
+                "previous_state": decision.previous_state,
+                "new_state": decision.target_state,
+                "reason": decision.reason,
+                "external_commit": decision.external_commit,
+                "include_dependents": bool(decision.include_dependents),
+                "force": bool(decision.force),
+                "evidence_gated": True,
+            },
+        )
 
     dependent_ids = ()
     if decision.include_dependents:
@@ -603,6 +701,7 @@ def apply_task_settle(
 
 __all__ = [
     "ALLOWED_TARGET_STATES",
+    "_is_valid_external_commit",
     "DEFAULT_OPENABLE_STATES",
     "DEPENDENCY_SKIP_REASON_TOKENS",
     "FORCE_REQUIRED_STATES",

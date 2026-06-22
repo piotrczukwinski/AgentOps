@@ -524,6 +524,66 @@ All per-task state is in `<repo>/.agentops/state.sqlite`. Tables:
 `agentops status` and `agentops logs` are the read APIs; `decide` and
 `review` are the write APIs for human-in-the-loop steering.
 
+## Operator task settlement (`agentops task-settle`)
+
+`agentops task-settle <task-id>` lets a human operator record that a
+task's work has already been merged outside AgentOps without invoking
+an executor. The settlement is written as a pair of audit events plus
+an optional third event for the explicit escape hatch below; the
+state DB transitions the task to the requested target state.
+
+### Default safety matrix
+
+| previous state                          | default result | `--force` | new `--allow-ready-external` |
+|-----------------------------------------|----------------|-----------|------------------------------|
+| `merge_failed` / `blocked` / `failed`    | allowed        | n/a       | n/a                          |
+| `validation_failed` / `awaiting_human`   | allowed        | n/a       | n/a                          |
+| `accepted` / `pushed` / `merged` / `skipped` | refused   | allowed   | refused (does not unlock)   |
+| `ready` (no executor running)            | **refused**    | refused   | **allowed** (with safeguards)|
+| any other in-flight state               | refused        | refused   | refused                      |
+
+`--force` alone cannot unlock in-flight refusals. The new
+`--allow-ready-external` flag is required, and is only meaningful
+when the previous state is exactly `ready` and the target state is
+exactly `merged`.
+
+### When to use `--allow-ready-external`
+
+Use the flag for tasks whose work was completed via a manual or
+external PR (for example a Codex-supervised rescue branch) and the
+task never entered an AgentOps run, so the state machine still
+shows `ready`. This is the natural state for tasks that were
+implemented, reviewed, and merged outside the normal
+`` → `` → `merged` flow.
+
+Do **not** use the flag as a generic bypass. The flag requires:
+
+* current state is exactly `ready` (no executor is actually running);
+* target state is exactly `merged` (never `accepted`);
+* `--external-commit` is a hex SHA (7..40 chars, `0-9a-fA-F`);
+* `--reason` is present and non-empty;
+* the flag is passed explicitly (`--force` does not unlock it).
+
+### Audit trail
+
+When the flag is used, `agentops task-settle` writes three events:
+
+1. `task.operator_settle_requested` (standard)
+2. `task.settled_external` (standard)
+3. `task.settled_external_ready` (new, evidence-gated marker)
+
+The `allow_ready_external: true` field is recorded in the payload of
+all three events so the morning checklist can grep for
+externally-cleared `ready` tasks.
+
+### Why not just remove `ready` from `IN_FLIGHT_STATES`?
+
+`ready` is the agent's "next to run" state. Settling it without
+external evidence could allow a stale or duplicate PR to silently
+mask a real bug. The explicit flag + external commit + reason is
+the minimum signal we need to trust an external settlement, and the
+new path keeps every other in-flight state refused.
+
 ## Known merge risks
 
 * `agentops/cli.py` and `README.md` are also touched by the local web UI
