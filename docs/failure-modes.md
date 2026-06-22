@@ -9,9 +9,23 @@ grep for, and the operator playbook for each.
 
 * **Category:** `missing_result`
 * **Detected by:** `agentops.operator_run.classify_result_marker`
+  (and the orchestrator's gated result guard when
+  ``require_executor_result`` is on, which is the default for
+  ``kind="implementation"`` agent-executor tasks).
 * **When:** the executor process exits 0 but no
   `AGENTOPS_RESULT_JSON` marker is present in `combined.log` (or
   the marker is present but the body is missing or unparseable).
+* **First-line behaviour:** if the orchestrator still has retry
+  budget (``attempt_no < max_attempts``) the task is queued for
+  a result-guard retry: ``task.result_guard_retry_queued`` is
+  recorded, the task transitions to ``REPAIR_PROMPT_READY``,
+  ``repair.prompt.md`` is written, and the next attempt is
+  started with a bounded repair prompt that explicitly demands
+  either a real ``status=\"done\"`` result after a real file
+  change or a ``status=\"blocked\"`` result with a concrete
+  reason. Only when the budget is exhausted does the task
+  transition to ``BLOCKED`` with ``task.result_guard_blocked``
+  and ``task.blocked_by_result_guard`` events.
 * **Operator playbook:**
   1. `agentops operator-tail <run-id> --lines 200` to inspect the
      captured stdout/stderr.
@@ -24,9 +38,17 @@ grep for, and the operator playbook for each.
 
 * **Category:** `template_result`
 * **Detected by:** `agentops.operator_run.is_template_placeholder_result`
+  (and the orchestrator's gated result guard).
 * **When:** the executor printed `AGENTOPS_RESULT_JSON: "..."` or
   `AGENTOPS_RESULT_JSON: "done|blocked"` (or one of the other
   known placeholders) before producing a real result.
+* **First-line behaviour:** same retry-queue path as
+  `missing_result`: the orchestrator writes a bounded repair
+  prompt and re-runs the executor while budget remains; only
+  after the budget is exhausted does the task transition to
+  `BLOCKED`. The shell executor is exempt (its result is the
+  exit code, not the marker), and ``require_executor_result``
+  can still opt out per-task.
 * **Operator playbook:**
   1. `agentops operator-tail <run-id> --lines 200` to confirm the
      placeholder.

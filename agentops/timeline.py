@@ -91,6 +91,7 @@ _WARNING_EXACT: frozenset[str] = frozenset(
         "task.awaiting_human",
         "task.repair_requested",
         "task.request_changes",
+        "task.result_guard_retry_queued",
     }
 )
 _ERROR_EXACT: frozenset[str] = frozenset(
@@ -100,6 +101,8 @@ _ERROR_EXACT: frozenset[str] = frozenset(
         "task.merge_failed",
         "task.executor_no_output_startup",
         "task.executor_idle_timeout",
+        "task.result_guard_blocked",
+        "task.blocked_by_result_guard",
     }
 )
 _ERROR_SUBSTRINGS: tuple[str, ...] = (

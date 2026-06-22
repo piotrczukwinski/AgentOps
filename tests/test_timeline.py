@@ -134,6 +134,27 @@ class ClassifyEventSeverityTests(unittest.TestCase):
             timeline.TIMELINE_SEVERITIES,
         )
 
+    def test_result_guard_retry_queued_is_warning(self) -> None:
+        """Executor-reliability v0.2: result-guard retries are warning, not error."""
+        self.assertEqual(
+            timeline.classify_event_severity("task.result_guard_retry_queued"),
+            "warning",
+        )
+
+    def test_result_guard_blocked_is_error(self) -> None:
+        """Executor-reliability v0.2: result-guard blocks are error."""
+        self.assertEqual(
+            timeline.classify_event_severity("task.result_guard_blocked"),
+            "error",
+        )
+
+    def test_blocked_by_result_guard_is_error(self) -> None:
+        """The roadmap-wide blocked-by-result_guard event is also an error."""
+        self.assertEqual(
+            timeline.classify_event_severity("task.blocked_by_result_guard"),
+            "error",
+        )
+
 
 class SafeTextTests(unittest.TestCase):
     def test_safe_text_collapses_whitespace(self) -> None:

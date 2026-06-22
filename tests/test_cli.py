@@ -754,5 +754,157 @@ class CliTimelineTests(unittest.TestCase):
             self.assertLessEqual(payload["limit"], 500)
 
 
+class CliRunnerProbeTests(unittest.TestCase):
+    """End-to-end tests for ``agentops runner-probe``."""
+
+    def test_runner_probe_missing_runner(self) -> None:
+        result = _Runner().run(
+            ["runner-probe", "--runner", "definitely-not-a-runner-xyz-12345"]
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("command_exists=False", result.stdout)
+
+    def test_runner_probe_missing_runner_json(self) -> None:
+        result = _Runner().run(
+            [
+                "runner-probe",
+                "--runner",
+                "definitely-not-a-runner-xyz-12345",
+                "--json",
+            ]
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["command_exists"])
+        self.assertFalse(payload["direct_run_supported"])
+
+    def test_runner_probe_opencode_json(self) -> None:
+        """When opencode is on PATH the probe reports direct_run_supported=True."""
+        import shutil
+
+        if shutil.which("opencode") is None:
+            self.skipTest("opencode not on PATH")
+        result = _Runner().run(["runner-probe", "--runner", "opencode", "--json"])
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["command_exists"])
+        self.assertTrue(payload["direct_run_supported"])
+
+
+class CliOperatorResumeTests(unittest.TestCase):
+    """End-to-end tests for ``agentops operator-resume``."""
+
+    def test_operator_resume_rejects_missing_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "state.sqlite")
+            result = _Runner().run(
+                [
+                    "--db",
+                    db,
+                    "operator-resume",
+                    "definitely-not-a-run-id-xyz",
+                    "--dir",
+                    tmp,
+                ]
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("operator-resume", result.stderr)
+
+    def test_operator_resume_metadata_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "state.sqlite")
+            # Lay down a run directory with no session marker.
+            runs = Path(tmp) / ".operator-runs"
+            run_dir = runs / "test-no-session-1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "prompt.md").write_text("hi", encoding="utf-8")
+            (run_dir / "combined.log").write_text(
+                "noise without session markers\n", encoding="utf-8"
+            )
+            (run_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "test-no-session-1",
+                        "name": None,
+                        "created_at": "2026-01-01T00:00:00+00:00",
+                        "workdir": tmp,
+                        "model": "minimax/MiniMax-M3",
+                        "runner": "opencode",
+                        "yolo": False,
+                        "detach": False,
+                        "prompt_path": str(run_dir / "prompt.md"),
+                        "status": "exited",
+                        "updated_at": "2026-01-01T00:00:00+00:00",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = _Runner().run(
+                [
+                    "--db",
+                    db,
+                    "operator-resume",
+                    "test-no-session-1",
+                    "--dir",
+                    tmp,
+                    "--format",
+                    "json",
+                ]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["same_session_available"])
+            self.assertIn("runner_session_id", payload)
+
+    def test_operator_resume_same_session_requires_metadata(self) -> None:
+        """--same-session without metadata exits non-zero with a clear reason."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "state.sqlite")
+            runs = Path(tmp) / ".operator-runs"
+            run_dir = runs / "test-no-session-2"
+            run_dir.mkdir(parents=True)
+            (run_dir / "prompt.md").write_text("hi", encoding="utf-8")
+            (run_dir / "combined.log").write_text("noise\n", encoding="utf-8")
+            (run_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "test-no-session-2",
+                        "name": None,
+                        "created_at": "2026-01-01T00:00:00+00:00",
+                        "workdir": tmp,
+                        "model": "minimax/MiniMax-M3",
+                        "runner": "opencode",
+                        "yolo": False,
+                        "detach": False,
+                        "prompt_path": str(run_dir / "prompt.md"),
+                        "status": "exited",
+                        "updated_at": "2026-01-01T00:00:00+00:00",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = _Runner().run(
+                [
+                    "--db",
+                    db,
+                    "operator-resume",
+                    "test-no-session-2",
+                    "--dir",
+                    tmp,
+                    "--same-session",
+                    "--dry-run",
+                ]
+            )
+            self.assertNotEqual(result.returncode, 0)
+            combined = result.stdout + result.stderr
+            self.assertIn("unavailable", combined)
+
+
 if __name__ == "__main__":
     unittest.main()

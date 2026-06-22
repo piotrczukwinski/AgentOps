@@ -3137,5 +3137,244 @@ class OperatorRunFollowTests(unittest.TestCase):
                 self.assertNotIn("prompt.md", recorded[-1])
 
 
+# ---------------------------------------------------------------------------
+# Session-handle extraction and same-session resume observability
+# ---------------------------------------------------------------------------
+
+
+class ExtractSessionHandleTests(unittest.TestCase):
+    """Safe extraction of session handles from executor output.
+
+    The function is intentionally conservative: it must not parse
+    arbitrary resume commands, must not return unsafe tokens, and
+    must never raise.
+    """
+
+    def test_parses_explicit_session_json_marker(self) -> None:
+        from agentops.operator_run import extract_session_handle
+
+        text = 'AGENTOPS_SESSION_JSON: {"runner": "opencode", "session_id": "abc.123-xyz"}'
+        result = extract_session_handle(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["runner"], "opencode")
+        self.assertEqual(result["session_id"], "abc.123-xyz")
+        self.assertEqual(result["source"], "agentops_session_json")
+
+    def test_parses_equals_form_session_json_marker(self) -> None:
+        from agentops.operator_run import extract_session_handle
+
+        text = 'AGENTOPS_SESSION_JSON={"runner": "mmx", "session_id": "session-9"}'
+        result = extract_session_handle(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["runner"], "mmx")
+        self.assertEqual(result["session_id"], "session-9")
+        self.assertEqual(result["source"], "agentops_session_json")
+
+    def test_parses_plain_session_id_line(self) -> None:
+        from agentops.operator_run import extract_session_handle
+
+        text = "session_id: opencode-abc.123-xyz\n"
+        result = extract_session_handle(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_id"], "opencode-abc.123-xyz")
+        self.assertEqual(result["source"], "plain_session_id")
+
+    def test_rejects_unsafe_token_with_shell_metachar(self) -> None:
+        from agentops.operator_run import extract_session_handle
+
+        # Backticks, dollar signs, and quotes must not survive.
+        unsafe_tokens = [
+            "abc; rm -rf /",
+            "abc`whoami`",
+            "abc$HOME",
+            "abc&&echo",
+            "abc|cat",
+            "abc def",
+            "../escape",
+            "a/b",
+            "a\\b",
+        ]
+        for tok in unsafe_tokens:
+            text = f'session_id: {tok}\n'
+            result = extract_session_handle(text)
+            self.assertIsNone(result, msg=f"unsafe token {tok!r} must be rejected")
+
+    def test_rejects_too_short_or_too_long_tokens(self) -> None:
+        from agentops.operator_run import extract_session_handle
+
+        # Too short.
+        self.assertIsNone(extract_session_handle("session_id: ab\n"))
+        # Too long (over 160 chars).
+        long_token = "a" * 200
+        text = f"session_id: {long_token}\n"
+        self.assertIsNone(extract_session_handle(text))
+
+    def test_ignores_resume_commands(self) -> None:
+        """The function must never parse resume CLI syntax as a session id."""
+        from agentops.operator_run import extract_session_handle
+
+        text = (
+            "usage: opencode resume --session <id>\n"
+            "or: opencode --resume-session my-session-id\n"
+        )
+        result = extract_session_handle(text)
+        self.assertIsNone(result)
+
+    def test_returns_none_for_empty_or_missing_input(self) -> None:
+        from agentops.operator_run import extract_session_handle
+
+        self.assertIsNone(extract_session_handle(""))
+        self.assertIsNone(extract_session_handle("hello world\n"))
+        self.assertIsNone(extract_session_handle(None))  # type: ignore[arg-type]
+
+
+class SameSessionResumeStatusTests(unittest.TestCase):
+    def test_available_false_when_no_session_id(self) -> None:
+        from agentops.operator_run import same_session_resume_status
+
+        status = same_session_resume_status({"runner": "opencode"})
+        self.assertFalse(status["available"])
+        self.assertEqual(status["runner"], "opencode")
+        self.assertIsNone(status["session_id"])
+        self.assertEqual(status["reason"], "no_session_handle_in_status")
+
+    def test_available_false_when_runner_not_in_resume_capable_set(self) -> None:
+        from agentops.operator_run import same_session_resume_status
+
+        status = same_session_resume_status(
+            {"runner": "opencode", "runner_session_id": "abc-123"}
+        )
+        self.assertFalse(status["available"])
+        self.assertEqual(status["runner"], "opencode")
+        self.assertEqual(status["session_id"], "abc-123")
+        self.assertIn("automatic resume is not implemented", status["reason"])
+
+    def test_invalid_input_is_safe(self) -> None:
+        from agentops.operator_run import same_session_resume_status
+
+        self.assertFalse(same_session_resume_status(None)["available"])
+        self.assertFalse(same_session_resume_status("not-a-dict")["available"])
+
+
+class StalePidResumeHintTests(unittest.TestCase):
+    def test_hint_mentions_operator_retry_when_no_session(self) -> None:
+        from agentops.operator_run import stale_pid_resume_hint
+
+        hint = stale_pid_resume_hint({"runner": "opencode"})
+        self.assertIn("operator-retry", hint)
+
+    def test_hint_mentions_operator_resume_when_session_metadata_present(self) -> None:
+        from agentops.operator_run import stale_pid_resume_hint
+
+        # Session metadata is present but the runner is not in the
+        # resume-capable set, so the same-session path is still not
+        # auto-available. The hint reflects the conservative answer.
+        hint = stale_pid_resume_hint(
+            {"runner": "opencode", "runner_session_id": "abc-123"}
+        )
+        self.assertIn("operator-retry", hint)
+
+
+class RunnerProbeTests(unittest.TestCase):
+    def test_opencode_is_direct_supported_when_on_path(self) -> None:
+        """``agentops runner-probe --runner opencode`` must report
+        direct_run_supported=True when the binary exists on PATH and
+        the harness has a tested argv builder for it."""
+        import shutil
+
+        from agentops.operator_run import probe_runner
+
+        if shutil.which("opencode") is None:
+            self.skipTest("opencode not on PATH")
+        result = probe_runner("opencode")
+        self.assertTrue(result["command_exists"])
+        self.assertTrue(result["direct_run_supported"])
+        self.assertTrue(result["supported_by_operator_run"])
+        self.assertFalse(result["same_session_resume_supported"])
+        self.assertTrue(result["command_path"].endswith("/opencode"))
+
+    def test_missing_runner_reports_command_exists_false(self) -> None:
+        from agentops.operator_run import probe_runner
+
+        result = probe_runner("definitely-not-a-real-runner-xyz123")
+        self.assertFalse(result["command_exists"])
+        self.assertFalse(result["direct_run_supported"])
+        self.assertEqual(result["runner"], "definitely-not-a-real-runner-xyz123")
+        self.assertIn("not found on PATH", result["reason"])
+
+    def test_probe_does_not_use_shell_true(self) -> None:
+        """The probe must use ``shell=False`` when invoking --help.
+
+        This is a defensive check: the probe runs ``--help`` only,
+        but the safety contract forbids ``shell=True`` for every
+        subprocess AgentOps launches. We verify by inspecting the
+        source code.
+        """
+        from agentops import operator_run
+
+        source = Path(operator_run.__file__).read_text(encoding="utf-8")
+        # The probe_runner function should appear and should set shell=False
+        # when launching --help. We don't try to introspect the call;
+        # we just check that the module does not contain a shell=True
+        # anywhere inside probe_runner.
+        start = source.find("def probe_runner")
+        end = source.find("\n\n\n", start) if start >= 0 else -1
+        body = source[start:end] if start >= 0 and end > start else ""
+        self.assertIn("shell=False", body)
+        self.assertNotIn("shell=True", body)
+
+
+class SessionHandleInStatusJsonTests(unittest.TestCase):
+    """After a run emits a session marker, the persisted status.json
+    must carry the safe session-id fields."""
+
+    def test_record_session_handle_persists_fields(self) -> None:
+        from agentops.operator_run import (
+            DEFAULT_MODEL,
+            DEFAULT_RUNNER,
+            record_session_handle,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_id = "test-20250101T000000Z-abc12345"
+            target = root / ".operator-runs" / run_id
+            target.mkdir(parents=True)
+            (target / "prompt.md").write_text("hi", encoding="utf-8")
+            (target / "combined.log").write_text(
+                'AGENTOPS_SESSION_JSON: {"runner": "opencode", "session_id": "abc.123-xyz"}\n',
+                encoding="utf-8",
+            )
+            payload = {
+                "run_id": run_id,
+                "name": None,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "workdir": str(root),
+                "model": DEFAULT_MODEL,
+                "runner": DEFAULT_RUNNER,
+                "yolo": False,
+                "detach": False,
+                "prompt_path": str(target / "prompt.md"),
+                "status": "exited",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+            }
+            (target / "status.json").write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            handle = record_session_handle(target)
+            self.assertIsNotNone(handle)
+            self.assertEqual(handle["session_id"], "abc.123-xyz")
+            persisted = json.loads(
+                (target / "status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(persisted.get("runner_session_id"), "abc.123-xyz")
+            self.assertEqual(
+                persisted.get("runner_session_source"), "agentops_session_json"
+            )
+            self.assertIn("same_session_resume_available", persisted)
+            self.assertIn("same_session_resume_reason", persisted)
+
+
 if __name__ == "__main__":
     unittest.main()
