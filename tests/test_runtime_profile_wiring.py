@@ -67,7 +67,6 @@ def _valid_registry() -> dict[str, Any]:
                         "exec",
                         "-p",
                         "{profile}",
-                        "--dangerously-bypass-approvals-and-sandbox",
                         "-C",
                         "{cwd}",
                         "{prompt_file}",
@@ -203,14 +202,6 @@ class OrchestratorProfileWiringTests(unittest.TestCase):
             )
             repo = _init_repo(tmp / "ws")
             roadmap_path = self._make_roadmap(tmp, repo)
-
-            # We can't actually run the codex CLI here (no real
-            # codex), so we drive the orchestrator with the
-            # pre-resolved registry. The runner resolves the
-            # registry, the codex binary runs the script, and the
-            # task ends. We only assert the resolved task carried
-            # the CLI overrides.
-
             from agentops.config import load_roadmap
             from agentops.state import StateStore
             state = StateStore(tmp / "state.sqlite")
@@ -228,7 +219,6 @@ class OrchestratorProfileWiringTests(unittest.TestCase):
                     no_codex=True,
                 ),
             )
-            # Pre-resolve the registry as the orchestrator would.
             orch._profile_registry = find_profile_registry(
                 explicit_path=str(profiles_path),
                 roadmap_path=str(roadmap_path),
@@ -238,12 +228,6 @@ class OrchestratorProfileWiringTests(unittest.TestCase):
             self.assertIn(
                 "minimax-via-codex", orch._profile_registry.executors
             )
-
-            # Apply the CLI overrides onto the task via the
-            # orchestrator's helper. The resolved task should
-            # carry the executor profile and reviewer profile
-            # from the CLI, and the executor field should be
-            # ``codex_cli`` (the profile's provider).
             task = roadmap.tasks[0]
             effective = orch._apply_profile_overrides(task, roadmap)
             self.assertEqual(effective.executor, "codex_cli")
@@ -311,9 +295,6 @@ class OrchestratorProfileWiringTests(unittest.TestCase):
             )
             # And the resolved task uses the registry default.
             effective = orch._apply_profile_overrides(roadmap.tasks[0], roadmap)
-            # The first executor in the registry is
-            # ``minimax-via-codex`` (alphabetical), so the
-            # effective task should use it.
             self.assertEqual(effective.executor, "codex_cli")
             self.assertEqual(effective.executor_profile, "minimax-via-codex")
             self.assertEqual(effective.model, "MiniMax-M3")
@@ -344,9 +325,6 @@ class CodexCliRunnerRegistryTests(unittest.TestCase):
             )
             registry = load_profile_registry_from_mapping(_valid_registry())
             runner = CodexCliProfileRunner()
-            # Inject the registry explicitly. The runner must use
-            # the injected registry, not look up a roadmap via
-            # task.prompt_path.
             runner.set_profile_registry(registry)
             cwd = tmp / "ws"
             cwd.mkdir(parents=True, exist_ok=True)
@@ -384,11 +362,14 @@ class CodexCliRunnerRegistryTests(unittest.TestCase):
             from agentops.profiles import builtin_profile_registry
             from agentops.runners import CodexCliProfileRunner as _CCR
             runner = _CCR()
-            runner = CodexCliProfileRunner()
             runner.set_profile_registry(builtin_profile_registry())
             with tempfile.TemporaryDirectory() as tmp:
                 tmp = Path(tmp)
                 _fake_codex(tmp, "echo ok > out.txt")
+                env = {
+                    **os.environ,
+                    "PATH": f"{tmp}:" + os.environ.get("PATH", ""),
+                }
                 from agentops.models import ReviewConfig, TaskConfig
                 task = TaskConfig(
                     id="T1",
@@ -401,20 +382,16 @@ class CodexCliRunnerRegistryTests(unittest.TestCase):
                     allowed_files=("out.txt",),
                     review=ReviewConfig(codex="never"),
                 )
-                # ``_apply_profile_overrides`` is called inside
-                # the orchestrator, not the runner. The runner
-                # only consumes the already-resolved task. The
-                # patched ``find_profile_registry`` must not be
-                # called.
                 cwd = tmp / "ws"
                 cwd.mkdir(parents=True, exist_ok=True)
                 (cwd / "prompt.md").write_text("hi", encoding="utf-8")
-                runner.run(
-                    task,
-                    prompt="hi",
-                    cwd=cwd,
-                    artifact_dir=tmp / "artifacts",
-                )
+                with mock.patch.dict(os.environ, env, clear=False):
+                    runner.run(
+                        task,
+                        prompt="hi",
+                        cwd=cwd,
+                        artifact_dir=tmp / "artifacts",
+                    )
             self.assertFalse(
                 find.called,
                 "runner must not call find_profile_registry",
