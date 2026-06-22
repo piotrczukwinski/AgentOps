@@ -424,5 +424,65 @@ class LatestBySeverityTests(unittest.TestCase):
         )
 
 
+class SafeCommandLabelTests(unittest.TestCase):
+    def test_safe_command_label_plain_string(self) -> None:
+        self.assertEqual(timeline.safe_command_label("codex"), "codex")
+
+    def test_safe_command_label_falls_back_to_codex_for_non_string(self) -> None:
+        self.assertEqual(timeline.safe_command_label(None), "codex")
+        self.assertEqual(timeline.safe_command_label(""), "codex")
+        self.assertEqual(timeline.safe_command_label(42), "codex")
+        self.assertEqual(timeline.safe_command_label([]), "codex")
+
+    def test_safe_command_label_strips_full_path_to_basename(self) -> None:
+        self.assertEqual(
+            timeline.safe_command_label("/home/user/bin/codex"),
+            "codex",
+        )
+        self.assertEqual(
+            timeline.safe_command_label("/usr/local/bin/codex-foo"),
+            "codex-foo",
+        )
+        self.assertEqual(
+            timeline.safe_command_label("C:\\Users\\me\\bin\\codex.exe"),
+            "codex.exe",
+        )
+
+    def test_safe_command_label_does_not_leak_path_components(self) -> None:
+        # The dashboard / CLI must NEVER see a full local path.
+        label = timeline.safe_command_label("/home/user/.local/bin/codex")
+        self.assertNotIn("/home", label)
+        self.assertNotIn("/user", label)
+        self.assertNotIn(".local", label)
+        self.assertEqual(label, "codex")
+
+    def test_summarize_event_codex_unavailable_uses_safe_command_label(self) -> None:
+        # Plain binary name is rendered as-is.
+        self.assertEqual(
+            timeline.summarize_event(
+                "codex.unavailable", {"binary": "codex"}
+            ),
+            "codex unavailable; binary=codex",
+        )
+        # A full path is collapsed to its basename, never the
+        # original path.
+        summary = timeline.summarize_event(
+            "codex.unavailable",
+            {"binary": "/home/user/bin/codex"},
+        )
+        self.assertIn("binary=codex", summary)
+        self.assertNotIn("/home", summary)
+        self.assertNotIn("user/bin", summary)
+        # Missing / non-string binary falls back to "codex".
+        self.assertEqual(
+            timeline.summarize_event("codex.unavailable", {}),
+            "codex unavailable; binary=codex",
+        )
+        self.assertEqual(
+            timeline.summarize_event("codex.unavailable", {"binary": None}),
+            "codex unavailable; binary=codex",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

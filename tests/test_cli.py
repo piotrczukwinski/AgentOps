@@ -507,6 +507,13 @@ class CliTimelineTests(unittest.TestCase):
                 payload["severity_counts"],
                 {"info": 0, "warning": 0, "error": 0},
             )
+            # latest_error / latest_warning must always be present
+            # (set to None on an empty DB) so the JSON shape is
+            # stable and matches /api/timeline.
+            self.assertIn("latest_error", payload)
+            self.assertIn("latest_warning", payload)
+            self.assertIsNone(payload["latest_error"])
+            self.assertIsNone(payload["latest_warning"])
             self.assertIn("notes", payload)
 
     def test_timeline_text_output_on_empty_db(self) -> None:
@@ -536,6 +543,21 @@ class CliTimelineTests(unittest.TestCase):
                 payload["severity_counts"]["warning"], 1
             )
             self.assertEqual(payload["severity_counts"]["error"], 1)
+            # latest_error / latest_warning are present and non-null
+            # on a seeded DB so the CLI JSON contract matches
+            # /api/timeline.
+            self.assertIn("latest_error", payload)
+            self.assertIn("latest_warning", payload)
+            self.assertIsNotNone(payload["latest_error"])
+            self.assertIsNotNone(payload["latest_warning"])
+            self.assertEqual(
+                payload["latest_error"]["type"],
+                "task.validation_failed",
+            )
+            self.assertEqual(
+                payload["latest_warning"]["type"],
+                "task.awaiting_review",
+            )
             # Prompt body MUST NOT leak into the JSON.
             serialized = json.dumps(payload, sort_keys=True)
             self.assertNotIn("SECRET-PROMPT-BODY", serialized)

@@ -269,6 +269,39 @@ def _format_scalar(value: Any) -> str:
     return safe_text(repr(value), max_len=80) or "-"
 
 
+def safe_command_label(value: Any) -> str:
+    """Render a binary / command path as a safe one-line label.
+
+    The dashboard and the CLI must never leak a full local path
+    through the timeline summary. A payload like
+    ``{"binary": "/home/user/.local/bin/codex"}`` would otherwise
+    render the entire path on the operator's screen. This helper
+    collapses any value that contains a path separator down to
+    its basename, falling back to ``"codex"`` when nothing safe
+    can be inferred.
+
+    Rules:
+
+    * non-string or empty -> ``"codex"``
+    * contains ``/`` or ``\\`` -> the last path component (split
+      on both separators so Windows-style paths collapse on
+      POSIX too), or ``"codex"`` when nothing is left
+    * otherwise -> :func:`safe_text` (single-line, no newlines,
+      truncated to the standard ``max_len``)
+
+    Never raises.
+    """
+    if not isinstance(value, str) or not value:
+        return "codex"
+    if "/" in value or "\\" in value:
+        # Split on both POSIX and Windows separators so the
+        # helper behaves identically on every platform.
+        stripped = value.rstrip("/\\")
+        base = stripped.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        return base or "codex"
+    return safe_text(value) or "codex"
+
+
 def _summary_for_event(
     event_type: str,
     payload: dict[str, Any],
@@ -345,8 +378,8 @@ def _summary_for_event(
         )
 
     if et == "codex.unavailable":
-        binary = pl.get("binary") or "codex"
-        return f"codex unavailable; binary={_format_scalar(binary)}"
+        binary = safe_command_label(pl.get("binary"))
+        return f"codex unavailable; binary={binary}"
 
     if et.startswith("codex.required_unavailable"):
         failure = pl.get("failure_category") or pl.get("reason")

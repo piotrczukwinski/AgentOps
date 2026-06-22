@@ -1741,6 +1741,9 @@ def _timeline_snapshot_for_cli(
     timestamp and the applied filter).
     """
     from .timeline import (
+        latest_by_severity as _timeline_latest_by_severity,
+    )
+    from .timeline import (
         severity_counts as _severity_counts,
     )
     from .timeline import (
@@ -1758,6 +1761,8 @@ def _timeline_snapshot_for_cli(
     chronological = list(reversed(rows))
     projected = timeline_rows_from_events(chronological)
     counts = _severity_counts(projected)
+    latest_error = _timeline_latest_by_severity(projected, "error")
+    latest_warning = _timeline_latest_by_severity(projected, "warning")
     notes = [
         "Timeline is local-only and read from the SQLite event log.",
         "Raw payloads, prompts and logs are not exposed.",
@@ -1768,6 +1773,8 @@ def _timeline_snapshot_for_cli(
         "limit": int(limit),
         "count": len(projected),
         "severity_counts": counts,
+        "latest_error": latest_error,
+        "latest_warning": latest_warning,
         "rows": projected,
         "notes": notes,
     }
