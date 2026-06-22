@@ -1000,6 +1000,603 @@ class TimelineApiTests(unittest.TestCase):
             self.assertEqual(resp.status, 404)
 
 
+class ReliabilityApiTests(unittest.TestCase):
+    """Read-only tests for ``/api/reliability`` and the
+    ``reliability_summary`` block embedded in ``/api/admin``.
+
+    These tests seed the SQLite ``events`` table through the public
+    :class:`StateStore` methods and the ``.operator-runs/`` directory
+    with ``status.json`` files. The HTTP test uses the same
+    in-process server harness the existing ``/api/admin`` tests use.
+    """
+
+    def _seed_result_guard_events(self, store: StateStore) -> None:
+        store.event(
+            "rmap", "T1", "A1",
+            "task.result_guard_retry_queued",
+            {"failure_category": "missing_result"},
+        )
+        store.event(
+            "rmap", "T1", "A1",
+            "task.result_guard_blocked",
+            {"failure_category": "template_result"},
+        )
+        store.event(
+            "rmap", "T2", "A2",
+            "task.blocked_by_result_guard",
+            {"failure_category": "missing_result"},
+        )
+        store.event(
+            "rmap", "T3", "A3",
+            "attempt.finished",
+            {"exit_code": 0, "head_sha": "deadbeef12345678"},
+        )
+
+    def _seed_unsafe_event_payload(self, store: StateStore) -> None:
+        store.event(
+            "rmap", "T1", "A1",
+            "task.result_guard_retry_queued",
+            {
+                "failure_category": "missing_result",
+                "prompt_body": "SECRET-PROMPT-BODY",
+                "stdout_path": "/home/leak/.agentops/runs/r/T/1/executor.stdout.log",
+                "env": {"API_KEY": "sk-leak"},
+            },
+        )
+
+    def _seed_unsafe_task_id_event(self, store: StateStore) -> None:
+        # An unsafe task id (contains whitespace + slash) must not be
+        # interpolated into the copyable suggested action.
+        store.event(
+            "rmap", "T with space/and slash", "A1",
+            "task.result_guard_retry_queued",
+            {"failure_category": "missing_result"},
+        )
+
+    def test_collect_reliability_snapshot_empty_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                clear=False,
+            ):
+                snap = web.collect_reliability_snapshot(store, operator_root=tmp_path / "empty")
+        self.assertEqual(snap["result_guard"]["retry_queued"], 0)
+        self.assertEqual(snap["result_guard"]["blocked"], 0)
+        self.assertIsNone(snap["result_guard"]["latest_retry"])
+        self.assertIsNone(snap["result_guard"]["latest_block"])
+        self.assertEqual(
+            snap["result_guard"]["failure_categories"],
+            {"missing_result": 0, "template_result": 0},
+        )
+        self.assertEqual(snap["operator_runs"]["total"], 0)
+        self.assertEqual(snap["operator_runs"]["stale_pid"], 0)
+        self.assertEqual(snap["operator_runs"]["needs_operator"], 0)
+        self.assertEqual(snap["operator_runs"]["same_session_metadata"], 0)
+        self.assertEqual(snap["operator_runs"]["same_session_available"], 0)
+        self.assertEqual(snap["operator_runs"]["same_session_unavailable"], 0)
+        self.assertIsNone(snap["operator_runs"]["latest_attention"])
+        self.assertEqual(snap["runner_probe"]["opencode"]["direct_run_supported"], True)
+        self.assertEqual(snap["runner_probe"]["mmx"]["direct_run_supported"], False)
+        # Suggested actions are static, no probe execution.
+        joined = " ".join(snap["suggested_actions"])
+        self.assertIn("agentops timeline --json", joined)
+        self.assertIn("agentops operator-resume <run-id>", joined)
+        self.assertNotIn("runner-probe", joined)
+
+    def test_collect_reliability_snapshot_seeded_retry_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            self._seed_result_guard_events(store)
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                clear=False,
+            ):
+                snap = web.collect_reliability_snapshot(
+                    store, operator_root=tmp_path / "empty"
+                )
+        self.assertEqual(snap["result_guard"]["retry_queued"], 1)
+        self.assertIsNotNone(snap["result_guard"]["latest_retry"])
+        latest_retry = snap["result_guard"]["latest_retry"]
+        self.assertEqual(latest_retry["type"], "task.result_guard_retry_queued")
+        self.assertEqual(latest_retry["failure_category"], "missing_result")
+        self.assertIn("agentops timeline --task", latest_retry["suggested_action"])
+
+    def test_collect_reliability_snapshot_seeded_blocked_types(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            self._seed_result_guard_events(store)
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                clear=False,
+            ):
+                snap = web.collect_reliability_snapshot(
+                    store, operator_root=tmp_path / "empty"
+                )
+        self.assertEqual(snap["result_guard"]["blocked"], 2)
+        self.assertIsNotNone(snap["result_guard"]["latest_block"])
+        latest_block = snap["result_guard"]["latest_block"]
+        self.assertIn(
+            latest_block["type"],
+            {"task.result_guard_blocked", "task.blocked_by_result_guard"},
+        )
+        self.assertIn("agentops logs", latest_block["suggested_action"])
+
+    def test_collect_reliability_snapshot_failure_categories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            store.event(
+                "rmap", "T1", "A1", "task.result_guard_retry_queued",
+                {"failure_category": "missing_result"},
+            )
+            store.event(
+                "rmap", "T1", "A1", "task.result_guard_retry_queued",
+                {"failure_category": "missing_result"},
+            )
+            store.event(
+                "rmap", "T2", "A2", "task.result_guard_blocked",
+                {"failure_category": "template_result"},
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                clear=False,
+            ):
+                snap = web.collect_reliability_snapshot(
+                    store, operator_root=tmp_path / "empty"
+                )
+        self.assertEqual(
+            snap["result_guard"]["failure_categories"],
+            {"missing_result": 2, "template_result": 1},
+        )
+
+    def test_collect_reliability_snapshot_does_not_leak_prompt_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            self._seed_unsafe_event_payload(store)
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                clear=False,
+            ):
+                snap = web.collect_reliability_snapshot(
+                    store, operator_root=tmp_path / "empty"
+                )
+        serialized = json.dumps(snap, sort_keys=True)
+        for leak in (
+            "SECRET-PROMPT-BODY",
+            "prompt_body",
+            "/home/leak",
+            "stdout_path",
+            "sk-leak",
+        ):
+            self.assertNotIn(leak, serialized)
+        latest_retry = snap["result_guard"]["latest_retry"]
+        assert latest_retry is not None
+        self.assertNotIn("prompt_body", latest_retry)
+        self.assertNotIn("env", latest_retry)
+
+    def test_collect_reliability_snapshot_unsafe_task_id_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            self._seed_unsafe_task_id_event(store)
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                clear=False,
+            ):
+                snap = web.collect_reliability_snapshot(
+                    store, operator_root=tmp_path / "empty"
+                )
+        latest_retry = snap["result_guard"]["latest_retry"]
+        assert latest_retry is not None
+        suggested = latest_retry["suggested_action"] or ""
+        # The unsafe task id must NEVER appear in the copyable CLI hint.
+        for unsafe in ("T with space", "and slash"):
+            self.assertNotIn(unsafe, suggested)
+        # The fallback is the generic command.
+        self.assertEqual(suggested, "agentops timeline")
+
+    def test_collect_reliability_snapshot_counts_stale_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            runs_root = tmp_path / "runs"
+            for i in range(2):
+                run_id = f"stale-run-{i:02d}"
+                run_dir = runs_root / ".operator-runs" / run_id
+                run_dir.mkdir(parents=True)
+                (run_dir / "combined.log").write_text("line\n", encoding="utf-8")
+                (run_dir / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": run_id,
+                            "name": run_id,
+                            "status": "running",
+                            "pid": 0,
+                            "started_at": "2026-01-01T00:00:00+00:00",
+                            "failure_category": "stale_pid",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            # A healthy run should not bump the stale_pid counter.
+            healthy_dir = runs_root / ".operator-runs" / "healthy-run-001"
+            healthy_dir.mkdir(parents=True)
+            (healthy_dir / "combined.log").write_text("line\n", encoding="utf-8")
+            (healthy_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "healthy-run-001",
+                        "name": "healthy",
+                        "status": "exited",
+                        "exit_code": 0,
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(runs_root)},
+                clear=False,
+            ):
+                snap = web.collect_reliability_snapshot(
+                    store, operator_root=runs_root
+                )
+        op = snap["operator_runs"]
+        self.assertEqual(op["total"], 3)
+        self.assertEqual(op["stale_pid"], 2)
+        self.assertEqual(op["needs_operator"], 0)
+        self.assertEqual(op["same_session_metadata"], 0)
+        latest_attention = op["latest_attention"]
+        assert latest_attention is not None
+        self.assertEqual(latest_attention["primary_reason"], "stale_pid")
+        self.assertIn(
+            "agentops operator-tail stale-run-00",
+            latest_attention["first_cli"],
+        )
+
+    def test_collect_reliability_snapshot_counts_same_session_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            runs_root = tmp_path / "runs"
+
+            def _write_run(
+                run_id: str,
+                status: str,
+                *,
+                session_id: str | None = None,
+                same_session_available: bool | None = None,
+                pid: int = 0,
+            ) -> None:
+                run_dir = runs_root / ".operator-runs" / run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                (run_dir / "combined.log").write_text("line\n", encoding="utf-8")
+                payload = {
+                    "run_id": run_id,
+                    "name": run_id,
+                    "status": status,
+                    "pid": pid,
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                }
+                if session_id is not None:
+                    payload["runner_session_id"] = session_id
+                    payload["runner_session_source"] = "agentops_session_json"
+                if same_session_available is not None:
+                    payload["same_session_resume_available"] = same_session_available
+                (run_dir / "status.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+
+            _write_run("r-available", "exited", session_id="sess-A",
+                       same_session_available=True)
+            _write_run("r-unavailable", "exited", session_id="sess-B",
+                       same_session_available=False)
+            _write_run("r-no-meta", "exited")
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(runs_root)},
+                clear=False,
+            ):
+                snap = web.collect_reliability_snapshot(
+                    store, operator_root=runs_root
+                )
+        op = snap["operator_runs"]
+        self.assertEqual(op["total"], 3)
+        self.assertEqual(op["same_session_metadata"], 2)
+        self.assertEqual(op["same_session_available"], 1)
+        self.assertEqual(op["same_session_unavailable"], 1)
+
+    def test_collect_reliability_snapshot_latest_attention_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            runs_root = tmp_path / "runs"
+            run_id = "attention-row-001"
+            run_dir = runs_root / ".operator-runs" / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / "combined.log").write_text("line\n", encoding="utf-8")
+            (run_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "name": "attention",
+                        "status": "running",
+                        "pid": 0,
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "failure_category": "stale_pid",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(runs_root)},
+                clear=False,
+            ):
+                snap = web.collect_reliability_snapshot(
+                    store, operator_root=runs_root
+                )
+        att = snap["operator_runs"]["latest_attention"]
+        assert att is not None
+        self.assertEqual(att["run_id"], run_id)
+        self.assertIn("stale_pid", att["reasons"])
+        self.assertEqual(att["primary_reason"], "stale_pid")
+        self.assertIn(run_id, att["first_cli"])
+
+    def test_admin_snapshot_includes_reliability_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                clear=False,
+            ):
+                data = web.collect_admin_snapshot(store)
+        summary = data["reliability_summary"]
+        for key in (
+            "generated_at",
+            "result_guard_retry_queued",
+            "result_guard_blocked",
+            "stale_pid",
+            "needs_operator",
+            "same_session_metadata",
+            "same_session_available",
+            "latest_attention",
+        ):
+            self.assertIn(key, summary)
+        self.assertEqual(summary["result_guard_retry_queued"], 0)
+        self.assertEqual(summary["result_guard_blocked"], 0)
+        self.assertIsNone(summary["latest_attention"])
+
+    def _server(self, store: StateStore) -> tuple[int, Any, threading.Thread]:
+        port = _free_port()
+        server = web.make_server("127.0.0.1", port, state=store)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return port, server, thread
+
+    def _stop(self, server: Any, thread: threading.Thread) -> None:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    def _http_get(self, port: int, path: str) -> tuple[int, dict[str, Any]]:
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8")
+        finally:
+            conn.close()
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            data = {"error": "invalid JSON"}
+        return resp.status, data
+
+    def _http_post(self, port: int, path: str, body: dict[str, Any]) -> int:
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request(
+                "POST",
+                path,
+                body=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            _body = resp.read()
+        finally:
+            conn.close()
+        return resp.status
+
+    def test_api_reliability_endpoint_returns_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            self._seed_result_guard_events(store)
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                    clear=False,
+                ):
+                    status, data = self._http_get(port, "/api/reliability?limit=50")
+            finally:
+                self._stop(server, thread)
+        self.assertEqual(status, 200)
+        self.assertIn("result_guard", data)
+        self.assertIn("operator_runs", data)
+        self.assertIn("runner_probe", data)
+        self.assertIn("suggested_actions", data)
+        self.assertIn("notes", data)
+        self.assertEqual(data["result_guard"]["retry_queued"], 1)
+        self.assertEqual(data["result_guard"]["blocked"], 2)
+        self.assertEqual(
+            data["result_guard"]["failure_categories"],
+            {"missing_result": 2, "template_result": 1},
+        )
+
+    def test_api_reliability_endpoint_clamps_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                    clear=False,
+                ):
+                    _status_high, data_high = self._http_get(
+                        port, "/api/reliability?limit=99999"
+                    )
+                    _status_low, data_low = self._http_get(
+                        port, "/api/reliability?limit=0"
+                    )
+            finally:
+                self._stop(server, thread)
+        # Server-side clamps.
+        self.assertLessEqual(data_high["limit"], 500)
+        self.assertGreaterEqual(data_low["limit"], 1)
+
+    def test_api_reliability_endpoint_does_not_leak_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            self._seed_unsafe_event_payload(store)
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                    clear=False,
+                ):
+                    _status, data = self._http_get(port, "/api/reliability")
+            finally:
+                self._stop(server, thread)
+        serialized = json.dumps(data, sort_keys=True)
+        for leak in (
+            "SECRET-PROMPT-BODY",
+            "prompt_body",
+            "/home/leak",
+            "stdout_path",
+            "sk-leak",
+            "payload_json",
+        ):
+            self.assertNotIn(leak, serialized)
+
+    def test_api_reliability_endpoint_does_not_run_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTOPS_OPERATOR_RUNS_ROOT": str(tmp_path / "empty")},
+                    clear=False,
+                ), mock.patch("subprocess.run") as run_mock, mock.patch(
+                    "agentops.operator_run.probe_runner"
+                ) as probe_mock:
+                    _status, _data = self._http_get(port, "/api/reliability")
+            finally:
+                self._stop(server, thread)
+        # The web UI must NEVER invoke subprocess.run for runner-probe
+        # or anything else as a side effect of /api/reliability.
+        run_mock.assert_not_called()
+        probe_mock.assert_not_called()
+
+    def test_post_to_api_reliability_does_not_run_command(self) -> None:
+        # POST must not exist; the endpoint is read-only.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            port, server, thread = self._server(store)
+            try:
+                with mock.patch("subprocess.run") as run_mock:
+                    status = self._http_post(
+                        port,
+                        "/api/reliability",
+                        {"oops": True},
+                    )
+            finally:
+                self._stop(server, thread)
+        self.assertIn(status, (404, 405))
+        run_mock.assert_not_called()
+
+    def test_no_exec_or_shell_endpoint_added_by_reliability(self) -> None:
+        # Regression guard: adding /api/reliability must not introduce a
+        # generic shell / exec endpoint.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = StateStore(tmp_path / "state.sqlite")
+            store.init()
+            port, server, thread = self._server(store)
+            try:
+                for forbidden in (
+                    "/api/exec",
+                    "/api/shell",
+                    "/api/command",
+                    "/api/run_command",
+                ):
+                    status, _data = self._http_get(port, forbidden)
+                    self.assertEqual(status, 404)
+            finally:
+                self._stop(server, thread)
+
+    def test_render_index_html_has_reliability_card(self) -> None:
+        html = web.render_index_html()
+        self.assertIn("Executor reliability", html)
+        self.assertIn("/api/reliability", html)
+        self.assertIn("renderReliability", html)
+        for element_id in (
+            "reliability-card",
+            "reliability-result-retries",
+            "reliability-result-blocks",
+            "reliability-stale-pid",
+            "reliability-needs-operator",
+            "reliability-session-metadata",
+            "reliability-latest-attention",
+            "reliability-actions",
+            "reliability-empty",
+            "reliability-refresh-note",
+        ):
+            self.assertIn(element_id, html)
+        # No shell/exec endpoint advertisement.
+        for forbidden in ("/api/exec", "/api/shell", "/api/command", "/api/run_command"):
+            self.assertNotIn(forbidden, html)
+        # The card text must surface that runner probes are CLI-only.
+        self.assertIn("Runner probes are CLI-only", html)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1976,6 +2573,7 @@ class AdminSnapshotShapeTests(unittest.TestCase):
         "diagnostics",
         "usage_summary",
         "timeline_summary",
+        "reliability_summary",
     }
 
     def _server(self, store):

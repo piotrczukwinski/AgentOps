@@ -808,7 +808,21 @@ def _project_operator_run_for_api(
     ``running``. The persisted ``status`` field is also exposed so the
     UI can show when the runtime overlay disagrees with the on-disk
     record without having to read ``status.json`` itself.
+
+    AO-AUDIT admin-reliability-panel-014: the projection also exposes
+    the same-session resume metadata (``session_id``,
+    ``session_source``, ``same_session_available``,
+    ``same_session_reason``) already recorded in ``status.json`` so
+    the Admin panel reliability view can surface availability
+    without re-reading the on-disk file. Only safe scalar fields are
+    forwarded; the session token is never logged, never sent to
+    subprocesses, and is never used to fabricate a resume command.
     """
+    session_id_raw = payload.get("runner_session_id")
+    session_id_str = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else None
+    same_session_available_raw = payload.get("same_session_resume_available")
+    same_session_reason_raw = payload.get("same_session_resume_reason")
+    session_source_raw = payload.get("runner_session_source")
     return {
         "run_id": str(payload.get("run_id") or run_dir_path.name),
         "name": payload.get("name"),
@@ -826,6 +840,20 @@ def _project_operator_run_for_api(
         "failure_category": payload.get("failure_category"),
         "result_json_present": bool(payload.get("result_json_present")),
         "suggested_action": payload.get("suggested_action"),
+        "session_id": session_id_str,
+        "session_source": (
+            session_source_raw if isinstance(session_source_raw, str) and session_source_raw else None
+        ),
+        "same_session_available": (
+            bool(same_session_available_raw)
+            if isinstance(same_session_available_raw, bool)
+            else None
+        ),
+        "same_session_reason": (
+            same_session_reason_raw
+            if isinstance(same_session_reason_raw, str) and same_session_reason_raw
+            else None
+        ),
     }
 
 
@@ -1336,6 +1364,436 @@ def collect_timeline_summary(state: StateStore) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Executor reliability summary (read-only, loopback-only)
+# ---------------------------------------------------------------------------
+#
+# The reliability view is a conservative, operator-friendly rollup of the
+# result-guard events recorded in the SQLite ``events`` table and the
+# runtime / same-session metadata already surfaced by the operator-run
+# status projection. The collector is read-only, never invokes
+# subprocesses, never reads arbitrary files, and never forwards the raw
+# ``payload_json`` column. Only the ``run_id`` / ``task_id`` strings that
+# were already exposed by ``/api/operator-runs`` and
+# ``/api/timeline`` are forwarded.
+
+RELIABILITY_NOTES: tuple[str, ...] = (
+    "This panel is read-only.",
+    "Runner probes are CLI-only and are not executed by the web UI.",
+    "Suggested actions are text only.",
+)
+
+RELIABILITY_RETRY_QUEUED_TYPES: frozenset[str] = frozenset(
+    {
+        "task.result_guard_retry_queued",
+    }
+)
+
+RELIABILITY_BLOCKED_TYPES: frozenset[str] = frozenset(
+    {
+        "task.result_guard_blocked",
+        "task.blocked_by_result_guard",
+    }
+)
+
+RELIABILITY_FAILURE_CATEGORIES: tuple[str, ...] = (
+    "missing_result",
+    "template_result",
+)
+
+
+def _safe_id_component(value: Any) -> str | None:
+    """Return ``value`` only when it is a single safe id component.
+
+    Mirrors the existing ``_safe_task_id`` rule set used by the timeline
+    helpers: a single non-empty string, no slashes / backslashes, no
+    ``..``, no whitespace. Used to gate which task / run ids get pasted
+    into a copyable ``agentops ...`` CLI hint.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if "/" in value or "\\" in value:
+        return None
+    if ".." in value:
+        return None
+    if any(ch.isspace() for ch in value):
+        return None
+    return value
+
+
+def _reliability_retry_action(task_id: str | None) -> str:
+    safe = _safe_id_component(task_id)
+    if safe is None:
+        return "agentops timeline"
+    return f"agentops timeline --task {safe}"
+
+
+def _reliability_blocked_action(task_id: str | None) -> str:
+    safe = _safe_id_component(task_id)
+    if safe is None:
+        return "agentops logs"
+    return f"agentops logs {safe}"
+
+
+def _reliability_stale_pid_action(run_id: str | None) -> str:
+    safe = _safe_id_component(run_id)
+    if safe is None:
+        return "agentops operator-status"
+    return f"agentops operator-status --run-id {safe} --format json"
+
+
+def _reliability_same_session_action(run_id: str | None) -> str:
+    safe = _safe_id_component(run_id)
+    if safe is None:
+        return "agentops operator-resume"
+    return f"agentops operator-resume {safe} --same-session --dry-run"
+
+
+def _reliability_no_metadata_action(run_id: str | None) -> str:
+    safe = _safe_id_component(run_id)
+    if safe is None:
+        return "agentops operator-retry"
+    return f"agentops operator-retry {safe}"
+
+
+def _reliability_project_event(row: Any) -> dict[str, Any] | None:
+    """Project one event row to a safe, slim reliability schema.
+
+    Never raises. Drops ``payload_json`` entirely; only the
+    ``failure_category`` (when it is one of the canonical names) is
+    surfaced. Returns ``None`` when the row cannot be projected at all.
+    """
+    try:
+        seq_value = int(row["seq"])
+    except (KeyError, TypeError, ValueError):
+        seq_value = 0
+    try:
+        event_type = str(row["type"] or "")
+    except (KeyError, TypeError):
+        return None
+    if not event_type:
+        return None
+    try:
+        created_at = row["created_at"]
+        if created_at is not None and not isinstance(created_at, str):
+            created_at = str(created_at)
+    except (KeyError, TypeError):
+        created_at = None
+    try:
+        roadmap_id = row["roadmap_id"]
+        if isinstance(roadmap_id, str) and roadmap_id:
+            pass
+        else:
+            roadmap_id = str(roadmap_id) if roadmap_id is not None else None
+    except (KeyError, TypeError):
+        roadmap_id = None
+    try:
+        task_id = row["task_id"]
+        if isinstance(task_id, str) and task_id:
+            pass
+        else:
+            task_id = str(task_id) if task_id is not None else None
+    except (KeyError, TypeError):
+        task_id = None
+    try:
+        attempt_id = row["attempt_id"]
+        if isinstance(attempt_id, str) and attempt_id:
+            pass
+        else:
+            attempt_id = str(attempt_id) if attempt_id is not None else None
+    except (KeyError, TypeError):
+        attempt_id = None
+    try:
+        payload_raw = row["payload_json"]
+    except (KeyError, TypeError):
+        payload_raw = None
+    payload = _parse_event_payload(payload_raw)
+    try:
+        classification = str(payload.get("classification") or "") or None
+    except (KeyError, TypeError):
+        classification = None
+    try:
+        failure_category = str(payload.get("failure_category") or "") or None
+    except (KeyError, TypeError):
+        failure_category = None
+    safe_task_id = _safe_id_component(task_id)
+    if event_type in RELIABILITY_RETRY_QUEUED_TYPES:
+        suggested_action = _reliability_retry_action(safe_task_id)
+    elif event_type in RELIABILITY_BLOCKED_TYPES:
+        suggested_action = _reliability_blocked_action(safe_task_id)
+    else:
+        suggested_action = None
+    return {
+        "seq": seq_value,
+        "created_at": created_at,
+        "roadmap_id": roadmap_id,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "type": event_type,
+        "classification": classification,
+        "failure_category": failure_category,
+        "suggested_action": suggested_action,
+    }
+
+
+def collect_reliability_snapshot(
+    state: StateStore,
+    *,
+    operator_root: Path | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Return the operator-facing reliability snapshot.
+
+    The snapshot is the single source of truth for both
+    ``/api/reliability`` and the ``reliability_summary`` block
+    embedded in ``/api/admin``. It is read-only, loopback-only,
+    never invokes subprocesses, and never reads arbitrary files.
+
+    Top-level keys (all present, even when the state DB is empty):
+
+    * ``generated_at`` — ISO timestamp the snapshot was computed.
+    * ``result_guard`` — counts and ``latest_*`` rows for the
+      result-guard retry / blocked events. ``latest_*`` rows
+      carry a copyable ``suggested_action`` CLI hint but never the
+      raw event payload.
+    * ``operator_runs`` — counts and the ``latest_attention`` row
+      derived from the same operator-run projection that
+      ``/api/operator-runs`` already exposes.
+    * ``runner_probe`` — static hints telling the operator that
+      runner probes are CLI-only. The web UI never executes
+      ``agentops runner-probe``.
+    * ``suggested_actions`` — a fixed list of copyable CLI hints.
+    * ``notes`` — short human-readable explanations.
+
+    A corrupt event payload must never raise; on read failure the
+    snapshot degrades to the empty shape with zero counts and an
+    extra "Reliability read failed." note.
+    """
+    generated_at = _utc_now_iso()
+    notes: list[str] = list(RELIABILITY_NOTES)
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        limit = 100
+    clamped_limit = max(1, min(int(limit), 500))
+
+    try:
+        state.init()
+        event_rows = list(state.latest_events(clamped_limit))
+    except Exception as exc:  # noqa: BLE001 - never raise from the snapshot
+        log.warning("collect_reliability_snapshot: state lookup failed: %s", exc)
+        event_rows = []
+        notes.append("Reliability read failed.")
+
+    retry_queued = 0
+    blocked = 0
+    latest_retry: dict[str, Any] | None = None
+    latest_block: dict[str, Any] | None = None
+    failure_category_counts: dict[str, int] = {
+        name: 0 for name in RELIABILITY_FAILURE_CATEGORIES
+    }
+
+    # ``latest_events`` returns newest-first; iterate in order so the
+    # last matching row wins.
+    for row in event_rows:
+        try:
+            event_type = str(row["type"] or "")
+        except (KeyError, TypeError):
+            continue
+        if not event_type:
+            continue
+        if event_type in RELIABILITY_RETRY_QUEUED_TYPES:
+            retry_queued += 1
+            projected = _reliability_project_event(row)
+            if projected is not None and latest_retry is None:
+                latest_retry = projected
+        elif event_type in RELIABILITY_BLOCKED_TYPES:
+            blocked += 1
+            projected = _reliability_project_event(row)
+            if projected is not None and latest_block is None:
+                latest_block = projected
+        try:
+            payload_raw = row["payload_json"]
+        except (KeyError, TypeError):
+            payload_raw = None
+        payload = _parse_event_payload(payload_raw)
+        try:
+            failure_category = str(payload.get("failure_category") or "")
+        except (KeyError, TypeError):
+            failure_category = ""
+        if failure_category in failure_category_counts:
+            failure_category_counts[failure_category] += 1
+
+    operator_runs_payload: dict[str, Any] = {
+        "total": 0,
+        "stale_pid": 0,
+        "needs_operator": 0,
+        "same_session_metadata": 0,
+        "same_session_available": 0,
+        "same_session_unavailable": 0,
+        "latest_attention": None,
+    }
+    try:
+        runs_payload = collect_operator_runs()
+        runs = list(runs_payload.get("runs") or [])
+    except Exception as exc:  # noqa: BLE001 - never raise from the snapshot
+        log.warning("collect_reliability_snapshot: operator runs lookup failed: %s", exc)
+        runs = []
+    operator_runs_payload["total"] = len(runs)
+    latest_attention: dict[str, Any] | None = None
+    for run in runs:
+        try:
+            runtime_status = str(run.get("runtime_status") or "")
+        except (KeyError, TypeError):
+            runtime_status = ""
+        try:
+            canonical_status = str(run.get("canonical_status") or "")
+        except (KeyError, TypeError):
+            canonical_status = ""
+        if runtime_status == "stale_pid":
+            operator_runs_payload["stale_pid"] += 1
+        if canonical_status == "needs_operator":
+            operator_runs_payload["needs_operator"] += 1
+        try:
+            session_id = run.get("session_id")
+        except (KeyError, TypeError):
+            session_id = None
+        try:
+            same_session_available = run.get("same_session_available")
+        except (KeyError, TypeError):
+            same_session_available = None
+        # The operator-run projection is the source of truth for the
+        # ``session_id`` / ``same_session_available`` fields it carries;
+        # ``_project_operator_run_for_api`` exposes them only when they
+        # are set in the persisted status.json. We treat "session_id is
+        # truthy" as "same-session metadata present" so the dashboard
+        # can surface the resume hint regardless of whether the runner
+        # is in the resume-capable set today.
+        session_id_str = session_id if isinstance(session_id, str) else None
+        if session_id_str:
+            operator_runs_payload["same_session_metadata"] += 1
+            if same_session_available is True:
+                operator_runs_payload["same_session_available"] += 1
+            elif same_session_available is False:
+                operator_runs_payload["same_session_unavailable"] += 1
+        if latest_attention is None:
+            reason_key = _admin_first_cli_for_operator_reason_for_reliability(runtime_status)
+            if reason_key is None and canonical_status == "needs_operator":
+                reason_key = "needs_operator"
+            if reason_key is not None:
+                run_id = run.get("run_id") if isinstance(run.get("run_id"), str) else None
+                first_cli = _admin_first_cli_for_operator_reason(reason_key)
+                safe_run_id = _safe_id_component(run_id)
+                if safe_run_id is not None:
+                    try:
+                        first_cli = first_cli.replace("<run-id>", safe_run_id)
+                    except Exception:  # noqa: BLE001 - never raise
+                        first_cli = "agentops operator-status"
+                else:
+                    first_cli = "agentops operator-status"
+                latest_attention = {
+                    "kind": "operator_run",
+                    "run_id": run_id,
+                    "name": run.get("name") if isinstance(run.get("name"), str) else None,
+                    "reasons": [reason_key],
+                    "primary_reason": reason_key,
+                    "canonical_status": canonical_status or None,
+                    "runtime_status": runtime_status or None,
+                    "failure_category": (
+                        run.get("failure_category")
+                        if isinstance(run.get("failure_category"), str)
+                        else None
+                    ),
+                    "first_cli": first_cli,
+                }
+    operator_runs_payload["latest_attention"] = latest_attention
+
+    runner_probe = {
+        "opencode": {
+            "direct_run_supported": True,
+            "note": "Use CLI: agentops runner-probe --runner opencode --json",
+        },
+        "mmx": {
+            "direct_run_supported": False,
+            "note": "Use CLI: agentops runner-probe --runner mmx --json",
+        },
+    }
+
+    suggested_actions = [
+        "agentops timeline --json",
+        "agentops usage --json",
+        "agentops operator-status --format json",
+        "agentops operator-resume <run-id> --same-session --dry-run",
+        "agentops operator-retry <run-id>",
+    ]
+
+    return {
+        "generated_at": generated_at,
+        "limit": clamped_limit,
+        "result_guard": {
+            "retry_queued": int(retry_queued),
+            "blocked": int(blocked),
+            "latest_retry": latest_retry,
+            "latest_block": latest_block,
+            "failure_categories": failure_category_counts,
+        },
+        "operator_runs": operator_runs_payload,
+        "runner_probe": runner_probe,
+        "suggested_actions": suggested_actions,
+        "notes": notes,
+    }
+
+
+def _admin_first_cli_for_operator_reason_for_reliability(runtime_status: str) -> str | None:
+    """Return the first matching operator-run attention reason.
+
+    Mirrors the rules in :func:`_admin_attention_for_operator_run` but
+    only inspects ``runtime_status``; the snapshot already counts
+    ``needs_operator`` runs separately on the canonical status.
+    """
+    if runtime_status == "stale_pid":
+        return "stale_pid"
+    if runtime_status == "exited_or_stale":
+        return "exited_or_stale"
+    return None
+
+
+def collect_reliability_summary(state: StateStore) -> dict[str, Any]:
+    """Return the compact ``reliability_summary`` block for ``/api/admin``.
+
+    Trims the full :func:`collect_reliability_snapshot` payload down to
+    the headline counters + the ``latest_attention`` row, so the
+    admin panel can show the reliability headline without paying for
+    the full ``result_guard`` projection.
+    """
+    try:
+        snap = collect_reliability_snapshot(state, limit=100)
+    except Exception as exc:  # noqa: BLE001 - never raise from the summary
+        log.warning("collect_reliability_summary: snapshot failed: %s", exc)
+        return {
+            "generated_at": _utc_now_iso(),
+            "result_guard_retry_queued": 0,
+            "result_guard_blocked": 0,
+            "stale_pid": 0,
+            "needs_operator": 0,
+            "same_session_metadata": 0,
+            "same_session_available": 0,
+            "latest_attention": None,
+            "notes": list(RELIABILITY_NOTES),
+        }
+    result_guard = snap.get("result_guard") or {}
+    operator_runs = snap.get("operator_runs") or {}
+    return {
+        "generated_at": snap.get("generated_at"),
+        "result_guard_retry_queued": int(result_guard.get("retry_queued") or 0),
+        "result_guard_blocked": int(result_guard.get("blocked") or 0),
+        "stale_pid": int(operator_runs.get("stale_pid") or 0),
+        "needs_operator": int(operator_runs.get("needs_operator") or 0),
+        "same_session_metadata": int(operator_runs.get("same_session_metadata") or 0),
+        "same_session_available": int(operator_runs.get("same_session_available") or 0),
+        "latest_attention": operator_runs.get("latest_attention"),
+        "notes": list(snap.get("notes") or RELIABILITY_NOTES),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Admin / Operator panel snapshot (read-only, loopback-only)
 # ---------------------------------------------------------------------------
 #
@@ -1794,6 +2252,7 @@ def collect_admin_snapshot(state: StateStore) -> dict[str, Any]:
         "diagnostics": diagnostics,
         "usage_summary": collect_usage_summary(state),
         "timeline_summary": collect_timeline_summary(state),
+        "reliability_summary": collect_reliability_summary(state),
     }
 
 
@@ -2085,6 +2544,9 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/timeline":
             self._handle_timeline(query)
             return
+        if path == "/api/reliability":
+            self._handle_reliability(query)
+            return
 
         self._send_json({"error": f"not found: {path}"}, status=404)
 
@@ -2192,6 +2654,33 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             self._server_state().state,
             roadmap_id=roadmap_filter,
             task_id=task_filter,
+            limit=limit,
+        )
+        self._send_json(snapshot)
+
+    def _handle_reliability(self, query: dict) -> None:
+        """Serve :func:`collect_reliability_snapshot` for ``GET /api/reliability``.
+
+        Query parameters (all optional):
+
+        * ``limit`` — newest-N clamp; ``1..500``, default ``100``.
+
+        The endpoint is GET only, read-only, never reads files outside
+        the DB and the existing operator-runs projection, never invokes
+        subprocesses (the runner-probe CLI is intentionally not called
+        from the web layer), and never includes the raw ``payload_json``
+        column. The operator-runs side reuses the same projection
+        ``/api/operator-runs`` already exposes so the counts cannot
+        drift between endpoints.
+        """
+        limit_raw = (query.get("limit") or ["100"])[0]
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 500))
+        snapshot = collect_reliability_snapshot(
+            self._server_state().state,
             limit=limit,
         )
         self._send_json(snapshot)
@@ -2997,6 +3486,27 @@ INDEX_TEMPLATE = """<!doctype html>
     <div class="muted" id="timeline-empty" style="display:none;">No timeline events recorded yet.</div>
   </section>
 
+  <section class="card" id="reliability-card">
+    <h2 style="margin-top:0;font-size:15px;">Executor reliability <span class="muted" id="reliability-generated-at"></span></h2>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="pill" id="reliability-result-retries">result retries: -</span>
+      <span class="pill" id="reliability-result-blocks">result blocks: -</span>
+      <span class="pill" id="reliability-stale-pid">stale pid: -</span>
+      <span class="pill" id="reliability-needs-operator">needs operator: -</span>
+      <span class="pill" id="reliability-session-metadata">same-session metadata: -</span>
+    </div>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="muted" id="reliability-missing-template">missing/template: -</span>
+    </div>
+    <div class="row" style="margin-bottom:8px;">
+      <span class="muted" id="reliability-latest-attention">latest attention: -</span>
+    </div>
+    <h3 style="font-size:13px;margin:8px 0 4px;">Suggested actions (text only)</h3>
+    <ul id="reliability-actions" class="muted" style="margin:0;padding-left:18px;font-size:12px;"></ul>
+    <div class="muted" id="reliability-empty" style="display:none;">No result-guard events recorded yet. The dashboard will populate after the first <code>agentops run</code>.</div>
+    <div class="muted" id="reliability-refresh-note" style="margin-top:6px;">Runner probes are CLI-only (agentops runner-probe). Suggested actions are text only and are never executed by the web UI.</div>
+  </section>
+
   <section class="card">
     <h2 style="margin-top:0;font-size:15px;">Model usage <span class="muted" id="usage-generated-at"></span></h2>
     <div class="row" style="margin-bottom:8px;">
@@ -3203,6 +3713,16 @@ INDEX_TEMPLATE = """<!doctype html>
   const timelineRows = $("timeline-rows");
   const timelineEmpty = $("timeline-empty");
   const timelineGeneratedAt = $("timeline-generated-at");
+  const reliabilityGeneratedAt = $("reliability-generated-at");
+  const reliabilityResultRetries = $("reliability-result-retries");
+  const reliabilityResultBlocks = $("reliability-result-blocks");
+  const reliabilityStalePid = $("reliability-stale-pid");
+  const reliabilityNeedsOperator = $("reliability-needs-operator");
+  const reliabilitySessionMetadata = $("reliability-session-metadata");
+  const reliabilityMissingTemplate = $("reliability-missing-template");
+  const reliabilityLatestAttention = $("reliability-latest-attention");
+  const reliabilityActions = $("reliability-actions");
+  const reliabilityEmpty = $("reliability-empty");
   const usageGeneratedAt = $("usage-generated-at");
   const usageEmptyPill = $("usage-empty-pill");
   const usageSummary = $("usage-summary");
@@ -4052,6 +4572,71 @@ async function tailOperatorRun() {
     }).join("");
   }
 
+  // ---- Executor reliability (T14) --------------------------------------
+  // Read-only summary of result-guard retry / blocked events plus
+  // operator-run same-session metadata. The dashboard NEVER executes
+  // the suggested actions: each line is plain text and never wired to
+  // a click handler. Runner probes are CLI-only.
+  async function renderReliability() {
+    if (!reliabilityResultRetries) return;
+    const res = await fetchJson("/api/reliability?limit=100");
+    if (!res.ok || !res.data) {
+      if (reliabilityResultRetries) reliabilityResultRetries.textContent = "result retries: ?";
+      if (reliabilityResultBlocks) reliabilityResultBlocks.textContent = "result blocks: ?";
+      if (reliabilityStalePid) reliabilityStalePid.textContent = "stale pid: ?";
+      if (reliabilityNeedsOperator) reliabilityNeedsOperator.textContent = "needs operator: ?";
+      if (reliabilitySessionMetadata) reliabilitySessionMetadata.textContent = "same-session metadata: ?";
+      if (reliabilityLatestAttention) reliabilityLatestAttention.textContent = "latest attention: unavailable";
+      if (reliabilityMissingTemplate) reliabilityMissingTemplate.textContent = "missing/template: ?";
+      if (reliabilityEmpty) reliabilityEmpty.textContent = "reliability snapshot unavailable";
+      return;
+    }
+    const data = res.data;
+    const resultGuard = data.result_guard || {};
+    const op = data.operator_runs || {};
+    const failureCategories = resultGuard.failure_categories || {};
+    if (reliabilityGeneratedAt) {
+      reliabilityGeneratedAt.textContent = data.generated_at ? "snapshot: " + data.generated_at : "";
+    }
+    if (reliabilityResultRetries) reliabilityResultRetries.textContent = "result retries: " + (resultGuard.retry_queued || 0);
+    if (reliabilityResultBlocks) reliabilityResultBlocks.textContent = "result blocks: " + (resultGuard.blocked || 0);
+    if (reliabilityStalePid) reliabilityStalePid.textContent = "stale pid: " + (op.stale_pid || 0);
+    if (reliabilityNeedsOperator) reliabilityNeedsOperator.textContent = "needs operator: " + (op.needs_operator || 0);
+    if (reliabilitySessionMetadata) {
+      const meta = op.same_session_metadata || 0;
+      const avail = op.same_session_available || 0;
+      reliabilitySessionMetadata.textContent = "same-session metadata: " + meta
+        + " (available: " + avail + ")";
+    }
+    if (reliabilityMissingTemplate) {
+      reliabilityMissingTemplate.textContent = "missing/template: missing=" + (failureCategories.missing_result || 0)
+        + " template=" + (failureCategories.template_result || 0);
+    }
+    if (reliabilityLatestAttention) {
+      const att = op.latest_attention;
+      if (!att) {
+        reliabilityLatestAttention.textContent = "latest attention: none";
+      } else {
+        const label = (att.kind || "?") + " "
+          + (att.run_id || att.task_id || "-") + " ("
+          + ((att.reasons && att.reasons[0]) || att.primary_reason || "needs attention") + ")";
+        reliabilityLatestAttention.textContent = "latest attention: " + label;
+      }
+    }
+    if (reliabilityEmpty) {
+      const empty = (resultGuard.retry_queued || 0) === 0
+        && (resultGuard.blocked || 0) === 0
+        && (op.total || 0) === 0;
+      reliabilityEmpty.style.display = empty ? "block" : "none";
+    }
+    if (reliabilityActions) {
+      const cmds = data.suggested_actions || [];
+      reliabilityActions.innerHTML = cmds.map(function (c) {
+        return "<li><code>" + escapeHtml(c) + "</code></li>";
+      }).join("");
+    }
+  }
+
   async function validateBundle(name) {
     if (!name) return;
     bundleValidateOutput.className = "muted";
@@ -4070,12 +4655,14 @@ async function tailOperatorRun() {
   renderAdmin();
   renderUsage();
   renderTimeline();
+  renderReliability();
   refresh();
   autoTimer = setInterval(function () {
     refresh();
     renderAdmin();
     renderUsage();
     renderTimeline();
+    renderReliability();
   }, 3000);
 })();
 </script>
