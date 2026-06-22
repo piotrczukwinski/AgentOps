@@ -154,6 +154,97 @@ guaranteed savings percentage. The roadmap-specific estimate in
 is recorded as one Codex reviewer estimate and should be turned
 into a reproducible benchmark before it is treated as a metric.
 
+## Beyond tokens: operator attention, wall-clock latency, and handoff gaps
+
+Tokens are the most visible cost signal, but the cost OSS
+maintainers actually feel on a long coding-agent workflow is
+**operator time**. AgentOps is designed to help on three
+non-token axes at once. The mechanism on each is the same —
+move the mechanical glue between model runs into a durable
+local control plane — but the visible result lands in three
+different places.
+
+### Operator attention
+
+Without a control plane, the maintainer is the integration
+layer between model runs: re-reading logs, deciding whether a
+failure is transient, reconstructing the next prompt, deciding
+whether a diff is safe to merge. Each of those is an attention
+unit that interrupts whatever the maintainer was actually
+working on.
+
+AgentOps moves that work into named, durable surfaces:
+
+* the **roadmap** owns the task list, the allowed-file scope,
+  the validation commands, the review policy, and the merge
+  gate;
+* the **SQLite state file** owns the per-task attempt log,
+  verdict, validation output, and last-known payload;
+* the **review packet** owns the bounded context the reviewer
+  sees, so the maintainer is not the message bus;
+* the **Admin / Operator panel** owns the attention-needed
+  rollup, with copyable CLI hints instead of new prompts to
+  author.
+
+The maintainer spends attention on the decisions that need a
+human (design review, blocker analysis, high-risk diffs) and
+not on the glue between runs.
+
+### Wall-clock latency
+
+Without a control plane, the workflow is single-step and
+serial: run one task, wait, notice, decide, write the next
+prompt, run again. The wall-clock from "first prompt" to
+"merged result" is the sum of every gap plus every executor
+turn.
+
+AgentOps turns the same workflow into a queued, bounded
+roadmap:
+
+* 10–20 narrow tasks are defined up front with allowed-file
+  scope, validations, attempt budgets, review policy, and
+  merge gates;
+* the run is started once; tasks execute sequentially under
+  the roadmap's per-task budget;
+* the maintainer does not have to be present between tasks —
+  the durable state captures the result, the maintainer returns
+  later to a checkpoint instead of a stalled subprocess.
+
+The shape of the improvement is workload-dependent and is
+**not a measured benchmark**. For tiny tasks the orchestration
+overhead can dominate and direct Codex may be the cheaper
+tool. For multi-step roadmaps with non-trivial implementation,
+retry, and validation work, removing the human-in-the-loop
+gaps is what compresses the wall-clock.
+
+### Handoff gaps
+
+The two axes above share a single underlying cause:
+**handoff gaps between model runs**. Each gap is a place
+where nothing useful happens on the codebase and the
+maintainer's attention has to fill in.
+
+AgentOps is designed to **reduce handoff gaps**, not to
+claim zero handoffs. Human review remains required for
+blocked and high-risk states, the merge gate still refuses
+to touch `main` / `master` / `audit/**` / `release/**`,
+the secret-like-value detector still runs on every patch,
+and `--dangerously-skip-permissions` is still off by default.
+The intent is **bounded unattended progress** with
+durable recovery, not blind autonomy.
+
+This section is **directional, not measured**. There is no
+operator-attention benchmark, no wall-clock benchmark, and
+no handoff-gap benchmark in the repository today. The local
+ledger (`agentops usage --json`,
+[`docs/usage-ledger.md`](usage-ledger.md)) is the source of
+truth for the token signal; the operator-time signal is
+recorded here as design intent, not as a metric.
+
+The full narrative — including how the same mechanism shows
+up in the maintainer-throughput pitch — is in
+[`docs/why-agentops-for-codex.md`](why-agentops-for-codex.md).
+
 ## Cache-aware interpretation
 
 When reasoning about cost, treat token counts and dollar cost

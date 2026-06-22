@@ -1,11 +1,17 @@
-# Public-Release Audit
+# Public-Release Audit (Historical)
 
-> Final readiness audit for the AgentOps repository. This
-> document summarises the state of the public-release
-> application package; it links out to the source-of-truth
-> docs and intentionally does not duplicate their full text.
-> The repository is **not yet public**; the visibility switch
-> is the maintainer's manual action.
+> Historical pre-public readiness audit for the AgentOps
+> repository. This document is preserved as a record of
+> what passed in the public-release validation run; it links
+> out to the source-of-truth docs and intentionally does not
+> duplicate their full text.
+>
+> The repository is now **public**, v0.1.0 has been tagged
+> and released, and the **OpenAI Codex for Open Source**
+> application has been submitted. Acceptance into the
+> support program is **not guaranteed**. See
+> [`docs/codex-for-oss-application.md`](codex-for-oss-application.md)
+> for the current status.
 
 ## 1. Metadata
 
@@ -124,16 +130,18 @@ public-release package adds:
   — release-readiness checklist (updated with the final
   manual steps section).
 * [`docs/codex-for-oss-application.md`](../codex-for-oss-application.md)
-  — Codex for Open Source application prep (updated with
-  ChatGPT Pro with Codex, API credits, Codex Security,
-  "what we will build during the support period", and
-  form-ready answer drafts).
+  — Codex for Open Source application record and
+  post-submission follow-up (containing the rationale,
+  the ChatGPT Pro with Codex / API credits / Codex
+  Security rationale, "what we will build during the
+  support period", and the form-ready answer drafts
+  that were submitted).
 
 ## 7. Known limitations
 
 The application is honest about these limits (they are
 also in [`README.md`](../../README.md) and the
-Codex-for-OSS prep doc):
+Codex-for-OSS application record):
 
 * Not a kernel / container sandbox.
 * Not a hosted service. No multi-tenant backend, no cloud
@@ -149,12 +157,12 @@ Codex-for-OSS prep doc):
 * Best-effort maintenance. There is no formal SLA for
   security or bug fixes.
 
-## 8. Remaining manual actions
+## 8. Remaining manual actions (historical)
 
-These actions live in the new "Final manual steps" section
-of [`docs/public-release-checklist.md`](../public-release-checklist.md).
-They are not automated; each is a small GitHub UI action
-with a clear pass / fail.
+This section records the manual actions that were on the
+list at the close of the public-readiness validation run.
+They have all been completed since. The historical list is
+preserved here for traceability.
 
 * Confirm the release branch is clean.
 * Run the validation commands from §6 of the checklist.
@@ -175,24 +183,39 @@ with a clear pass / fail.
   wording that lands wrong in `README.md`, `docs/demo.md`,
   or the Admin / Operator panel.
 
-## 9. Status
+## 9. Status (historical → current)
 
-* The `public-release-application-package-003` branch
-  contains the full public-release application package
-  (case study, demo, OSS application doc, updated
-  checklist, updated docs map, this audit).
-* The validation suite is green on the release branch:
-  `py_compile` over `agentops/`, the full `unittest`
-  suite, `ruff check .`, `agentops --help`, `agentops
-  doctor`, `agentops plan` on both demo roadmaps,
+Historical, at the close of the public-readiness validation
+run on the `public-release-application-package-003` branch:
+
+* that branch contained the full public-release application
+  package (case study, demo, OSS application doc, updated
+  checklist, updated docs map, this audit);
+* the validation suite was green on the release branch:
+  `py_compile` over `agentops/`, the full `unittest` suite,
+  `ruff check .`, `agentops --help`, `agentops doctor`,
+  `agentops plan` on both demo roadmaps,
   `agentops run --no-codex --max-tasks 1` on the demo
   shell roadmap, `agentops status`, `git diff --check`,
-  and the private-term grep all return clean.
-* The repository is **not yet public**. The visibility
-  switch is the maintainer's manual action and is gated on
-  the steps in §8 above.
+  and the private-term grep all returned clean;
+* the repository was still **private** at the close of
+  that validation run; the visibility switch was the
+  maintainer's manual action.
 
-## 10. Final validation run
+Current:
+
+* the repository is **public**;
+* v0.1.0 is released;
+* the **OpenAI Codex for Open Source** application has
+  been **submitted**;
+* acceptance is **not guaranteed** — see
+  [`docs/codex-for-oss-application.md`](../codex-for-oss-application.md)
+  for the post-submission record;
+* follow-up maintenance continues in the open; no new
+  telemetry, no hosted backend, no change in the safety
+  model.
+
+## 10. Final validation run (historical)
 
 This section records the final pre-public validation run
 performed after the public-readiness, admin dashboard,
@@ -205,7 +228,10 @@ demo recording guide PRs were merged into `main`.
 * **Scope:** validation only; no product changes, no
   dependency changes, no telemetry, no web-shell endpoint,
   no Codex-from-UI, no `main` push, no release tag, no
-  public visibility switch.
+  public visibility switch. The repository was still
+  private at the close of this validation run; the
+  visibility switch happened afterwards and is documented
+  in §9 (current status).
 
 ### 10.1 Repository metadata files
 
@@ -259,16 +285,24 @@ demo recording guide PRs were merged into `main`.
 ### 10.4 Private-term grep
 
 ```
-git grep -nE '/home/czuki|BusinessAgent|biuro|antidetect|AgentOps Internal|piotr@local.agentops|business-agent|STAB|admin-web|web-admin|GIT_TERMAL_PROMPT'
+git grep -nE '/home/[a-z]+|/Users/[a-z]+|C:\\Users\\|@[a-z0-9.-]+\.(com|org|io|net|local)'
 ```
 
+Plus a maintainer-owned sweep against the deny-list of
+private / internal codenames. The exact deny-list lives in
+the maintainer's private prep notes and is **not
+reproduced** in this public file; the release PR recorded
+zero matches in tracked files. This document intentionally
+does not paste the deny-list terms into the public surface
+either, to keep the sweep useful on future releases.
+
 * Tracked working tree: **no matches.**
-* Old roadmap IDs containing the old `biuro-p1-operator-queue`
-  and `agentops-reliability-audit-v2` names are present in
-  the local SQLite state file at `.agentops/state.sqlite`.
-  That file is git-ignored and is a runtime artifact, not
-  source code. It is **not** part of the public repository
-  and will not be published.
+* Old roadmap IDs containing old internal codenames (an
+  internal queue-prefix name and a previous audit-batch
+  name) are present in the local SQLite state file at
+  `.agentops/state.sqlite`. That file is git-ignored and is
+  a runtime artifact, not source code. It is **not** part
+  of the public repository and is not published.
 
 ### 10.5 Secret-like scan
 
@@ -295,10 +329,11 @@ git grep -nE '/home/czuki|BusinessAgent|biuro|antidetect|AgentOps Internal|piotr
   sandboxing recipes, and demo recording guide commits
   visible in history.
 
-### 10.7 Remaining manual actions
+### 10.7 Remaining manual actions (historical)
 
-These actions are owned by the maintainer and are not
-automated by this validation run:
+These actions were owned by the maintainer and were not
+automated by the validation run. They have all been
+completed since:
 
 * Switch the repository visibility to public (GitHub
   Settings → Danger Zone → "Change repository visibility").
@@ -316,11 +351,14 @@ automated by this validation run:
   drafts in
   [`docs/codex-for-oss-application.md`](../codex-for-oss-application.md).
 
-### 10.8 Verdict
+### 10.8 Verdict (historical)
 
-`READY_FOR_PUBLIC_RELEASE` — every automated gate listed
-in §10.3 is green, the private-term grep and secret-like
-scan both return zero matches on tracked source, the
-working tree is clean (only intentionally untracked local
-runtime artifacts remain), and the only outstanding items
-are the maintainer-owned manual steps in §10.7.
+`READY_FOR_PUBLIC_RELEASE` (historical) — at the close of
+the validation run, every automated gate listed in §10.3
+was green, the private-term grep and secret-like scan both
+returned zero matches on tracked source, the working tree
+was clean (only intentionally untracked local runtime
+artifacts remained), and the only outstanding items were
+the maintainer-owned manual steps in §10.7. All of those
+manual steps have since been completed; see §9 for the
+current status.

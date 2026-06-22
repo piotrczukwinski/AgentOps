@@ -1,14 +1,25 @@
 # Public-Release Checklist
 
-> This document is the source of truth for what must pass before
-> the AgentOps repository is switched from private to public.
-> Items are grouped by category; each item should be checked
-> off in the PR that performs the actual switch.
+> Historical / reusable release-hygiene checklist.
+>
+> This document was the source of truth for what must pass
+> before the AgentOps repository was switched from private to
+> public. That switch has since happened: the repository is
+> now **public**, v0.1.0 is released, and the **OpenAI Codex
+> for Open Source** application has been submitted.
+> Acceptance is **not guaranteed**.
+>
+> The list below is preserved as **reusable release hygiene**
+> for future releases of this repository and as a reference
+> for other small open-source projects. Items are grouped by
+> category; the wording now treats each item as a hygiene
+> check rather than a one-shot pre-public gate.
 >
 > The companion document
 > [`codex-for-oss-application.md`](codex-for-oss-application.md)
-> lists the prep steps for the OpenAI Codex for Open Source
-> application.
+> is the application record and post-submission follow-up
+> plan for the OpenAI Codex for Open Source support
+> program.
 
 ## 1. Metadata checklist
 
@@ -158,11 +169,12 @@ output for each of the commands below.
 * [ ] No new telemetry, analytics, or hosted / cloud
       dependency has been added.
 
-## 6. Commands to run before switching the repo public
+## 6. Reusable release validation commands
 
-Run each command from the repository root, on the release
-branch, with a clean working tree. Attach the output to the
-release PR.
+For future releases or public-facing documentation changes,
+run each command from the repository root on the release branch
+with a clean working tree. Attach the output to the release PR
+or PR description.
 
 ```bash
 # Sensitive-term sweep (should return nothing in the diff).
@@ -199,23 +211,25 @@ gitleaks detect --no-banner --source .
 trufflehog filesystem .
 ```
 
-If any command returns a non-zero exit code or any non-empty
-match, the release is **not** ready and the issue must be
-fixed in the release branch before the repo is switched
-public.
+If any command returns a non-zero exit code or any unexpected
+match, the release or documentation PR is **not** ready and the
+issue must be fixed before merge.
 
-## 7. Final manual steps (run by the maintainer)
+## 7. Final manual steps (historical — used at v0.1.0)
 
 This section lists the actions that **only the maintainer
-can do** before the repository is switched from private to
-public and before the Codex for Open Source application is
-submitted. None of these are automated; each is a small
-GitHub UI action with a clear pass / fail.
+can do** at the moment of a visibility switch or a public
+program submission. The list below was the historical
+checklist used at v0.1.0; the actions have since been
+completed (repository is public, v0.1.0 tagged, Codex for
+Open Source application submitted). Future maintainers
+treating this document as reusable release hygiene should
+adapt the wording to their own context — these items are
+**not** a recurring requirement on every PR.
 
 * [ ] **Confirm the release branch is clean.**
-      `git status` shows a clean working tree on
-      `public-release-application-package-003` (or the
-      current release branch).
+      `git status` shows a clean working tree on the
+      release branch.
 * [ ] **Run the validation commands from §6** and paste the
       output in the release PR. Every command must return
       zero on the release branch.
@@ -242,9 +256,9 @@ GitHub UI action with a clear pass / fail.
       * `opencode`
       * `cli`
       * `automation`
-* [ ] **Create the v0.1.0 release tag** on the merged
-      `main` commit after the release PR is merged. Tag
-      message: short, public, no private codenames.
+* [ ] **Create the release tag** on the merged `main`
+      commit after the release PR is merged. Tag message:
+      short, public, no private codenames.
 * [ ] **Add a screenshot or animated GIF of the Admin /
       Operator panel** if desired. Place the file under
       `docs/img/` and reference it from `README.md`. This
@@ -257,14 +271,18 @@ GitHub UI action with a clear pass / fail.
       text walkthrough in [`docs/demo.md`](demo.md) is the
       source of truth, and a missing image must not block
       the release.
-* [ ] **Switch the repository visibility to public** in
-      GitHub Settings → General → Danger Zone. This is the
-      visibility switch the rest of this document guards.
-* [ ] **Submit the Codex for Open Source application** using
-      the draft answers in
+* [ ] **(First-time only) Switch the repository visibility
+      to public** in GitHub Settings → General → Danger
+      Zone. This was the v0.1.0 visibility switch; it is
+      not a recurring step.
+* [ ] **(First-time only) Submit the OpenAI Codex for
+      Open Source application** using the rationale and
+      drafts in
       [`docs/codex-for-oss-application.md`](codex-for-oss-application.md).
       Trim the 500-character drafts to fit the form's hard
-      limit if the form requires it.
+      limit if the form requires it. Submission has
+      already happened at v0.1.0; this is recorded here
+      for traceability, not as an open task.
 * [ ] **Watch the first 24 hours of public traffic.** The
       first wave of public visitors will hit `README.md`,
       `docs/demo.md`, and the Admin / Operator panel first;

@@ -19,7 +19,7 @@ The longer narrative is in
 | Codex reviewer model config | Roadmap/task `review.model` and reasoning-effort configuration. | Lets maintainers choose the reviewer model per task without changing code. |
 | operator-run recovery | Operator run harness docs and tests. | Handles long-running executor prompts, watchdog state, and bounded retry. |
 | Admin / Operator panel | Local web UI docs and tests for `GET /api/admin`. | Gives the maintainer a read-only cockpit without enabling web Codex execution. |
-| public release readiness | Public checklist, audit, demo, and application prep docs. | Shows AgentOps can manage its own release-hardening workflow. |
+| public release readiness | Public checklist, audit, demo, and OSS application record docs. | Shows AgentOps can manage its own release-hardening workflow. |
 
 ## Public-safe branches and docs
 

@@ -1,11 +1,14 @@
-# Codex for Open Source — Application Prep
+# Codex for Open Source — Application Record and Follow-up
 
-> Internal prep document for the **OpenAI Codex for Open
-> Source** application. The text below is a draft and is
-> intentionally short; copy-and-paste from this file when
-> filling in the application form. The repository is **not
-> yet public**, and this document does **not** guarantee that
-> the application will be accepted.
+> Application record and post-submission follow-up for the
+> **OpenAI Codex for Open Source** support program.
+>
+> Status (current): the AgentOps repository is public, v0.1.0
+> is released, and the application has been submitted. This
+> document preserves the rationale and answer drafts that
+> were submitted with the application, plus the follow-up
+> plan for the support period. Acceptance into the program
+> is **not guaranteed**; review is on OpenAI's own criteria.
 
 ## 1. Project pitch (one paragraph)
 
@@ -240,23 +243,30 @@ The application is honest about these limits:
 
 ## 11. Things this document does **not** claim
 
-* Acceptance into the Codex for Open Source program is
-  **not guaranteed**. The application is reviewed by
-  OpenAI on its own criteria.
-* The repository is not yet public. The
-  [`public-release-checklist.md`](public-release-checklist.md)
-  is the source of truth for what must pass before the
-  visibility switch; this PR satisfies most of it.
+* Acceptance into the **OpenAI Codex for Open Source**
+  support program is **not guaranteed**. The application
+  is reviewed by OpenAI on its own criteria.
+* No grant, credit amount, or seat count is implied by
+  this document. The drafts speak only in terms of
+  *ChatGPT Pro with Codex* and *API credits* as worded on
+  the application form.
+* The maintainer is a single person doing best-effort
+  maintenance in spare time. There is no on-call rota and
+  no guaranteed response window for security reports
+  beyond the contact in `SECURITY.md`.
 * AgentOps is **not** a hosted service, **not** a
   kernel/container sandbox, and **not** a security
   boundary. The safety model in
   [`docs/security.md`](security.md) and
   [`SECURITY.md`](../SECURITY.md) is honest about these
   limits.
-* The maintainer is a single person doing best-effort
-  maintenance in spare time. There is no on-call rota and
-  no guaranteed response window for security reports
-  beyond the contact in `SECURITY.md`.
+* AgentOps does **not** claim full autonomy. The merge
+  gate refuses to touch `main` / `master` / `audit/**` /
+  `release/**`, `BLOCK` verdicts stop the run, and
+  human review remains required for blocked and high-risk
+  states. See
+  [`docs/why-agentops-for-codex.md`](why-agentops-for-codex.md)
+  for the operator-time compression narrative.
 
 ## 12. Demo for reviewers
 
@@ -292,3 +302,82 @@ and never enables the Codex reviewer. The CLI is the
 source of truth; the UI is a maintainer cockpit.
 
 The full walkthrough is in [`docs/demo.md`](demo.md).
+
+## 13. Status (post-submission)
+
+Honest record of where the application stands today:
+
+* the AgentOps repository is **public**;
+* v0.1.0 has been tagged and released;
+* the **OpenAI Codex for Open Source** support application
+  has been **submitted**;
+* acceptance is **not guaranteed** — review is on OpenAI's
+  own criteria and timeline;
+* this document does **not** claim that credits, seats,
+  acceptance, or any specific outcome have been granted.
+
+If the application is accepted, the support period begins on
+OpenAI's terms. The commitments in §8 (harden executor
+result JSON, expand gated-roadmap runner coverage, polish
+the Admin / Operator panel and `agentops pr-loop`, and keep
+the public roadmap hygiene up-to-date) remain in scope
+regardless.
+
+If the application is not accepted, AgentOps development
+continues in the open: Apache 2.0, no telemetry, no hosted
+backend, no change in the safety model. The CLI, the local
+web UI, the `codex` reviewer integration, and the
+`opencode` executor all remain usable on the maintainer's
+own keys.
+
+## 14. Follow-up plan during the support period
+
+If accepted, the support period is treated as **bounded
+unattended progress** plus a small set of explicit
+maintainer checkpoints:
+
+* each roadmap in scope is published as a PR series with
+  allowed-file scope, validations, attempt budgets, review
+  policy, and an integration branch;
+* the maintainer checks the Admin / Operator panel and the
+  SQLite event log at sensible intervals instead of
+  tailing the subprocess live;
+* blocked / high-risk tasks remain human decisions and are
+  not auto-merged;
+* `agentops decide <task> --verdict <...> --safe-to-merge`
+  is the documented recovery path for `awaiting_review`
+  states when Codex is unavailable or out of budget;
+* `agentops operator-tail <run-id>` plus the
+  `agentops timeline` / `agentops usage` commands are the
+  documented recovery path for transient-failure rollups
+  and the model-usage ledger rollup respectively.
+
+If not accepted, the same roadmaps run against the
+maintainer's own Codex / OpenCode keys, with the same
+reviewer / executor contract and the same safety model. The
+documented support-period flow does not depend on the
+program outcome.
+
+## 15. Operator-time compression (the OSS-support story)
+
+The full maintainer-throughput argument lives in
+[`docs/why-agentops-for-codex.md`](why-agentops-for-codex.md).
+The short version, kept here because it is the single most
+important paragraph a reviewer of this application is likely
+to weigh:
+
+> AgentOps is not only a token / cost optimization layer. It
+> is designed to compress maintainer wall-clock time by
+> removing the manual handoff gaps between model runs.
+> Without a durable control plane, long coding-agent
+> workflows stall between steps: the executor finishes, the
+> maintainer notices later, copies the next prompt, re-runs
+> validation, asks for repair, waits again, and repeats.
+> AgentOps turns this into a queued, bounded roadmap: the
+> maintainer can define 10–20 narrow tasks with allowed-file
+> scope, validations, attempt budgets, review policy, and
+> merge gates, start the run, and return later to durable
+> state — accepted tasks, blocked tasks, logs, artifacts,
+> validation output, review packets, and copyable recovery
+> commands. This is not blind autonomy: safety boundaries
+> remain.
