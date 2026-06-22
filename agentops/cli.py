@@ -844,6 +844,79 @@ def build_parser() -> argparse.ArgumentParser:
     # harness on the PR branch. The final merge is always
     # operator-controlled. See docs/operator-run-harness.md and
     # docs/gated-roadmap-runner.md for the full procedure.
+    task_settle_cmd = sub.add_parser(
+        "task-settle",
+        help="Record settlement of a task whose work is already integrated externally.",
+        description=(
+            "Use this when a task is stuck in a terminal failure state "
+            "(merge_failed / blocked / failed / validation_failed / "
+            "awaiting_human) but the actual change has already been merged "
+            "outside AgentOps (for example a duplicate cherry-pick or a "
+            "human-merged rescue PR). The command records the settlement "
+            "in the audit event log and advances the task to 'accepted' or "
+            "'merged' without invoking an executor. "
+            "Protected states (accepted / pushed / merged / skipped) "
+            "require --force. In-flight states are always refused."
+        ),
+    )
+    task_settle_cmd.add_argument(
+        "task_id",
+        help="Task id to settle.",
+    )
+    task_settle_cmd.add_argument(
+        "--roadmap",
+        required=True,
+        help="Path to the roadmap JSON/YAML file the task belongs to.",
+    )
+    task_settle_cmd.add_argument(
+        "--state",
+        required=True,
+        choices=("accepted", "merged"),
+        help="Target settlement state.",
+    )
+    task_settle_cmd.add_argument(
+        "--reason",
+        required=True,
+        help="Free-form operator note recorded in the settlement event payload. Required.",
+    )
+    task_settle_cmd.add_argument(
+        "--external-commit",
+        default=None,
+        help=(
+            "External commit SHA where the work actually lives. "
+            "Required when --state is 'merged'; optional for 'accepted'."
+        ),
+    )
+    task_settle_cmd.add_argument(
+        "--include-dependents",
+        action="store_true",
+        help=(
+            "Reopen every transitive dependent that was skipped because this "
+            "task was not satisfied. Only tasks in state=skipped with a "
+            "dependency-related skip reason are touched; accepted / pushed / "
+            "merged dependents are never reset."
+        ),
+    )
+    task_settle_cmd.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Override the default refusal for tasks already in a protected "
+            "terminal state (accepted / pushed / merged / skipped). "
+            "Cannot override in-flight refusals."
+        ),
+    )
+    task_settle_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the decision that would be applied and exit without mutating the SQLite state DB.",
+    )
+    task_settle_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a JSON object with the decision / mutations instead of a human summary.",
+    )
+
     pr_loop_cmd = sub.add_parser(
         "pr-loop",
         help="Run a single cycle of the AgentOps PR repair loop (review verdict -> repair prompt -> executor).",
@@ -1038,6 +1111,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "task-retry":
             return _cmd_task_retry(state, args)
+
+        if args.command == "task-settle":
+            return _cmd_task_settle(state, args)
 
         if args.command == "pr-loop":
             return _cmd_pr_loop(args)
@@ -2531,6 +2607,137 @@ def _cmd_task_retry(state: StateStore, args: argparse.Namespace) -> int:
     else:
         _print_task_retry_text(result, roadmap_path=roadmap_path, dry_run=False)
     return 0
+
+
+def _cmd_task_settle(state: StateStore, args: argparse.Namespace) -> int:
+    """Operator-initiated task settlement for already-integrated work.
+
+    Mirrors the safety guarantees of ``task-retry`` and ``decide``.
+    The function never invokes an executor; it only writes a pair of
+    audit events and (when allowed) the new task state.
+    """
+    from .task_settlement import (
+        apply_task_settle,
+        evaluate_task_settle,
+    )
+
+    roadmap = _load_roadmap_or_error(args.roadmap)
+    roadmap_path = str(Path(args.roadmap).expanduser().resolve())
+
+    target_state = str(getattr(args, "state", "")).strip()
+    reason = str(getattr(args, "reason", "")).strip()
+    external_commit = str(getattr(args, "external_commit", "") or "").strip() or None
+    include_dependents = bool(getattr(args, "include_dependents", False))
+    force = bool(getattr(args, "force", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    as_json = bool(getattr(args, "json", False))
+
+    task_id = str(args.task_id)
+    current_state = _lookup_current_task_state(
+        state,
+        roadmap_id=roadmap.roadmap_id,
+        task_id=task_id,
+    )
+    if current_state is None:
+        msg = (
+            f"task-settle: task {task_id!r} not found in roadmap "
+            f"{roadmap.roadmap_id!r}"
+        )
+        if as_json:
+            print(
+                json.dumps(
+                    {"allowed": False, "refusal_reason": msg},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(msg, file=sys.stderr)
+        return 2
+
+    decision = evaluate_task_settle(
+        current_state=current_state,
+        target_state=target_state,
+        reason=reason,
+        external_commit=external_commit,
+        include_dependents=include_dependents,
+        force=force,
+    )
+
+    if not decision.allowed:
+        if as_json:
+            print(json.dumps(decision.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(f"task-settle: {decision.refusal_reason}", file=sys.stderr)
+            if decision.previous_state in {"accepted", "pushed", "merged", "skipped"}:
+                print(
+                    "Hint: re-run with --force to override the safety default.",
+                    file=sys.stderr,
+                )
+        return 2
+
+    result = apply_task_settle(
+        state,
+        roadmap_id=roadmap.roadmap_id,
+        task_id=task_id,
+        decision=decision,
+        dry_run=dry_run,
+    )
+
+    payload = result.to_dict()
+    payload["roadmap_path"] = roadmap_path
+    payload["dry_run"] = dry_run
+
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        next_command = (
+            f"agentops run --roadmap {roadmap_path} --resume"
+        )
+        if dry_run:
+            print(
+                f"task-settle (dry-run): task={task_id} "
+                f"previous_state={result.previous_state} -> "
+                f"new_state={result.new_state}"
+            )
+        else:
+            print(
+                f"task-settle: task={task_id} "
+                f"previous_state={result.previous_state} -> "
+                f"new_state={result.new_state}"
+            )
+        if result.external_commit:
+            print(f"  external_commit: {result.external_commit}")
+        if result.dependent_ids:
+            print(
+                "  dependents reopened: "
+                + ", ".join(result.dependent_ids)
+            )
+        print(f"  reason: {decision.reason}")
+        if not dry_run:
+            print(f"Next: {next_command}")
+    return 0
+
+
+def _lookup_current_task_state(
+    state: StateStore, *, roadmap_id: str, task_id: str
+) -> str | None:
+    try:
+        with state.connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM tasks WHERE roadmap_id=? AND id=?",
+                (roadmap_id, task_id),
+            ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    if row is None:
+        return None
+    try:
+        return str(row["state"])
+    except (IndexError, KeyError):
+        return None
 
 
 # ---------------------------------------------------------------------------
