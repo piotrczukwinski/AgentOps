@@ -164,6 +164,41 @@ to execute shell.
 See `docs/night-run-report.md` for the morning checklist
 that pairs with these endpoints.
 
+## Operator cockpit layout
+
+The dashboard is organized as an **operator cockpit**, not a vertical
+page of tables. The first screen answers "what should I do next?"
+before any raw table:
+
+1. **Sticky header** — health dot, running count, attention count,
+   latest-error count, manual refresh. Same data, no new endpoints.
+2. **Overview strip** — five cards (Health, Running, Attention, Latest
+   error, Next action) rendered from the single `/api/admin` payload.
+   The Attention card folds in the `reliability_summary` counters
+   (`result_guard_blocked`, `stale_pid`, `needs_operator`); the Next
+   action card surfaces a copyable CLI hint taken first from
+   `reliability_summary.latest_attention.first_cli` and then from
+   `attention_needed`.
+3. **Work queue + selected detail** — the left column prioritizes
+   needs-attention items (from `attention_needed`), then in-flight
+   runs, then recently-settled runs. Clicking a row selects it into
+   the right-hand detail pane, which reuses the existing run/task
+   monitor (Tail, Start live, Load logs, Task live) — no new
+   endpoints. Every CLI hint has a text-only **Copy** button.
+4. **Task explorer** — defaults to "Needs attention", not "All".
+5. **Collapsed reference** — Run timeline, Executor reliability,
+   Model usage, the Admin / Operator panel tables, Operator runs
+   (monitor), Bundles, History, and Latest events each render inside
+   a native `<details>` element so they ship collapsed. Expanding
+   them does not change which endpoints are polled.
+
+The cockpit adds **no new endpoints**, **no new fetches** (it reads
+the summaries already embedded in `/api/admin`), and **no command
+execution** — copy buttons write to the clipboard only. The full
+`Executor reliability` card and `/api/reliability` endpoint remain
+unchanged; the cockpit simply surfaces their headline counters above
+the fold.
+
 ## Recommended workflow
 
 The recommended operator loop is still CLI-first; the UI is a read-mostly

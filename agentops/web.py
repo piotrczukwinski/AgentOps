@@ -3359,15 +3359,16 @@ INDEX_TEMPLATE = """<!doctype html>
 <title>AgentOps Local UI</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-  :root { color-scheme: light dark; --fg:#111; --bg:#f6f6f6; --card:#fff; --muted:#666; --accent:#0a66c2; --err:#b00020; }
-  @media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#181818; --card:#222; --muted:#aaa; --accent:#7cb7ff; --err:#ff8080; } }
+  :root { color-scheme: light dark; --fg:#111; --bg:#f6f6f6; --card:#fff; --muted:#666; --accent:#0a66c2; --err:#b00020; --ok:#2a9d4a; --warn:#d97706; --border:#8884; --subtle:#0000000d; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#181818; --card:#222; --muted:#aaa; --accent:#7cb7ff; --err:#ff8080; --ok:#3fb96a; --warn:#f0a830; --border:#fff3; --subtle:#ffffff10; } }
   body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--fg); margin: 0; }
-  header { padding: 12px 20px; background: var(--card); border-bottom: 1px solid #8884; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header.cockpit-header { position: sticky; top: 0; z-index: 20; padding: 10px 20px; background: var(--card); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; box-shadow: 0 1px 2px var(--subtle); }
   header h1 { font-size: 18px; margin: 0; }
   main { padding: 16px 20px; display: grid; gap: 16px; }
-  .card { background: var(--card); border: 1px solid #8884; border-radius: 8px; padding: 12px 14px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .card-h { margin: 0 0 8px; font-size: 15px; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  button, select, input[type=text] { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid #8888; background: var(--card); color: var(--fg); }
+  button, select, input[type=text], input[type=number], input[type=file] { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid #8888; background: var(--card); color: var(--fg); }
   button { cursor: pointer; background: var(--accent); color: #fff; border-color: var(--accent); }
   button.secondary { background: var(--card); color: var(--fg); border-color: #8888; }
   button:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -3375,98 +3376,255 @@ INDEX_TEMPLATE = """<!doctype html>
   th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #8883; vertical-align: top; }
   th { color: var(--muted); font-weight: 600; }
   .pill { display: inline-block; padding: 1px 6px; border-radius: 999px; background: #8883; font-size: 12px; }
-  pre { white-space: pre-wrap; word-break: break-word; background: #00000010; padding: 8px; border-radius: 6px; max-height: 320px; overflow: auto; }
+  pre { white-space: pre-wrap; word-break: break-word; background: var(--subtle); padding: 8px; border-radius: 6px; max-height: 320px; overflow: auto; }
   .muted { color: var(--muted); }
   .err { color: var(--err); }
   .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: #888; }
-  .status-dot.ok { background: #2a9d4a; }
+  .status-dot.ok { background: var(--ok); }
   .status-dot.bad { background: var(--err); }
-  .status-dot.stale { background: #d97706; }
-  .runtime-stale { color: #d97706; font-weight: 600; }
-  @media (prefers-color-scheme: dark) { .runtime-stale { color: #f0a830; } }
+  .status-dot.stale { background: var(--warn); }
+  .runtime-stale { color: var(--warn); font-weight: 600; }
   .timeline-sev-info { background: #8883; }
-  .timeline-sev-warning { background: #d97706; color: #fff; }
-  .timeline-sev-error { background: #b00020; color: #fff; }
+  .timeline-sev-warning { background: var(--warn); color: #fff; }
+  .timeline-sev-error { background: var(--err); color: #fff; }
+  .sev-info { background: #8883; }
+  .sev-warn { background: var(--warn); color: #fff; }
+  .sev-error { background: var(--err); color: #fff; }
+
+  /* ---- Operator cockpit layout ---- */
+  .overview-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+  @media (max-width: 1100px) { .overview-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 640px) { .overview-grid { grid-template-columns: 1fr; } }
+  .ov-card { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--card); min-width: 0; }
+  .ov-card.ov-action { border-color: var(--accent); }
+  .ov-label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .ov-value { font-size: 20px; font-weight: 600; line-height: 1.2; margin-top: 2px; word-break: break-word; }
+  .ov-sub { font-size: 11px; margin-top: 2px; }
+
+  .main-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 980px) { .main-grid { grid-template-columns: 1fr; } }
+
+  .wq-bucket { margin-bottom: 10px; }
+  .wq-bucket-h { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; padding: 4px 0; display: flex; align-items: center; gap: 6px; }
+  .wq-bucket-h.sev-error { color: var(--err); }
+  .wq-bucket-h.sev-warn { color: var(--warn); }
+  .wq-bucket-h::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; display: inline-block; }
+
+  .queue-item { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; padding: 7px 8px; border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px; margin-bottom: 6px; background: var(--card); cursor: pointer; }
+  .queue-item:hover { border-color: var(--accent); }
+  .queue-item.sev-error { border-left-color: var(--err); }
+  .queue-item.sev-warn { border-left-color: var(--warn); }
+  .queue-item.sev-info { border-left-color: #888; }
+  .qi-main { min-width: 0; }
+  .qi-title { font-weight: 600; font-size: 13px; word-break: break-all; }
+  .qi-reasons { font-size: 12px; color: var(--muted); }
+  .qi-cli { grid-column: 1 / -1; font-size: 12px; }
+  .qi-cli code { background: var(--subtle); padding: 2px 4px; border-radius: 4px; word-break: break-all; }
+
+  .detail-pickers { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+  .detail-tab { font-weight: 600; }
+  .detail-tab.tab-active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .detail-hint { margin-left: 6px; }
+  .detail-pane { border-top: 1px dashed var(--border); padding-top: 8px; }
+  .detail-pane .row code { background: var(--subtle); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
+
+  .copy-btn { font-size: 11px; padding: 2px 8px; }
+  .copy-btn.copied { background: var(--ok); color: #fff; border-color: var(--ok); }
+
+  .filter-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+
+  details.card, details.wq-settled { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+  details.card > summary, details.wq-settled > summary { cursor: pointer; font-size: 14px; font-weight: 600; }
+  details.card[open] { padding-bottom: 12px; }
+  .section-note { font-size: 12px; }
+
+  tr.row-clickable { cursor: pointer; }
+  tr.row-clickable:hover { background: var(--subtle); }
 </style>
 </head>
 <body>
-<header>
+<header class="cockpit-header">
   <h1>AgentOps Local UI</h1>
   <span class="pill" id="status-pill">checking&hellip;</span>
+  <span class="pill" id="cockpit-running">running: -</span>
+  <span class="pill" id="cockpit-attention">attention: -</span>
+  <span class="muted" id="cockpit-latest-error"></span>
   <span class="muted" id="db-path"></span>
   <span class="muted" id="auto-refresh">auto-refresh: on (3s)</span>
   <span style="flex:1"></span>
   <button class="secondary" id="refresh-btn">Refresh now</button>
 </header>
 <main>
-  <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">Bundles</h2>
-    <div class="row">
-      <input id="bundle-file" type="file" accept=".zip" />
-      <button id="bundle-upload-btn">Upload bundle</button>
-      <span id="bundle-upload-status" class="muted"></span>
+  <section class="card" id="cockpit-overview" aria-label="Operator overview">
+    <div class="overview-grid">
+      <div class="ov-card" id="overview-health">
+        <div class="ov-label">Health</div>
+        <div class="ov-value" id="overview-health-value"><span class="status-dot"></span> checking</div>
+        <div class="ov-sub muted" id="overview-health-sub">db: -</div>
+      </div>
+      <div class="ov-card" id="overview-running">
+        <div class="ov-label">Running</div>
+        <div class="ov-value" id="overview-running-value">-</div>
+        <div class="ov-sub muted" id="overview-running-sub">operator runs</div>
+      </div>
+      <div class="ov-card" id="overview-attention">
+        <div class="ov-label">Attention</div>
+        <div class="ov-value" id="overview-attention-value">-</div>
+        <div class="ov-sub muted" id="overview-attention-sub">blocks / stale / needs operator</div>
+      </div>
+      <div class="ov-card" id="overview-latest-error">
+        <div class="ov-label">Latest error</div>
+        <div class="ov-value" id="overview-latest-error-value" style="font-size:13px;font-weight:500;">none</div>
+        <div class="ov-sub muted" id="overview-latest-error-sub">timeline</div>
+      </div>
+      <div class="ov-card ov-action" id="overview-next-action">
+        <div class="ov-label">Next action</div>
+        <div class="ov-value" id="overview-next-action-text" style="font-size:13px;font-weight:500;">no action suggested</div>
+        <div class="ov-sub" id="overview-next-action-copy"></div>
+      </div>
     </div>
-    <table>
-      <thead>
-        <tr><th>Name</th><th>Version</th><th>Roadmap</th><th>Description</th><th>Action</th></tr>
-      </thead>
-      <tbody id="bundle-rows"><tr><td colspan="5" class="muted">loading&hellip;</td></tr></tbody>
-    </table>
-    <pre id="bundle-validate-output" class="muted">click Validate to check a bundle.</pre>
   </section>
 
+  <div class="main-grid">
+    <section class="card" id="work-queue" aria-label="Work queue">
+      <h2 class="card-h">Work queue</h2>
+      <div class="muted" id="work-queue-empty" style="display:none;">Nothing needs operator attention. The dashboard is green.</div>
+      <div class="wq-bucket">
+        <div class="wq-bucket-h sev-error">Needs attention <span class="muted" id="wq-attention-count"></span></div>
+        <div id="work-queue-attention"></div>
+      </div>
+      <div class="wq-bucket">
+        <div class="wq-bucket-h sev-warn">In flight <span class="muted" id="wq-running-count"></span></div>
+        <div id="work-queue-running"></div>
+      </div>
+      <div class="wq-bucket">
+        <details class="wq-settled">
+          <summary>Recently settled <span class="muted" id="wq-settled-count"></span></summary>
+          <div id="work-queue-settled" style="margin-top:6px;"></div>
+        </details>
+      </div>
+    </section>
+
+    <section class="card" id="selected-detail" aria-label="Selected detail">
+      <h2 class="card-h">Selected detail</h2>
+      <div class="detail-pickers">
+        <button type="button" class="secondary detail-tab tab-active" id="detail-tab-run">Run</button>
+        <button type="button" class="secondary detail-tab" id="detail-tab-task">Task</button>
+        <span class="muted detail-hint" id="detail-hint">pick a row from the work queue</span>
+      </div>
+
+      <div id="detail-run-pane" class="detail-pane">
+        <div class="row">
+          <span class="muted">run:</span>
+          <code id="detail-run-id">(none)</code>
+          <button type="button" class="secondary copy-btn" data-copy-target="detail-run-id">Copy id</button>
+        </div>
+        <div class="row" style="margin-top:6px;"><span class="muted" id="detail-run-meta"></span></div>
+        <div class="row" style="margin-top:6px;">
+          <span class="muted">suggested:</span>
+          <code id="detail-run-suggested">(none)</code>
+          <button type="button" class="secondary copy-btn" data-copy-target="detail-run-suggested">Copy</button>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <label for="operator-run-select" class="muted">Process:</label>
+          <select id="operator-run-select"></select>
+          <label for="operator-run-input" class="muted">Run id:</label>
+          <input id="operator-run-input" type="text" placeholder="20260617T004015Z-..." size="28" />
+          <button class="secondary" id="operator-tail-btn">Tail (200 lines)</button>
+        </div>
+        <pre id="operator-tail-output" class="muted">click Tail to load the latest attempt log for the selected run id.</pre>
+        <div class="row" style="margin-top:8px;">
+          <label for="monitor-run-input" class="muted">Operator run id:</label>
+          <input id="monitor-run-input" type="text" placeholder="20260617T..." size="28" />
+          <button class="secondary" id="monitor-start-btn">Start live</button>
+          <button class="secondary" id="monitor-stop-btn">Stop</button>
+        </div>
+        <pre id="monitor-live-output">click Start live to stream.</pre>
+      </div>
+
+      <div id="detail-task-pane" class="detail-pane" style="display:none;">
+        <div class="row">
+          <span class="muted">task:</span>
+          <code id="detail-task-id">(none)</code>
+          <button type="button" class="secondary copy-btn" data-copy-target="detail-task-id">Copy id</button>
+        </div>
+        <div class="row" style="margin-top:6px;"><span class="muted" id="detail-task-meta"></span></div>
+        <div class="row" style="margin-top:8px;">
+          <label for="task-input" class="muted">Task id:</label>
+          <input id="task-input" type="text" placeholder="DEMO-SHELL-001" size="22" />
+          <button class="secondary" id="logs-btn">Load logs</button>
+          <button class="secondary" id="artifacts-btn">Load artifacts</button>
+        </div>
+        <pre id="detail-output">select a task and press a button.</pre>
+        <div class="row" style="margin-top:8px;">
+          <label for="monitor-task-roadmap" class="muted">Roadmap:</label>
+          <input id="monitor-task-roadmap" type="text" placeholder="roadmap_id" size="20" />
+          <button class="secondary" id="task-live-btn">Task live</button>
+          <button class="secondary" id="task-live-stop-btn">Stop</button>
+        </div>
+        <pre id="task-live-output">click Task live to stream the executor log.</pre>
+      </div>
+    </section>
+  </div>
+
   <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">Admin / Operator panel <span class="muted" id="admin-generated-at"></span></h2>
-    <div class="row" style="margin-bottom:8px;">
+    <h2 class="card-h">Roadmap launcher</h2>
+    <div class="row">
+      <label for="roadmap-select" class="muted">Select:</label>
+      <select id="roadmap-select"></select>
+      <label for="roadmap-input" class="muted">or path:</label>
+      <input id="roadmap-input" type="text" placeholder="examples/roadmaps/demo-shell.json" size="38" />
+      <button id="plan-btn">Plan</button>
+      <button id="run-btn">Run with Codex review</button>
+      <label><input id="run-autonomous" type="checkbox" /> autonomous</label>
+      <label>reviewer: <select id="run-reviewer"><option value="codex" selected>codex</option><option value="heuristic">heuristic</option><option value="">(roadmap default)</option></select></label>
+      <label>max-tasks: <input id="run-max-tasks" type="number" min="1" placeholder="(none)" size="4" /></label>
+    </div>
+    <div id="plan-output" class="muted" style="margin-top:8px;"></div>
+  </section>
+
+  <details class="card">
+    <summary>Roadmap health</summary>
+    <div class="row" style="margin:8px 0;">
       <span class="pill" id="admin-empty-pill">loading&hellip;</span>
       <span class="muted" id="admin-summary"></span>
+      <span class="muted" id="admin-generated-at"></span>
     </div>
-    <h3 style="font-size:13px;margin:8px 0 4px;">Roadmap task rollup</h3>
     <table>
       <thead>
         <tr><th>Roadmap</th><th>Tasks</th><th>States</th></tr>
       </thead>
       <tbody id="admin-roadmap-rows"><tr><td colspan="3" class="muted">loading&hellip;</td></tr></tbody>
     </table>
-    <h3 style="font-size:13px;margin:12px 0 4px;">Latest events</h3>
-    <table>
-      <thead>
-        <tr><th>#</th><th>Time</th><th>Type</th><th>Task</th><th>Roadmap</th><th>Summary</th></tr>
-      </thead>
-      <tbody id="admin-event-rows"><tr><td colspan="6" class="muted">loading&hellip;</td></tr></tbody>
-    </table>
-    <h3 style="font-size:13px;margin:12px 0 4px;">Operator runs (5 most recent)</h3>
-    <table>
-      <thead>
-        <tr><th>Run id</th><th>Status</th><th>Runtime</th><th>PID</th><th>Idle (s)</th><th>Log size</th><th>Failure</th><th>Suggested</th></tr>
-      </thead>
-      <tbody id="admin-operator-runs-rows"><tr><td colspan="8" class="muted">loading&hellip;</td></tr></tbody>
-    </table>
-    <h3 style="font-size:13px;margin:12px 0 4px;">Attention needed</h3>
-    <table>
-      <thead>
-        <tr><th>Kind</th><th>Id</th><th>Reasons</th><th>First CLI move</th></tr>
-      </thead>
-      <tbody id="admin-attention-rows"><tr><td colspan="4" class="muted">loading&hellip;</td></tr></tbody>
-    </table>
-    <h3 style="font-size:13px;margin:12px 0 4px;">PR repair cycles</h3>
-    <div class="muted" id="admin-pr-loop-summary" style="margin-bottom:6px;">loading&hellip;</div>
-    <table>
-      <thead>
-        <tr><th>PR</th><th>Cycle</th><th>Prompt path</th><th>Verdict path</th></tr>
-      </thead>
-      <tbody id="admin-pr-loop-rows"><tr><td colspan="4" class="muted">loading&hellip;</td></tr></tbody>
-    </table>
-    <h3 style="font-size:13px;margin:12px 0 4px;">Recommended CLI commands</h3>
-    <ul id="admin-recommended-commands" class="muted" style="margin:0;padding-left:18px;"></ul>
-  </section>
+  </details>
 
-  <section class="card" id="timeline-card">
-    <h2 style="margin-top:0;font-size:15px;">Run timeline <span class="muted" id="timeline-generated-at"></span></h2>
-    <div class="row" style="margin-bottom:8px;">
+  <details class="card">
+    <summary>Task explorer</summary>
+    <div class="filter-bar">
+      <label for="task-filter" class="muted">Show:</label>
+      <select id="task-filter">
+        <option value="attention" selected>Needs attention (default)</option>
+        <option value="in_flight">In flight</option>
+        <option value="blocked">Blocked</option>
+        <option value="all">All</option>
+      </select>
+      <span class="muted">Tasks <span id="task-count"></span></span>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Roadmap</th><th>Task</th><th>State</th><th>Attempt</th><th>Risk</th><th>Updated</th></tr>
+      </thead>
+      <tbody id="task-rows"><tr><td colspan="6" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+  </details>
+
+  <details class="card" id="timeline-card">
+    <summary>Run timeline</summary>
+    <div class="row" style="margin:8px 0;">
       <span class="pill" id="timeline-info-count">info: -</span>
       <span class="pill" id="timeline-warning-count">warning: -</span>
       <span class="pill" id="timeline-error-count">error: -</span>
+      <span class="muted" id="timeline-generated-at"></span>
     </div>
     <div class="row" style="margin-bottom:8px;">
       <span class="muted" id="timeline-latest-warning">latest warning: -</span>
@@ -3475,7 +3633,7 @@ INDEX_TEMPLATE = """<!doctype html>
       <span class="muted" id="timeline-latest-error">latest error: -</span>
     </div>
     <div class="row" style="margin-bottom:8px;">
-      <span class="muted" id="timeline-refresh-note">local read from the SQLite event log; no raw payloads are rendered.</span>
+      <span class="muted section-note" id="timeline-refresh-note">local read from the SQLite event log; no raw payloads are rendered.</span>
     </div>
     <table>
       <thead>
@@ -3484,34 +3642,36 @@ INDEX_TEMPLATE = """<!doctype html>
       <tbody id="timeline-rows"><tr><td colspan="8" class="muted">loading&hellip;</td></tr></tbody>
     </table>
     <div class="muted" id="timeline-empty" style="display:none;">No timeline events recorded yet.</div>
-  </section>
+  </details>
 
-  <section class="card" id="reliability-card">
-    <h2 style="margin-top:0;font-size:15px;">Executor reliability <span class="muted" id="reliability-generated-at"></span></h2>
-    <div class="row" style="margin-bottom:8px;">
+  <details class="card" id="reliability-card">
+    <summary>Executor reliability</summary>
+    <div class="row" style="margin:8px 0;">
       <span class="pill" id="reliability-result-retries">result retries: -</span>
       <span class="pill" id="reliability-result-blocks">result blocks: -</span>
       <span class="pill" id="reliability-stale-pid">stale pid: -</span>
       <span class="pill" id="reliability-needs-operator">needs operator: -</span>
       <span class="pill" id="reliability-session-metadata">same-session metadata: -</span>
+      <span class="muted" id="reliability-generated-at"></span>
     </div>
     <div class="row" style="margin-bottom:8px;">
-      <span class="muted" id="reliability-missing-template">missing/template: -</span>
+      <span class="muted section-note" id="reliability-missing-template">missing/template: -</span>
     </div>
     <div class="row" style="margin-bottom:8px;">
-      <span class="muted" id="reliability-latest-attention">latest attention: -</span>
+      <span class="muted section-note" id="reliability-latest-attention">latest attention: -</span>
     </div>
     <h3 style="font-size:13px;margin:8px 0 4px;">Suggested actions (text only)</h3>
     <ul id="reliability-actions" class="muted" style="margin:0;padding-left:18px;font-size:12px;"></ul>
     <div class="muted" id="reliability-empty" style="display:none;">No result-guard events recorded yet. The dashboard will populate after the first <code>agentops run</code>.</div>
-    <div class="muted" id="reliability-refresh-note" style="margin-top:6px;">Runner probes are CLI-only (agentops runner-probe). Suggested actions are text only and are never executed by the web UI.</div>
-  </section>
+    <div class="muted section-note" id="reliability-refresh-note" style="margin-top:6px;">Runner probes are CLI-only (agentops runner-probe). Suggested actions are text only and are never executed by the web UI.</div>
+  </details>
 
-  <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">Model usage <span class="muted" id="usage-generated-at"></span></h2>
-    <div class="row" style="margin-bottom:8px;">
+  <details class="card">
+    <summary>Model usage</summary>
+    <div class="row" style="margin:8px 0;">
       <span class="pill" id="usage-empty-pill">loading&hellip;</span>
       <span class="muted" id="usage-summary"></span>
+      <span class="muted" id="usage-generated-at"></span>
     </div>
     <h3 style="font-size:13px;margin:8px 0 4px;">Token totals</h3>
     <div class="row" id="usage-totals-cards" style="gap:12px;">
@@ -3543,94 +3703,71 @@ INDEX_TEMPLATE = """<!doctype html>
       <tbody id="usage-latest-rows"><tr><td colspan="10" class="muted">loading&hellip;</td></tr></tbody>
     </table>
     <ul id="usage-notes" class="muted" style="margin:8px 0 0;padding-left:18px;font-size:12px;"></ul>
-  </section>
+  </details>
 
-  <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">Roadmap</h2>
-    <div class="row">
-      <label for="roadmap-select" class="muted">Select:</label>
-      <select id="roadmap-select"></select>
-      <label for="roadmap-input" class="muted">or path:</label>
-      <input id="roadmap-input" type="text" placeholder="examples/roadmaps/demo-shell.json" size="42" />
-      <button id="plan-btn">Plan</button>
-      <button id="run-btn">Run with Codex review</button>
-      <label><input id="run-autonomous" type="checkbox" /> autonomous</label>
-      <label>reviewer: <select id="run-reviewer"><option value="codex" selected>codex</option><option value="heuristic">heuristic</option><option value="">(roadmap default)</option></select></label>
-      <label>max-tasks: <input id="run-max-tasks" type="number" min="1" placeholder="(none)" size="4" /></label>
-    </div>
-    <div id="plan-output" class="muted" style="margin-top:8px;"></div>
-  </section>
-
-  <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">Tasks <span class="muted" id="task-count"></span></h2>
+  <details class="card">
+    <summary>Admin / Operator panel</summary>
+    <h3 style="font-size:13px;margin:8px 0 4px;">Latest events</h3>
     <table>
       <thead>
-        <tr><th>Roadmap</th><th>Task</th><th>State</th><th>Attempt</th><th>Risk</th><th>Updated</th></tr>
+        <tr><th>#</th><th>Time</th><th>Type</th><th>Task</th><th>Roadmap</th><th>Summary</th></tr>
       </thead>
-      <tbody id="task-rows"><tr><td colspan="6" class="muted">loading&hellip;</td></tr></tbody>
+      <tbody id="admin-event-rows"><tr><td colspan="6" class="muted">loading&hellip;</td></tr></tbody>
     </table>
-  </section>
-
-  <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">Latest events</h2>
+    <h3 style="font-size:13px;margin:12px 0 4px;">Operator runs (5 most recent)</h3>
     <table>
       <thead>
-        <tr><th>#</th><th>Time</th><th>Type</th><th>Task</th><th>Roadmap</th></tr>
+        <tr><th>Run id</th><th>Status</th><th>Runtime</th><th>PID</th><th>Idle (s)</th><th>Log size</th><th>Failure</th><th>Suggested</th></tr>
       </thead>
-      <tbody id="event-rows"><tr><td colspan="5" class="muted">loading&hellip;</td></tr></tbody>
+      <tbody id="admin-operator-runs-rows"><tr><td colspan="8" class="muted">loading&hellip;</td></tr></tbody>
     </table>
-  </section>
+    <h3 style="font-size:13px;margin:12px 0 4px;">Attention needed</h3>
+    <table>
+      <thead>
+        <tr><th>Kind</th><th>Id</th><th>Reasons</th><th>First CLI move</th></tr>
+      </thead>
+      <tbody id="admin-attention-rows"><tr><td colspan="4" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:12px 0 4px;">PR repair cycles</h3>
+    <div class="muted" id="admin-pr-loop-summary" style="margin-bottom:6px;">loading&hellip;</div>
+    <table>
+      <thead>
+        <tr><th>PR</th><th>Cycle</th><th>Prompt path</th><th>Verdict path</th></tr>
+      </thead>
+      <tbody id="admin-pr-loop-rows"><tr><td colspan="4" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:12px 0 4px;">Recommended CLI commands</h3>
+    <ul id="admin-recommended-commands" class="muted" style="margin:0;padding-left:18px;"></ul>
+  </details>
 
-  <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">Active runs</h2>
-    <ul id="runs-list" class="muted"><li>none</li></ul>
-  </section>
-
-  <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">Operator runs (monitor)</h2>
+  <details class="card">
+    <summary>Operator runs (monitor)</summary>
     <table>
       <thead>
         <tr><th>Run id</th><th>Name</th><th>Status</th><th>Runtime</th><th>PID</th><th>Idle (s)</th><th>Log size</th><th>Failure</th><th>Result</th><th>Suggested</th><th>Action</th></tr>
       </thead>
       <tbody id="operator-runs-rows"><tr><td colspan="11" class="muted">loading&hellip;</td></tr></tbody>
     </table>
-    <div class="row" style="margin-top:8px;">
-      <label for="operator-run-select" class="muted">Process:</label>
-      <select id="operator-run-select"></select>
-      <label for="operator-run-input" class="muted">Run id:</label>
-      <input id="operator-run-input" type="text" placeholder="20260617T004015Z-..." size="42" />
-      <button class="secondary" id="operator-tail-btn">Tail (200 lines)</button>
-    </div>
-    <pre id="operator-tail-output" class="muted">click Tail to load the latest attempt log for the selected run id.</pre>
-    <div class="row" style="margin-top:8px;">
-      <label for="monitor-run-input" class="muted">Operator run id:</label>
-      <input id="monitor-run-input" type="text" placeholder="20260617T..." size="40" />
-      <button class="secondary" id="monitor-start-btn">Start live</button>
-      <button class="secondary" id="monitor-stop-btn">Stop</button>
-    </div>
-    <pre id="monitor-live-output">click Start live to stream.</pre>
-  </section>
+  </details>
 
-  <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">Task detail</h2>
-    <div class="row">
-      <label for="task-input" class="muted">Task id:</label>
-      <input id="task-input" type="text" placeholder="DEMO-SHELL-001" size="32" />
-      <button class="secondary" id="logs-btn">Load logs</button>
-      <button class="secondary" id="artifacts-btn">Load artifacts</button>
+  <details class="card">
+    <summary>Bundles</summary>
+    <div class="row" style="margin:8px 0;">
+      <input id="bundle-file" type="file" accept=".zip" />
+      <button id="bundle-upload-btn">Upload bundle</button>
+      <span id="bundle-upload-status" class="muted"></span>
     </div>
-    <pre id="detail-output">select a task and press a button.</pre>
-    <div class="row" style="margin-top:8px;">
-      <label for="monitor-task-roadmap" class="muted">Roadmap:</label>
-      <input id="monitor-task-roadmap" type="text" placeholder="roadmap_id" size="20" />
-      <button class="secondary" id="task-live-btn">Task live</button>
-      <button class="secondary" id="task-live-stop-btn">Stop</button>
-    </div>
-    <pre id="task-live-output">click Task live to stream the executor log.</pre>
-  </section>
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Version</th><th>Roadmap</th><th>Description</th><th>Action</th></tr>
+      </thead>
+      <tbody id="bundle-rows"><tr><td colspan="5" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <pre id="bundle-validate-output" class="muted">click Validate to check a bundle.</pre>
+  </details>
 
-  <section class="card">
-    <h2 style="margin-top:0;font-size:15px;">History</h2>
+  <details class="card">
+    <summary>History &amp; logs</summary>
     <table>
       <thead>
         <tr><th>Roadmap</th><th>Created</th><th>Verdict</th><th>Action</th></tr>
@@ -3657,7 +3794,20 @@ INDEX_TEMPLATE = """<!doctype html>
       <button class="secondary" id="log-view-btn">View log</button>
     </div>
     <pre id="log-view-output">choose a run, task, attempt and kind.</pre>
-  </section>
+  </details>
+
+  <details class="card">
+    <summary>Latest events &amp; active runs</summary>
+    <h3 style="font-size:13px;margin:8px 0 4px;">Latest events</h3>
+    <table>
+      <thead>
+        <tr><th>#</th><th>Time</th><th>Type</th><th>Task</th><th>Roadmap</th></tr>
+      </thead>
+      <tbody id="event-rows"><tr><td colspan="5" class="muted">loading&hellip;</td></tr></tbody>
+    </table>
+    <h3 style="font-size:13px;margin:12px 0 4px;">Active runs</h3>
+    <ul id="runs-list" class="muted"><li>none</li></ul>
+  </details>
 </main>
 
 <script>
@@ -3742,6 +3892,50 @@ INDEX_TEMPLATE = """<!doctype html>
   const logViewBtn = $("log-view-btn");
   const logViewOutput = $("log-view-output");
 
+  const cockpitRunning = $("cockpit-running");
+  const cockpitAttention = $("cockpit-attention");
+  const cockpitLatestError = $("cockpit-latest-error");
+  const overviewHealthValue = $("overview-health-value");
+  const overviewHealthSub = $("overview-health-sub");
+  const overviewRunningValue = $("overview-running-value");
+  const overviewRunningSub = $("overview-running-sub");
+  const overviewAttentionValue = $("overview-attention-value");
+  const overviewAttentionSub = $("overview-attention-sub");
+  const overviewLatestErrorValue = $("overview-latest-error-value");
+  const overviewNextActionText = $("overview-next-action-text");
+  const overviewNextActionCopy = $("overview-next-action-copy");
+  const workQueueEl = $("work-queue");
+  const workQueueEmpty = $("work-queue-empty");
+  const wqAttentionCount = $("wq-attention-count");
+  const wqRunningCount = $("wq-running-count");
+  const wqSettledCount = $("wq-settled-count");
+  const workQueueAttention = $("work-queue-attention");
+  const workQueueRunning = $("work-queue-running");
+  const workQueueSettled = $("work-queue-settled");
+  const detailTabRun = $("detail-tab-run");
+  const detailTabTask = $("detail-tab-task");
+  const detailHint = $("detail-hint");
+  const detailRunPane = $("detail-run-pane");
+  const detailTaskPane = $("detail-task-pane");
+  const selectedDetail = $("selected-detail");
+  const detailRunId = $("detail-run-id");
+  const detailRunMeta = $("detail-run-meta");
+  const detailRunSuggested = $("detail-run-suggested");
+  const detailTaskId = $("detail-task-id");
+  const detailTaskMeta = $("detail-task-meta");
+  const taskFilter = $("task-filter");
+  const taskInput = $("task-input");
+
+  const cockpit = {
+    runId: "",
+    taskId: "",
+    roadmapId: "",
+    pane: "run",
+    taskFilter: "attention",
+    lastAdmin: null,
+    attentionTaskIds: {},
+  };
+
   let autoTimer = null;
   let monitorES = null;
   let taskES = null;
@@ -3770,6 +3964,418 @@ INDEX_TEMPLATE = """<!doctype html>
     return { ok: res.ok, status: res.status, data: data };
   }
 
+  // ---- Operator cockpit helpers ---------------------------------------
+  // These read only from the already-fetched /api/admin payload (the
+  // timeline/usage/reliability summaries are embedded there), so the
+  // cockpit overview and work queue add no extra fetches and never
+  // execute a command. Copy buttons are text-only.
+
+  function legacyCopy(text) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  function copyText(text, btn) {
+    const value = String(text == null ? "" : text);
+    if (!value) return;
+    const done = function () {
+      if (!btn) return;
+      const orig = btn.getAttribute("data-orig-label") || btn.textContent;
+      btn.setAttribute("data-orig-label", orig);
+      btn.textContent = "Copied";
+      btn.classList.add("copied");
+      setTimeout(function () {
+        btn.textContent = orig;
+        btn.classList.remove("copied");
+      }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(value).then(done, function () { legacyCopy(value); done(); });
+    } else {
+      legacyCopy(value);
+      done();
+    }
+  }
+
+  function classifySeverity(item) {
+    const reasons = (item && item.reasons) || [];
+    const state = String(item && (item.state || item.primary_reason || item.canonical_status || item.runtime_status) || "").toLowerCase();
+    const cat = String((item && item.failure_category) || "").toLowerCase();
+    const text = reasons.join(" ") + " " + state + " " + cat;
+    if (/block|error|fail|missing|template|stale_pid|merge_failed|budget_exceeded|needs_operator|no_output/.test(text)) {
+      return "error";
+    }
+    if (/warn|retry|stale|await|review|exited/.test(text)) {
+      return "warn";
+    }
+    return "info";
+  }
+
+  function isRunInFlight(run) {
+    const rt = String((run && run.runtime_status) || "").toLowerCase();
+    const cs = String((run && (run.canonical_status || run.status)) || "").toLowerCase();
+    return rt === "running" || cs === "running" || rt.indexOf("running") >= 0;
+  }
+
+  function isRunTerminal(run) {
+    const rt = String((run && run.runtime_status) || "").toLowerCase();
+    const cs = String((run && (run.canonical_status || run.status)) || "").toLowerCase();
+    const term = /^(exited|completed|failed|succeeded|success|killed|stopped|crashed|dead)$/;
+    return term.test(rt) || term.test(cs);
+  }
+
+  function runTitle(run) {
+    const id = (run && run.run_id) ? run.run_id : "(unknown)";
+    const name = (run && run.name) ? run.name : "";
+    return name ? name + " | " + id : id;
+  }
+
+  function renderQueueItem(opts) {
+    const sev = opts.sev || "info";
+    const title = opts.title || "";
+    const reasons = opts.reasons || "";
+    const cli = opts.cli || "";
+    const selAttr = opts.selAttr || "";
+    let html = '<div class="queue-item sev-' + sev + '"' + (selAttr ? " " + selAttr : "") + ">";
+    html += '<div class="qi-main">';
+    html += '<div class="qi-title">' + escapeHtml(title) + "</div>";
+    if (reasons) html += '<div class="qi-reasons">' + escapeHtml(reasons) + "</div>";
+    html += "</div>";
+    if (cli) {
+      html += '<div class="qi-cli"><code>' + escapeHtml(cli) + "</code>";
+      html += ' <button type="button" class="secondary copy-btn" data-copy-text="' + escapeHtml(cli) + '">Copy</button></div>';
+    }
+    html += "</div>";
+    return html;
+  }
+
+  function attRelLabel(a) {
+    const id = a.run_id || a.task_id || "-";
+    const reason = (a.reasons && a.reasons[0]) || a.primary_reason || "needs attention";
+    return (a.kind === "operator_run" ? "run " : "item ") + id + " (" + reason + ")";
+  }
+
+  function attentionLabel(a) {
+    const id = a.kind === "operator_run" ? (a.run_id || "-") : ((a.task_id || "-") + " (" + (a.roadmap_id || "-") + ")");
+    const reason = (a.reasons && a.reasons[0]) || a.state || "needs attention";
+    return id + " (" + reason + ")";
+  }
+
+  function pickNextAction(admin) {
+    if (!admin) return null;
+    const rel = admin.reliability_summary || {};
+    const attRel = rel.latest_attention;
+    if (attRel && attRel.first_cli) {
+      return { cli: attRel.first_cli, label: attRelLabel(attRel) };
+    }
+    const attItems = (admin.attention_needed && admin.attention_needed.items) || [];
+    if (attItems.length && attItems[0].first_cli) {
+      return { cli: attItems[0].first_cli, label: attentionLabel(attItems[0]) };
+    }
+    return null;
+  }
+
+  function renderCockpitOverview(admin) {
+    if (!admin) return;
+    cockpit.lastAdmin = admin;
+    const timeline = admin.timeline_summary || {};
+    const reliability = admin.reliability_summary || {};
+    const attention = admin.attention_needed || {};
+    const opRuns = admin.operator_runs || {};
+    const sev = timeline.severity_counts || {};
+    const errCount = (sev.error || 0);
+    const attCount = attention.count || 0;
+    const relBlocks = reliability.result_guard_blocked || 0;
+    const relStale = reliability.stale_pid || 0;
+    const relNeeds = reliability.needs_operator || 0;
+    const attentionSignal = attCount + relBlocks + relStale + relNeeds;
+
+    if (overviewHealthValue) {
+      let dot = "ok", label = "ok";
+      if (attentionSignal > 0 || errCount > 0) { dot = "bad"; label = attCount + " attention"; }
+      else if ((reliability.result_guard_retry_queued || 0) > 0) { dot = "stale"; label = "retries"; }
+      overviewHealthValue.innerHTML = '<span class="status-dot ' + dot + '"></span> ' + escapeHtml(label);
+    }
+    if (overviewHealthSub) {
+      const dbp = (admin.diagnostics && admin.diagnostics.db_path) || "";
+      const segs = dbp.split("/");
+      const base = dbp ? (segs[segs.length - 1] || dbp) : "-";
+      overviewHealthSub.textContent = "db: " + base;
+    }
+
+    const items = opRuns.items || [];
+    let running = 0;
+    for (let i = 0; i < items.length; i++) { if (isRunInFlight(items[i])) running++; }
+    if (overviewRunningValue) overviewRunningValue.textContent = String(running);
+    if (overviewRunningSub) {
+      const total = (opRuns.count != null) ? opRuns.count : items.length;
+      overviewRunningSub.textContent = "of " + total + " operator runs";
+    }
+
+    if (overviewAttentionValue) overviewAttentionValue.textContent = String(attCount);
+    if (overviewAttentionSub) {
+      overviewAttentionSub.textContent = "blocks " + relBlocks + " / stale " + relStale + " / needs " + relNeeds;
+    }
+
+    if (overviewLatestErrorValue) {
+      const le = timeline.latest_error;
+      if (le) {
+        overviewLatestErrorValue.textContent = (le.type || "?") + (le.summary ? " - " + le.summary : "");
+      } else {
+        overviewLatestErrorValue.textContent = "none";
+      }
+    }
+
+    const next = pickNextAction(admin);
+    if (overviewNextActionText) {
+      overviewNextActionText.textContent = next ? next.label : "no action suggested";
+    }
+    if (overviewNextActionCopy) {
+      overviewNextActionCopy.innerHTML = next
+        ? '<code style="background:var(--subtle);padding:1px 5px;border-radius:4px;word-break:break-all;">' + escapeHtml(next.cli) + "</code>"
+        + ' <button type="button" class="secondary copy-btn" data-copy-text="' + escapeHtml(next.cli) + '">Copy</button>'
+        : "";
+    }
+
+    if (cockpitRunning) {
+      cockpitRunning.innerHTML = '<span class="status-dot ' + (running > 0 ? "ok" : "") + '"></span> running: ' + running;
+    }
+    if (cockpitAttention) {
+      const dot = attentionSignal > 0 ? "bad" : "ok";
+      cockpitAttention.innerHTML = '<span class="status-dot ' + dot + '"></span> attention: ' + attCount;
+    }
+    if (cockpitLatestError) {
+      cockpitLatestError.textContent = errCount > 0 ? "errors: " + errCount : "";
+    }
+  }
+
+  function renderWorkQueue(admin) {
+    if (!admin) return;
+    const attention = admin.attention_needed || {};
+    const opRuns = admin.operator_runs || {};
+    const attItems = attention.items || [];
+    const items = opRuns.items || [];
+
+    const attentionIds = {};
+    cockpit.attentionTaskIds = {};
+    for (let i = 0; i < attItems.length; i++) {
+      const a = attItems[i];
+      if (a.kind === "operator_run" && a.run_id) attentionIds[a.run_id] = true;
+      if (a.task_id) cockpit.attentionTaskIds[a.task_id] = true;
+    }
+
+    let attHtml = "";
+    for (let i = 0; i < attItems.length; i++) {
+      const a = attItems[i];
+      const sev = classifySeverity(a);
+      let title, reasons, cli, sel;
+      if (a.kind === "operator_run") {
+        title = "run " + (a.run_id || "-");
+        reasons = ((a.reasons || []).join(", ")) || (a.primary_reason || "");
+        cli = a.first_cli || "";
+        sel = 'data-sel-run="' + escapeHtml(a.run_id || "") + '"';
+      } else {
+        title = "task " + (a.task_id || "-") + " (" + (a.roadmap_id || "-") + ")";
+        reasons = ((a.reasons || []).join(", ")) || (a.state || "");
+        cli = a.first_cli || "";
+        sel = 'data-sel-task="' + escapeHtml(a.task_id || "") + '" data-sel-roadmap="' + escapeHtml(a.roadmap_id || "") + '"';
+      }
+      attHtml += renderQueueItem({ sev: sev, title: title, reasons: reasons, cli: cli, selAttr: sel });
+    }
+    if (workQueueAttention) {
+      workQueueAttention.innerHTML = attHtml
+        || '<div class="muted" style="font-size:12px;padding:4px 0;">nothing flagged</div>';
+    }
+    if (wqAttentionCount) wqAttentionCount.textContent = "(" + attItems.length + ")";
+
+    let runHtml = "";
+    let runCount = 0;
+    for (let i = 0; i < items.length; i++) {
+      const r = items[i];
+      if (!isRunInFlight(r)) continue;
+      if (r.run_id && attentionIds[r.run_id]) continue;
+      runCount++;
+      const reasons = "status: " + (r.runtime_status || r.canonical_status || r.status || "-")
+        + (r.idle_for_seconds != null ? " | idle " + Math.round(Number(r.idle_for_seconds)) + "s" : "");
+      runHtml += renderQueueItem({
+        sev: "warn",
+        title: runTitle(r),
+        reasons: reasons,
+        cli: r.suggested_action || "",
+        selAttr: 'data-sel-run="' + escapeHtml(r.run_id || "") + '"',
+      });
+    }
+    if (workQueueRunning) {
+      workQueueRunning.innerHTML = runHtml
+        || '<div class="muted" style="font-size:12px;padding:4px 0;">no runs in flight</div>';
+    }
+    if (wqRunningCount) wqRunningCount.textContent = "(" + runCount + ")";
+
+    let setHtml = "";
+    let setCount = 0;
+    for (let i = 0; i < items.length; i++) {
+      const r = items[i];
+      if (!isRunTerminal(r) || isRunInFlight(r)) continue;
+      if (r.run_id && attentionIds[r.run_id]) continue;
+      if (setCount >= 8) break;
+      setCount++;
+      const blob = String(r.failure_category || "") + " " + String(r.canonical_status || "");
+      const sev = /fail|error|block/.test(blob) ? "error" : "info";
+      setHtml += renderQueueItem({
+        sev: sev,
+        title: runTitle(r),
+        reasons: (r.failure_category || r.canonical_status || r.status || "settled"),
+        cli: r.suggested_action || "",
+        selAttr: 'data-sel-run="' + escapeHtml(r.run_id || "") + '"',
+      });
+    }
+    if (workQueueSettled) {
+      workQueueSettled.innerHTML = setHtml
+        || '<div class="muted" style="font-size:12px;padding:4px 0;">no recently settled runs</div>';
+    }
+    if (wqSettledCount) wqSettledCount.textContent = "(" + setCount + ")";
+
+    if (workQueueEmpty) {
+      workQueueEmpty.style.display = (attItems.length === 0 && runCount === 0 && setCount === 0) ? "block" : "none";
+    }
+    applyTaskFilter();
+  }
+
+  function findRunInAdmin(runId) {
+    if (!runId || !cockpit.lastAdmin) return null;
+    const items = (cockpit.lastAdmin.operator_runs && cockpit.lastAdmin.operator_runs.items) || [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].run_id === runId) return items[i];
+    }
+    const att = (cockpit.lastAdmin.attention_needed && cockpit.lastAdmin.attention_needed.items) || [];
+    for (let i = 0; i < att.length; i++) {
+      if (att[i].run_id === runId) return att[i];
+    }
+    return null;
+  }
+
+  function findAttentionTask(taskId) {
+    if (!taskId || !cockpit.lastAdmin) return null;
+    const att = (cockpit.lastAdmin.attention_needed && cockpit.lastAdmin.attention_needed.items) || [];
+    for (let i = 0; i < att.length; i++) {
+      if (att[i].task_id === taskId) return att[i];
+    }
+    return null;
+  }
+
+  function renderSelectedDetail() {
+    if (cockpit.pane === "task") {
+      if (detailTaskId) detailTaskId.textContent = cockpit.taskId || "(none)";
+      if (detailTaskMeta) {
+        const a = findAttentionTask(cockpit.taskId);
+        const bits = [];
+        if (a) {
+          if (a.state) bits.push("state: " + a.state);
+          if (a.roadmap_id) bits.push("roadmap: " + a.roadmap_id);
+          if (a.reasons && a.reasons.length) bits.push(a.reasons.join(", "));
+        } else if (cockpit.taskId) {
+          bits.push("no attention row for this task");
+        }
+        detailTaskMeta.textContent = bits.join(" | ");
+      }
+      if (detailHint) detailHint.textContent = cockpit.taskId ? "task selected" : "pick a row from the work queue";
+    } else {
+      if (detailRunId) detailRunId.textContent = cockpit.runId || "(none)";
+      const r = findRunInAdmin(cockpit.runId);
+      if (detailRunMeta) {
+        const bits = [];
+        if (r) {
+          if (r.name) bits.push("name: " + r.name);
+          bits.push("status: " + (r.canonical_status || r.status || "-"));
+          if (r.runtime_status && r.runtime_status !== (r.canonical_status || r.status)) bits.push("runtime: " + r.runtime_status);
+          if (r.failure_category) bits.push("failure: " + r.failure_category);
+          if (r.pid != null) bits.push("pid: " + r.pid);
+        } else if (cockpit.runId) {
+          bits.push("not found in latest snapshot");
+        }
+        detailRunMeta.textContent = bits.join(" | ");
+      }
+      if (detailRunSuggested) {
+        const cli = (r && (r.suggested_action || r.first_cli)) || "";
+        detailRunSuggested.textContent = cli || "(none)";
+      }
+      if (detailHint) detailHint.textContent = cockpit.runId ? "run selected" : "pick a row from the work queue";
+    }
+  }
+
+  function switchPane(name) {
+    cockpit.pane = name;
+    if (detailRunPane) detailRunPane.style.display = (name === "run") ? "" : "none";
+    if (detailTaskPane) detailTaskPane.style.display = (name === "task") ? "" : "none";
+    if (detailTabRun) detailTabRun.classList.toggle("tab-active", name === "run");
+    if (detailTabTask) detailTabTask.classList.toggle("tab-active", name === "task");
+  }
+
+  function selectRun(runId) {
+    cockpit.runId = runId || "";
+    if (runId) {
+      if (operatorRunInput && document.activeElement !== operatorRunInput) operatorRunInput.value = runId;
+      if (monitorRunInput && document.activeElement !== monitorRunInput) monitorRunInput.value = runId;
+      if (operatorRunSelect) {
+        let found = false;
+        for (let i = 0; i < operatorRunSelect.options.length; i++) {
+          if (operatorRunSelect.options[i].value === runId) { operatorRunSelect.selectedIndex = i; found = true; break; }
+        }
+        if (!found) operatorRunSelect.value = runId;
+      }
+    }
+    switchPane("run");
+    renderSelectedDetail();
+    if (selectedDetail && selectedDetail.scrollIntoView) selectedDetail.scrollIntoView({ block: "nearest" });
+  }
+
+  function selectTask(taskId, roadmapId) {
+    cockpit.taskId = taskId || "";
+    cockpit.roadmapId = roadmapId || "";
+    if (taskId && taskInput && document.activeElement !== taskInput) taskInput.value = taskId;
+    if (roadmapId && monitorTaskRoadmap && document.activeElement !== monitorTaskRoadmap) monitorTaskRoadmap.value = roadmapId;
+    switchPane("task");
+    renderSelectedDetail();
+    if (selectedDetail && selectedDetail.scrollIntoView) selectedDetail.scrollIntoView({ block: "nearest" });
+  }
+
+  function applyTaskFilter() {
+    if (!taskRows) return;
+    const mode = cockpit.taskFilter || "all";
+    const rows = taskRows.querySelectorAll("tr[data-sel-task]");
+    let visible = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const tr = rows[i];
+      const state = String(tr.getAttribute("data-state") || "").toLowerCase();
+      const taskId = tr.getAttribute("data-sel-task") || "";
+      let show = false;
+      if (mode === "all") show = true;
+      else if (mode === "attention") show = !!cockpit.attentionTaskIds[taskId];
+      else if (mode === "blocked") show = state.indexOf("block") >= 0;
+      else if (mode === "in_flight") show = /run|progress|review|repair|ready|wait/.test(state);
+      tr.style.display = show ? "" : "none";
+      if (show) visible++;
+    }
+    const existing = taskRows.querySelector("tr.task-filter-empty");
+    if (visible === 0 && rows.length > 0) {
+      if (!existing) {
+        const e = document.createElement("tr");
+        e.className = "task-filter-empty";
+        e.innerHTML = '<td colspan="6" class="muted">no tasks match this filter</td>';
+        taskRows.appendChild(e);
+      }
+    } else if (existing && existing.parentNode) {
+      existing.parentNode.removeChild(existing);
+    }
+  }
+
   function renderTasks(tasks) {
     if (!tasks || !tasks.length) {
       taskRows.innerHTML = '<tr><td colspan="6" class="muted">no tasks recorded yet</td></tr>';
@@ -3778,7 +4384,10 @@ INDEX_TEMPLATE = """<!doctype html>
     }
     taskCount.textContent = "(" + tasks.length + ")";
     taskRows.innerHTML = tasks.map(function (t) {
-      return "<tr>"
+      const state = String(t.state || "").toLowerCase();
+      return '<tr class="row-clickable" data-state="' + escapeHtml(state)
+        + '" data-risk="' + escapeHtml(t.risk || "") + '" data-sel-task="'
+        + escapeHtml(t.id || "") + '" data-sel-roadmap="' + escapeHtml(t.roadmap_id || "") + '">'
         + "<td>" + escapeHtml(t.roadmap_id) + "</td>"
         + "<td>" + escapeHtml(t.id) + "</td>"
         + '<td><span class="pill">' + escapeHtml(t.state) + "</span></td>"
@@ -3787,6 +4396,7 @@ INDEX_TEMPLATE = """<!doctype html>
         + "<td>" + escapeHtml(t.updated_at) + "</td>"
         + "</tr>";
     }).join("");
+    applyTaskFilter();
   }
 
   function renderEvents(events) {
@@ -4192,6 +4802,13 @@ async function tailOperatorRun() {
         return "<li><code>" + escapeHtml(c) + "</code></li>";
       }).join("");
     }
+
+    // Operator cockpit overview + work queue + selected detail, all
+    // derived from this same /api/admin payload (timeline, usage and
+    // reliability summaries are already embedded).
+    renderCockpitOverview(data);
+    renderWorkQueue(data);
+    renderSelectedDetail();
   }
 
   // ---- Model usage ledger (T9) ---------------------------------------
@@ -4648,6 +5265,58 @@ async function tailOperatorRun() {
   }
 
   if (bundleUploadBtn) bundleUploadBtn.addEventListener("click", uploadBundle);
+
+  // ---- Operator cockpit event wiring (delegation; no per-row listeners) ----
+  document.addEventListener("click", function (e) {
+    const btn = e.target.closest && e.target.closest(".copy-btn");
+    if (!btn) return;
+    let text = btn.getAttribute("data-copy-text");
+    if (text == null) {
+      const tgt = btn.getAttribute("data-copy-target");
+      if (tgt) { const el = document.getElementById(tgt); if (el) text = el.textContent || el.value || ""; }
+    }
+    e.preventDefault();
+    copyText(text, btn);
+  });
+
+  if (workQueueEl) {
+    workQueueEl.addEventListener("click", function (e) {
+      if (e.target.closest && e.target.closest(".copy-btn")) return;
+      const runEl = e.target.closest && e.target.closest("[data-sel-run]");
+      if (runEl && runEl.getAttribute("data-sel-run")) {
+        selectRun(runEl.getAttribute("data-sel-run"));
+        return;
+      }
+      const taskEl = e.target.closest && e.target.closest("[data-sel-task]");
+      if (taskEl && taskEl.getAttribute("data-sel-task")) {
+        selectTask(taskEl.getAttribute("data-sel-task"), taskEl.getAttribute("data-sel-roadmap") || "");
+      }
+    });
+  }
+
+  if (taskRows) {
+    taskRows.addEventListener("click", function (e) {
+      if (e.target.closest && e.target.closest(".copy-btn")) return;
+      const tr = e.target.closest && e.target.closest("tr[data-sel-task]");
+      if (!tr) return;
+      const tid = tr.getAttribute("data-sel-task");
+      if (tid) selectTask(tid, tr.getAttribute("data-sel-roadmap") || "");
+    });
+  }
+
+  if (detailTabRun) detailTabRun.addEventListener("click", function () { switchPane("run"); renderSelectedDetail(); });
+  if (detailTabTask) detailTabTask.addEventListener("click", function () { switchPane("task"); renderSelectedDetail(); });
+
+  if (taskFilter) {
+    taskFilter.addEventListener("change", function () {
+      cockpit.taskFilter = taskFilter.value || "all";
+      applyTaskFilter();
+    });
+  }
+
+  switchPane("run");
+  renderSelectedDetail();
+  applyTaskFilter();
 
   loadBundles();
   loadHistory();
