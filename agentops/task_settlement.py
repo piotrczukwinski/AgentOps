@@ -371,40 +371,51 @@ def _collect_settlement_skipped_dependents(
             continue
         try:
             with state.connect() as conn:
-                # The orchestrator emits ``task.skipped`` (with the
-                # reason) and then ``task.skipped_dependency`` (with
-                # only ``task_id``). Match on either event type and
-                # inspect the union of recent payload reason fields.
-                rows = conn.execute(
+                # The orchestrator emits a ``task.skipped`` event
+                # (with reason) and then a ``task.skipped_dependency``
+                # event (with only ``task_id``) in adjacent seq order.
+                # The "current effective skip reason" is the reason
+                # in the most recent ``task.skipped`` event. A later
+                # manual re-skip overwrites that reason and we must
+                # honour it instead of any stale dependency reason.
+                latest_skip = conn.execute(
                     """
                     SELECT type, payload_json FROM events
-                    WHERE roadmap_id=? AND task_id=?
-                      AND type IN ('task.skipped', 'task.skipped_dependency')
-                    ORDER BY seq DESC LIMIT 5
+                    WHERE roadmap_id=? AND task_id=? AND type='task.skipped'
+                    ORDER BY seq DESC LIMIT 1
                     """,
                     (roadmap_id, tid),
-                ).fetchall()
+                ).fetchone()
+                latest_dep_event = conn.execute(
+                    """
+                    SELECT type FROM events
+                    WHERE roadmap_id=? AND task_id=? AND type='task.skipped_dependency'
+                    ORDER BY seq DESC LIMIT 1
+                    """,
+                    (roadmap_id, tid),
+                ).fetchone()
         except Exception:
-            rows = []
-        if not rows:
+            latest_skip = None
+            latest_dep_event = None
+        if latest_skip is None:
             continue
-        dependency_skip = False
-        for row in rows:
-            try:
-                payload = (
-                    json.loads(row["payload_json"])
-                    if row["payload_json"]
-                    else {}
-                )
-            except (TypeError, ValueError):
-                payload = {}
-            if not isinstance(payload, dict):
-                continue
-            if _is_dependency_skip_reason(payload):
-                dependency_skip = True
-                break
-        if not dependency_skip:
+        try:
+            payload = (
+                json.loads(latest_skip["payload_json"])
+                if latest_skip["payload_json"]
+                else {}
+            )
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
             continue
+        # Accept if the latest ``task.skipped`` carries a dependency
+        # reason. When the orchestrator produced the skip, the
+        # adjacent ``task.skipped_dependency`` is informational only
+        # and does not change the reason.
+        if not _is_dependency_skip_reason(payload):
+            continue
+        _ = latest_dep_event  # documented: adjacent event pair
         out.append(tid)
     return out
 

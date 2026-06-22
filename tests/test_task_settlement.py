@@ -136,12 +136,20 @@ def _seed_task(
 
 
 def _seed_dependency_skip(state: StateStore, *, roadmap_id: str, task_id: str) -> None:
+    """Mimic the orchestrator: emit ``task.skipped`` with reason and then ``task.skipped_dependency``."""
+    state.event(
+        roadmap_id,
+        task_id,
+        None,
+        "task.skipped",
+        {"reason": "dependencies_not_satisfied"},
+    )
     state.event(
         roadmap_id,
         task_id,
         None,
         "task.skipped_dependency",
-        {"task_id": task_id, "reason": "dependencies_not_satisfied"},
+        {"task_id": task_id},
     )
 
 
@@ -502,6 +510,57 @@ class TaskSettlementApplyTests(unittest.TestCase):
             row = conn.execute(
                 "SELECT state FROM tasks WHERE roadmap_id=? AND id=?",
                 (self.roadmap_id, "T3"),
+            ).fetchone()
+        self.assertEqual(str(row["state"]), "skipped")
+
+    def test_include_dependents_honours_later_manual_skip(self) -> None:
+        """A dependent that was dependency-skipped earlier and then manually
+
+        re-skipped must NOT be reopened, because the latest ``task.skipped``
+        reason is no longer dependency-related.
+        """
+        _seed_task(
+            self.state,
+            roadmap_id=self.roadmap_id,
+            task_id="T1",
+            current_state="merge_failed",
+        )
+        _seed_task(
+            self.state,
+            roadmap_id=self.roadmap_id,
+            task_id="T2",
+            current_state="skipped",
+            depends_on_json=json.dumps(["T1"]),
+        )
+        _seed_dependency_skip(self.state, roadmap_id=self.roadmap_id, task_id="T2")
+        # Later manual skip that overrides the dependency reason.
+        self.state.event(
+            self.roadmap_id,
+            "T2",
+            None,
+            "task.skipped",
+            {"reason": "operator out-of-scope override"},
+        )
+
+        decision = evaluate_task_settle(
+            current_state="merge_failed",
+            target_state="merged",
+            reason="external merge confirmed",
+            external_commit="abcdef",
+            include_dependents=True,
+        )
+        result = apply_task_settle(
+            self.state,
+            roadmap_id=self.roadmap_id,
+            task_id="T1",
+            decision=decision,
+        )
+        self.assertNotIn("T2", result.dependent_ids)
+
+        with self.state.connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM tasks WHERE roadmap_id=? AND id=?",
+                (self.roadmap_id, "T2"),
             ).fetchone()
         self.assertEqual(str(row["state"]), "skipped")
 
