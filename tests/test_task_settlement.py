@@ -539,6 +539,77 @@ class TaskSettlementApplyTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(str(row["state"]), "accepted")
 
+    def test_validation_failed_can_settle_to_merged(self) -> None:
+        self._seed_default("validation_failed")
+        decision = evaluate_task_settle(
+            current_state="validation_failed",
+            target_state="merged",
+            reason="external merge confirmed",
+            external_commit="abcdef",
+        )
+        self.assertTrue(decision.allowed)
+        result = apply_task_settle(
+            self.state,
+            roadmap_id=self.roadmap_id,
+            task_id=self.task_id,
+            decision=decision,
+        )
+        with self.state.connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM tasks WHERE roadmap_id=? AND id=?",
+                (self.roadmap_id, self.task_id),
+            ).fetchone()
+        self.assertEqual(str(row["state"]), "merged")
+        self.assertEqual(result.new_state, "merged")
+
+    def test_include_dependents_handles_orchestrator_skip_event_shape(self) -> None:
+        """The orchestrator emits ``task.skipped`` then ``task.skipped_dependency``;
+
+        the latter carries only ``task_id`` (no reason). The helper
+        must still reopen the dependent.
+        """
+        _seed_task(
+            self.state,
+            roadmap_id=self.roadmap_id,
+            task_id="T1",
+            current_state="merge_failed",
+        )
+        _seed_task(
+            self.state,
+            roadmap_id=self.roadmap_id,
+            task_id="T2",
+            current_state="skipped",
+            depends_on_json=json.dumps(["T1"]),
+        )
+        self.state.event(
+            self.roadmap_id,
+            "T2",
+            None,
+            "task.skipped",
+            {"reason": "dependencies_not_satisfied"},
+        )
+        self.state.event(
+            self.roadmap_id,
+            "T2",
+            None,
+            "task.skipped_dependency",
+            {"task_id": "T2"},
+        )
+        decision = evaluate_task_settle(
+            current_state="merge_failed",
+            target_state="merged",
+            reason="external merge confirmed",
+            external_commit="abcdef",
+            include_dependents=True,
+        )
+        result = apply_task_settle(
+            self.state,
+            roadmap_id=self.roadmap_id,
+            task_id="T1",
+            decision=decision,
+        )
+        self.assertIn("T2", result.dependent_ids)
+
     def test_apply_preserves_attempts(self) -> None:
         self._seed_default("merge_failed")
         with self.state.connect() as conn:

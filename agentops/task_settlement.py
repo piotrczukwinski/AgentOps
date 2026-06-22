@@ -75,6 +75,8 @@ FORCE_REQUIRED_STATES: frozenset[str] = frozenset(
 )
 
 #: In-flight states that must always be refused, even with ``--force``.
+#: ``VALIDATION_FAILED`` is intentionally excluded because it is a
+#: terminal failure state in :data:`DEFAULT_OPENABLE_STATES`.
 IN_FLIGHT_STATES: frozenset[str] = frozenset(
     {
         TaskState.PLANNED.value,
@@ -369,29 +371,39 @@ def _collect_settlement_skipped_dependents(
             continue
         try:
             with state.connect() as conn:
-                skip_event = conn.execute(
+                # The orchestrator emits ``task.skipped`` (with the
+                # reason) and then ``task.skipped_dependency`` (with
+                # only ``task_id``). Match on either event type and
+                # inspect the union of recent payload reason fields.
+                rows = conn.execute(
                     """
-                    SELECT payload_json FROM events
-                    WHERE roadmap_id=? AND task_id=? AND type LIKE 'task.skipped%'
-                    ORDER BY seq DESC LIMIT 1
+                    SELECT type, payload_json FROM events
+                    WHERE roadmap_id=? AND task_id=?
+                      AND type IN ('task.skipped', 'task.skipped_dependency')
+                    ORDER BY seq DESC LIMIT 5
                     """,
                     (roadmap_id, tid),
-                ).fetchone()
+                ).fetchall()
         except Exception:
-            skip_event = None
-        if skip_event is None:
+            rows = []
+        if not rows:
             continue
-        try:
-            payload = (
-                json.loads(skip_event["payload_json"])
-                if skip_event["payload_json"]
-                else {}
-            )
-        except (TypeError, ValueError):
-            payload = {}
-        if not isinstance(payload, dict):
-            continue
-        if not _is_dependency_skip_reason(payload):
+        dependency_skip = False
+        for row in rows:
+            try:
+                payload = (
+                    json.loads(row["payload_json"])
+                    if row["payload_json"]
+                    else {}
+                )
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                continue
+            if _is_dependency_skip_reason(payload):
+                dependency_skip = True
+                break
+        if not dependency_skip:
             continue
         out.append(tid)
     return out
