@@ -153,3 +153,43 @@ guaranteed savings percentage. The roadmap-specific estimate in
 [`evidence/codex-roadmap-reduction-estimate.md`](evidence/codex-roadmap-reduction-estimate.md)
 is recorded as one Codex reviewer estimate and should be turned
 into a reproducible benchmark before it is treated as a metric.
+
+## Cache-aware interpretation
+
+When reasoning about cost, treat token counts and dollar cost
+as different signals that only loosely correlate.
+
+* **Cached input tokens are cheaper than fresh input tokens.**
+  When a provider exposes a cached-input price (typically a small
+  fraction of the fresh-input price), a workflow that re-reads
+  the same prompt / context across many executor calls will see
+  a much smaller marginal cost than the headline input-token
+  total suggests. The local ledger (`agentops usage --json`)
+  records ``cached_tokens`` when the provider exposes it; missing
+  values render as ``unknown`` rather than zero.
+* **Output tokens can dominate cost.** Even with cached input,
+  output tokens are billed at the full rate. A workflow that
+  produces a lot of long output (large patches, verbose logs)
+  is dominated by output cost, not input cost.
+* **Bounded review can out-perform raw token-count savings.**
+  A bounded-review architecture can show much higher cost savings
+  than raw token-count savings when the avoided executor output
+  would have been produced by the expensive model. The token
+  saved is *expensive* tokens, not just *any* tokens.
+* **Payload-size estimates are lower-confidence.** A header-only
+  metric (bytes, line count, structural size) is a coarse proxy
+  for tokens; useful as a sanity check, not as a cost claim.
+* **Real claims should come from `agentops usage --json`.**
+  When the provider exposes usage, the local ledger is the
+  authoritative source for what was actually billed. The
+  dashboard's Model usage card and the ``/api/usage`` endpoint
+  render the same shape; see
+  [`docs/usage-ledger.md`](usage-ledger.md) for the contract and
+  the explicit safety properties (no ``0`` coercion, no price
+  estimate invented locally).
+
+In short: headline token savings and headline cost savings are
+not the same claim. Treat the cost-model estimate in this
+document as a directional intuition; ground any concrete
+percentage in the local ledger once enough provider-side usage
+is exposed.

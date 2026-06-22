@@ -209,6 +209,105 @@ def _failure_category_for_verdict(verdict: ReviewVerdict) -> str:
     return "review_unavailable"
 
 
+# Allow-listed subset of executor result status values the orchestrator
+# will accept as a real completion. The values are intentionally narrow:
+# an executor that prints an arbitrary status string (e.g. "maybe_done")
+# is treated as a template_result placeholder and triggers the retry
+# path. The full list mirrors the canonical values in the
+# ``AGENTOPS_RESULT_JSON`` contract prompt.
+_ALLOWED_EXECUTOR_RESULT_STATUSES = frozenset({"done", "blocked"})
+
+
+def _result_guard_repair_prompt(
+    *,
+    task: TaskConfig,
+    classification: str,
+    failure_category: str,
+    attempt_no: int,
+    max_attempts: int,
+) -> str:
+    """Build the repair prompt when the result guard sees missing/template.
+
+    The prompt is deterministic, includes the task id / kind / allowed
+    files / validations / remaining budget, and never embeds raw prior
+    logs, secrets, env vars, or paths beyond the task's own
+    ``allowed_files``. It tells the executor exactly what to do on the
+    retry: produce a real ``AGENTOPS_RESULT_JSON`` with
+    ``status="done"`` after a real file change, or
+    ``status="blocked"`` with a concrete reason; never emit a
+    placeholder marker; never claim success without file changes.
+
+    The helper is module-level and pure so the same prompt can be
+    surfaced in tests and dry-run debugging without launching a
+    subprocess.
+    """
+    remaining = max(0, max_attempts - attempt_no)
+    allowed = list(task.allowed_files) if task.allowed_files else []
+    validations = list(task.validations) if task.validations else []
+    prompt_lines: list[str] = []
+    prompt_lines.append("--- AgentOps result-guard retry ---")
+    prompt_lines.append(
+        f"Task id: {task.id} (kind={task.kind or 'implementation'})."
+    )
+    prompt_lines.append(
+        "The previous attempt exited successfully but did NOT emit a "
+        "real AGENTOPS_RESULT_JSON result. Classification: "
+        f"{classification!r} (failure_category={failure_category!r})."
+    )
+    prompt_lines.append(
+        f"This is retry {attempt_no} of {max_attempts}; "
+        f"{remaining} attempt(s) remain before the task is BLOCKED."
+    )
+    prompt_lines.append("")
+    prompt_lines.append("On this attempt you MUST do one of:")
+    prompt_lines.append(
+        "1. modify at least one allowed file below so the diff is real, "
+        "and then emit a real AGENTOPS_RESULT_JSON with "
+        "status=\"done\" and a concrete summary of what changed; OR"
+    )
+    prompt_lines.append(
+        "2. emit a real AGENTOPS_RESULT_JSON with status=\"blocked\" "
+        "and a concrete reason (do not retry; the operator will pick "
+        "this up)."
+    )
+    prompt_lines.append("")
+    prompt_lines.append("HARD rules:")
+    prompt_lines.append(
+        "- Do NOT output a placeholder marker like "
+        '"done-or-blocked" or any other pipe-separated template value; '
+        'pick exactly one of "done" or "blocked".'
+    )
+    prompt_lines.append(
+        "- Do NOT emit the marker wrapped in shell syntax "
+        "(no $ prefix, no echo, no heredoc, no markdown backticks)."
+    )
+    prompt_lines.append(
+        "- Do NOT claim success without actually modifying at least "
+        "one allowed file."
+    )
+    if allowed:
+        prompt_lines.append("")
+        prompt_lines.append("Allowed files (touch at least one if status=\"done\"):")
+        for entry in allowed:
+            prompt_lines.append(f"- {entry}")
+    if validations:
+        prompt_lines.append("")
+        prompt_lines.append("Validations (must pass if status=\"done\"):")
+        for entry in validations:
+            prompt_lines.append(f"- {entry}")
+    prompt_lines.append("")
+    prompt_lines.append(
+        "Required result shape (one marker, one JSON object on its own "
+        "line, no wrapping):"
+    )
+    prompt_lines.append("AGENTOPS_RESULT_JSON: {\"status\": \"done\", \"summary\": \"what changed\"}")
+    prompt_lines.append("")
+    prompt_lines.append(
+        "Allowed status values: \"done\" or \"blocked\" only."
+    )
+    return "\n".join(prompt_lines) + "\n"
+
+
 @dataclass(frozen=True)
 class RunOptions:
     no_codex: bool = False
@@ -956,12 +1055,25 @@ class Orchestrator:
             # so a
             # silent exit 0 with no AGENTOPS_RESULT_JSON marker is
             # never accepted as a real completion. Shell executors
-            # are exempt because their result is the exit code, not
-            # a marker — shell tasks are validated by their
-            # ``validations`` block alone. Tasks of other kinds
-            # (docs / review / test / audit) keep the opt-in behaviour.
-            # An implementation task that genuinely wants to opt out
-            # can set ``require_executor_result: false`` explicitly.
+            # are exempt from the B5 *default* because their result
+            # is the exit code, not a marker — shell tasks are
+            # validated by their ``validations`` block alone. Tasks
+            # of other kinds (docs / review / test / audit) keep the
+            # opt-in behaviour. An implementation task that genuinely
+            # wants to opt out can set ``require_executor_result: false``
+            # explicitly.
+            #
+            # Executor-reliability v0.2: shell executors still
+            # participate in the result guard when the task *explicitly*
+            # opts in via ``require_executor_result: true`` (the existing
+            # ``test_missing_result_blocks_when_required`` contract
+            # relies on this), but the *retry* path is skipped for
+            # shell. Shell tasks report success via exit code, so a
+            # bounded retry-with-marker would not help — the
+            # ``executor_command`` either ran or it did not. The
+            # terminal BLOCK is therefore the correct behaviour for
+            # shell tasks when the marker is missing and the budget
+            # is exhausted, and we keep it.
             _result_guard_enabled = bool(task.require_executor_result)
             if (
                 task.require_executor_result is None
@@ -989,6 +1101,77 @@ class Orchestrator:
                 elif _cls == "template":
                     _category = TEMPLATE_RESULT_CATEGORY
                 if _category is not None:
+                    # Shell executors do not get the retry path: their
+                    # result is the exit code, not a marker, so a
+                    # marker-driven retry would not help. Fall through
+                    # to the terminal BLOCK path which still applies
+                    # for explicit ``require_executor_result: true``
+                    # shell tasks.
+                    _shell_executor = task.executor == "shell"
+                    if attempt_no < max_attempts and not _shell_executor:
+                        # Retry budget remains: write a bounded repair
+                        # prompt and queue the next attempt. The retry
+                        # is bounded by ``max_attempts``; the attempt
+                        # loop will refuse to run past it.
+                        runtime.repair_prompt = _result_guard_repair_prompt(
+                            task=task,
+                            classification=_cls,
+                            failure_category=_category,
+                            attempt_no=attempt_no,
+                            max_attempts=max_attempts,
+                        )
+                        repair_path = artifact_store.write_text(
+                            attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                        )
+                        self.state.record_artifact(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "repair_prompt",
+                            repair_path,
+                            artifact_store.sha256(repair_path),
+                        )
+                        self.state.event(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "task.result_guard_retry_queued",
+                            {
+                                "failure_category": _category,
+                                "classification": _cls,
+                                "exit_code": result.exit_code,
+                                "after_attempt": attempt_no,
+                                "next_attempt": attempt_no + 1,
+                                "reason": (
+                                    "executor exited without a real "
+                                    "AGENTOPS_RESULT_JSON result"
+                                ),
+                            },
+                        )
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            task.id,
+                            TaskState.REPAIR_PROMPT_READY,
+                            {
+                                "reason": _category,
+                                "failure_category": _category,
+                                "classification": _cls,
+                                "attempt": attempt_no,
+                                "next_attempt": attempt_no + 1,
+                            },
+                        )
+                        self._record_roadmap_event(
+                            roadmap,
+                            "task.result_guard_retry_queued",
+                            task.id,
+                            extra={
+                                "failure_category": _category,
+                                "classification": _cls,
+                                "after_attempt": attempt_no,
+                                "next_attempt": attempt_no + 1,
+                            },
+                        )
+                        continue
                     self.state.event(
                         roadmap.roadmap_id,
                         task.id,

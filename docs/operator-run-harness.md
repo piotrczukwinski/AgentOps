@@ -885,6 +885,76 @@ actually did.
   `_TEMPLATE_PLACEHOLDER_STRINGS` set) and cannot be triggered by
   the executor's output alone.
 
+## Same-session resume observability
+
+AgentOps does not invent a resume command for unknown runners.
+Same-session resume is a real feature on a few executor CLIs
+(``opencode`` keeps a per-directory session id, some chat-style
+CLIs expose a ``--session`` or ``--continue`` flag) but the
+exact argv is runner-specific, and a fabricated resume command
+that the executor does not actually support would silently
+fail or, worse, silently re-launch a *different* session.
+
+The harness surfaces the metadata the operator needs to decide
+manually:
+
+* After every foreground run completes (and on every
+  ``agentops operator-status`` read), the harness scans the
+  most recent ``combined.log`` (bounded to a tail window, never
+  the whole file) for two safe markers:
+
+  - ``AGENTOPS_SESSION_JSON: {"runner": "...", "session_id": "..."}``
+    (or the legacy ``=`` form, tolerated exactly like the result
+    marker).
+  - A conservative plain ``session_id: <token>`` line, with a
+    token alphabet that excludes slashes, backslashes,
+    whitespace, and shell metacharacters.
+
+* When a safe handle is found, ``status.json`` is updated with:
+
+  - ``runner_session_id``
+  - ``runner_session_source`` (``agentops_session_json`` or
+    ``plain_session_id``)
+  - ``same_session_resume_available`` (boolean)
+  - ``same_session_resume_reason`` (human-readable explanation
+    when the boolean is ``false``)
+
+* The same-session availability is computed by
+  :func:`agentops.operator_run.same_session_resume_status`,
+  which returns ``available=true`` only when a safe session id
+  is present AND the runner is in the tested resume-capable
+  set. The set is intentionally conservative: today no runner
+  is auto-resume-capable. Adding a runner requires a tested
+  argv builder in ``build_argv`` and matching tests, so the
+  surface cannot drift.
+
+The operator-facing CLI is:
+
+```bash
+# Inspect availability for a single run.
+agentops operator-status --run-id <run-id>
+
+# Read the JSON-friendly availability dict for a run.
+agentops operator-resume <run-id> --same-session --dry-run
+```
+
+When ``agentops operator-status`` reports ``runtime_status=stale_pid``
+(e.g. after a reboot), the on-disk status carries a clear hint:
+
+* ``same-session resume metadata found; use agentops operator-resume <run-id> --same-session --dry-run first``
+* or, when no safe metadata is on disk: ``same-session resume metadata not found; use operator-retry <run-id> for a fresh retry``.
+
+The harness never parses an arbitrary "resume command" out of
+the log, never executes a command string it found in
+``status.json``, never falls back to ``shell=True``. The only
+argv-builder the harness owns is ``build_argv``, and it refuses
+any runner that is not in the tested set with a clear
+``ValueError``. The new ``agentops runner-probe`` subcommand
+exists exactly so the operator can verify, locally, whether a
+runner binary is in the tested set (or only exposes chat / API
+flags, in which case direct executor support is intentionally
+not enabled).
+
 
 ## Overnight runbook
 
@@ -1109,3 +1179,42 @@ verdict was wrong) delete the cycle directory before the next run.
 * An optional auto-merge after repeated `ACCEPT` verdicts is
   intentionally out of scope for this PR. The merge remains
   operator-controlled.
+
+## Reviewer model and reasoning effort
+
+The Codex reviewer (the bounded, packet-driven side of the
+two-agent strategy) is configured entirely through the roadmap
+file and the local environment. Operator Run Harness never
+selects a reviewer model itself; it inherits whatever the
+roadmap declared.
+
+The resolution order for the reviewer model id is:
+
+1. ``review.model`` in the roadmap / task JSON (canonical key).
+2. ``AGENTOPS_CODEX_MODEL`` environment variable (operator-level
+   override that lets you point at a different reviewer without
+   editing the roadmap).
+3. The Codex CLI default model.
+
+The reasoning effort follows the same shape:
+
+1. ``review.model_reasoning_effort`` (canonical key, allowed
+   values ``low`` / ``medium`` / ``high``).
+2. ``review.reasoning_effort`` (alias).
+3. ``AGENTOPS_CODEX_MODEL_REASONING_EFFORT`` environment variable.
+4. The Codex CLI default reasoning effort.
+
+When neither is set, the harness invokes ``codex`` without any
+``-m`` or ``-c model_reasoning_effort=...`` flag and lets the
+``codex`` CLI pick its defaults. A reader of the logs may then
+see ``codex`` print its default model id (commonly shown as
+``gpt-5.3-codex-spark`` in recent builds) on the first
+turn-completed event; this is the local ``codex`` binary's
+default, not a hidden AgentOps setting.
+
+If you want to pin the reviewer to a specific model / effort,
+set ``review.model`` and ``review.model_reasoning_effort`` in
+the roadmap (or use the matching ``AGENTOPS_CODEX_MODEL`` /
+``AGENTOPS_CODEX_MODEL_REASONING_EFFORT`` env vars). Both are
+documented in [`docs/roadmap-format.md`](roadmap-format.md) under
+the Review block.

@@ -623,6 +623,85 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. 'text' (default) prints a one-line summary; 'json' prints a JSON object with the persisted fields.",
     )
 
+    operator_resume_cmd = sub.add_parser(
+        "operator-resume",
+        help="Resume a previously-stopped or stale-pid operator run (probe only).",
+        description=(
+            "Inspect the durable status of an operator run and decide "
+            "whether a same-session resume is possible. AgentOps never "
+            "invents a resume command for an unknown runner: when "
+            "``--same-session`` is set the command requires a verified "
+            "runner_session_id and a tested argv builder. Without "
+            "``--same-session`` the command only prints what would be "
+            "needed; the operator is expected to use ``operator-retry`` "
+            "for a fresh retry."
+        ),
+    )
+    operator_resume_cmd.add_argument("run_id", help="Run id (the directory name under .operator-runs/).")
+    operator_resume_cmd.add_argument("--dir", default=".", help="Working directory that owns .operator-runs/. Default: current directory.")
+    operator_resume_cmd.add_argument(
+        "--same-session",
+        action="store_true",
+        help=(
+            "Require that a safe same-session resume is available "
+            "(runner_session_id present, runner in the resume-capable "
+            "set, argv builder present). Without this flag the command "
+            "only reports availability."
+        ),
+    )
+    operator_resume_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would happen; never launch a subprocess.",
+    )
+    operator_resume_cmd.add_argument(
+        "--fresh-fallback",
+        action="store_true",
+        help=(
+            "When --same-session is not available, recommend "
+            "``operator-retry`` for a fresh retry in the same output."
+        ),
+    )
+    operator_resume_cmd.add_argument(
+        "--runner",
+        default=None,
+        help="Optional runner override (defaults to the persisted runner).",
+    )
+    operator_resume_cmd.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format. 'text' (default) prints a human summary; 'json' prints the metadata dict.",
+    )
+
+    runner_probe_cmd = sub.add_parser(
+        "runner-probe",
+        help="Probe a runner binary for direct execution support (no model call).",
+        description=(
+            "Verify whether a runner binary exists on PATH and whether "
+            "its ``--help`` output exposes a non-interactive run mode "
+            "compatible with AgentOps. The probe never executes the "
+            "runner and never makes a network call. Use ``--json`` for "
+            "machine-readable output suitable for CI."
+        ),
+    )
+    runner_probe_cmd.add_argument(
+        "--runner",
+        required=True,
+        help="Runner binary name to probe (e.g. 'opencode', 'mmx').",
+    )
+    runner_probe_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the probe result as JSON.",
+    )
+    runner_probe_cmd.add_argument(
+        "--help-timeout",
+        type=float,
+        default=10.0,
+        help="Timeout in seconds for the ``--help`` probe. Default: 10.",
+    )
+
     serve = sub.add_parser("serve", help="Start the local AgentOps web UI (local-only, default 127.0.0.1:8765).")
     serve.add_argument("--host", default="127.0.0.1", help="Host to bind the local UI on. Default: 127.0.0.1 (local-only).")
     serve.add_argument("--port", type=int, default=8765, help="TCP port for the local UI. Default: 8765.")
@@ -898,6 +977,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "operator-stop":
             return _cmd_operator_stop(args)
+
+        if args.command == "operator-resume":
+            return _cmd_operator_resume(args)
+
+        if args.command == "runner-probe":
+            return _cmd_runner_probe(args)
 
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
@@ -2846,6 +2931,180 @@ def _cmd_operator_stop(args: argparse.Namespace) -> int:
     if getattr(args, "format", "text") == "json":
         print(json.dumps(format_status_json(payload), indent=2, sort_keys=True))
     return 0
+
+
+def _cmd_operator_resume(args: argparse.Namespace) -> int:
+    """Inspect a run for same-session resume availability.
+
+    The command is intentionally conservative: it never invents a
+    resume argv for an unknown runner. With ``--same-session`` it
+    refuses to launch anything when the runner is not in the
+    resume-capable set; without that flag it only prints the
+    availability so the operator can choose between
+    ``operator-resume --same-session`` and ``operator-retry``.
+    """
+    from .operator_run import (
+        resolve_run,
+        same_session_resume_status,
+        stale_pid_resume_hint,
+    )
+
+    root = _operator_run_root(args)
+    if not root.exists():
+        print(f"Workdir does not exist: {root}", file=sys.stderr)
+        return 2
+
+    try:
+        target = resolve_run(root, args.run_id)
+    except FileNotFoundError as exc:
+        print(f"operator-resume: {exc}", file=sys.stderr)
+        return 2
+
+    payload = _read_status_payload(target) or {}
+    if getattr(args, "runner", None):
+        payload["runner"] = str(args.runner)
+    availability = same_session_resume_status(payload)
+
+    metadata = {
+        "run_id": str(payload.get("run_id") or target.name),
+        "runner": payload.get("runner"),
+        "runner_session_id": payload.get("runner_session_id"),
+        "runner_session_source": payload.get("runner_session_source"),
+        "same_session_available": bool(availability["available"]),
+        "same_session_reason": str(availability["reason"]),
+    }
+
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(metadata, indent=2, sort_keys=True))
+    else:
+        print(f"operator-resume: run_id={metadata['run_id']}")
+        print(f"operator-resume: runner={metadata['runner'] or '-'}")
+        if metadata["runner_session_id"]:
+            print(
+                f"operator-resume: session_id={metadata['runner_session_id']} "
+                f"(source={metadata['runner_session_source'] or 'unknown'})"
+            )
+        else:
+            print("operator-resume: session_id=(none found)")
+        print(f"operator-resume: same_session_available={metadata['same_session_available']}")
+        print(f"operator-resume: reason={metadata['same_session_reason']}")
+        # stale_pid hint
+        if str(payload.get("runtime_status") or payload.get("status") or "") == "stale_pid":
+            print(f"operator-resume: hint={stale_pid_resume_hint(payload)}")
+
+    same_session = bool(getattr(args, "same_session", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    fresh_fallback = bool(getattr(args, "fresh_fallback", False))
+
+    if same_session and not metadata["same_session_available"]:
+        print(
+            f"operator-resume: same-session resume unavailable "
+            f"({metadata['same_session_reason']})",
+            file=sys.stderr,
+        )
+        if fresh_fallback:
+            print(
+                "operator-resume: fresh fallback recommended - use "
+                "`agentops operator-retry <run-id>` to start a new attempt.",
+                file=sys.stderr,
+            )
+        return 1
+    if not same_session:
+        # Without --same-session the command is purely informational
+        # and exits 0 even when no metadata is available, as long as
+        # the run directory was found.
+        return 0
+
+    # same-session was requested and is available. We deliberately
+    # do NOT synthesize an argv for any runner: the only runner in
+    # the resume-capable set today is "opencode", and even then the
+    # operator is expected to drive the actual launch via the existing
+    # ``operator-run`` / ``operator-retry`` paths (so the safety
+    # sanitization and the durable logs stay intact). With
+    # ``--dry-run`` we only print what would happen.
+    print("operator-resume: same-session metadata found; safe argv list:")
+    runner = str(metadata["runner"] or "")
+    if runner == "opencode":
+        prompt_path = payload.get("prompt_path") or (target / "prompt.md")
+        print(
+            "  opencode run "
+            f"--dir {payload.get('workdir') or target} "
+            f"--model {payload.get('model') or 'minimax/MiniMax-M3'} "
+            f"{'<prompt>'}"
+        )
+        print(f"  (resume-session={metadata['runner_session_id']}; prompt={prompt_path})")
+    else:
+        print(
+            f"  runner={runner!r} is not in the AgentOps-tested "
+            "resume-capable set; refuse to invent an argv. "
+            "Add a tested argv builder before enabling auto-resume.",
+            file=sys.stderr,
+        )
+        return 1
+    if dry_run:
+        print("operator-resume: --dry-run set; not launching any subprocess.")
+        return 0
+    print(
+        "operator-resume: auto-launch is intentionally not implemented "
+        "in this PR. Use `agentops operator-retry <run-id>` for a fresh "
+        "retry, or paste the argv above into a manual launch after "
+        "reviewing the safety notes.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_runner_probe(args: argparse.Namespace) -> int:
+    """Probe a runner binary and emit the result.
+
+    The probe never executes the runner and never calls any network.
+    With ``--json`` it emits a stable, machine-readable payload; the
+    default text output is a one-line summary suitable for a CI log.
+    """
+    from .operator_run import probe_runner
+
+    result = probe_runner(
+        str(args.runner),
+        help_timeout_seconds=float(getattr(args, "help_timeout", 10.0)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    runner = result.get("runner") or ""
+    exists = bool(result.get("command_exists"))
+    direct = bool(result.get("direct_run_supported"))
+    chat_only = bool(result.get("chat_only_runner"))
+    non_int = bool(result.get("non_interactive_run_detected"))
+    print(
+        f"runner-probe: runner={runner} command_exists={exists} "
+        f"direct_run_supported={direct} "
+        f"non_interactive_run_detected={non_int} "
+        f"chat_only_runner={chat_only}"
+    )
+    print(f"runner-probe: reason={result.get('reason') or '-'}")
+    patterns = list(result.get("detected_patterns") or [])
+    if patterns:
+        print(f"runner-probe: detected_patterns={','.join(patterns)}")
+    return 0
+
+
+def _read_status_payload(run_dir_path) -> dict[str, Any]:
+    """Read ``status.json`` from an operator run directory.
+
+    Tiny local helper so :func:`_cmd_operator_resume` does not have to
+    import the full ``operator_run`` module API (which would pull the
+    executor env helpers into the CLI). Returns ``None`` when the
+    file is missing or unparseable.
+    """
+    status_path = run_dir_path / "status.json"
+    if not status_path.exists():
+        return None
+    try:
+        import json as _json
+        data = _json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 # ---------------------------------------------------------------------------

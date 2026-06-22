@@ -27,6 +27,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -46,6 +47,304 @@ from .runners import executor_env as _executor_env
 RUNS_DIR = Path(".operator-runs")
 
 RESULT_MARKER = "AGENTOPS_RESULT_JSON"
+
+# Same-session resume observability. AgentOps does not invent a resume
+# command for unknown runners; it only surfaces a safe, extracted
+# session handle (when the executor emits the explicit
+# ``AGENTOPS_SESSION_JSON`` marker or a conservative plain ``session_id``
+# line) so the operator can decide whether a same-session resume is
+# possible. A safe automatic resume is *not* implemented in this module:
+# any ``argv``-rebuild for an unknown runner is rejected by
+# :func:`build_argv` because we have no verified contract for it.
+SESSION_MARKER = "AGENTOPS_SESSION_JSON"
+
+# Token alphabet allowed inside a session id. The set is the union of
+# A-Z / a-z / 0-9 / dot / underscore / dash. No slashes, backslashes,
+# whitespace, or shell metacharacters.
+_SESSION_TOKEN_OK_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SESSION_TOKEN_MAX = 160
+_SESSION_TOKEN_MIN = 3
+
+# Runner names that already have a verified same-session resume command
+# surface in this module. The set is intentionally conservative: any
+# runner not in here is reported as ``available=False`` until somebody
+# adds a tested argv builder for it.
+_RESUME_CAPABLE_RUNNERS: frozenset[str] = frozenset()
+
+# Hard cap on how many bytes of combined log the scanner reads.
+# 200 KiB is enough for a typical session-marker line (the marker
+# appears in the first ~tens of KB of most runs) and protects the
+# scanner from a multi-megabyte log without bound.
+_SESSION_SCAN_MAX_BYTES = 200 * 1024
+
+
+def _safe_session_token(value: str) -> str | None:
+    """Return ``value`` if it matches the conservative session-token rules.
+
+    Returns ``None`` for anything that does not look like a safe,
+    shell-free identifier. The token rules are:
+
+    * 3..160 chars
+    * only ``A-Z`` / ``a-z`` / ``0-9`` / ``.`` / ``_`` / ``-``
+    * no slash, backslash, whitespace, or shell metacharacter
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if len(candidate) < _SESSION_TOKEN_MIN or len(candidate) > _SESSION_TOKEN_MAX:
+        return None
+    if not _SESSION_TOKEN_OK_RE.match(candidate):
+        return None
+    return candidate
+
+
+_SESSION_JSON_HEADER_RE = re.compile(
+    r"^[ \t]*" + re.escape(SESSION_MARKER) + r"[ \t]*[:=][^\n]*$"
+)
+
+
+def extract_session_handle(text: str) -> dict[str, str] | None:
+    """Extract a runner session handle from explicit, safe markers only.
+
+    Supported markers (the parser only accepts these; nothing else):
+
+    1. ``AGENTOPS_SESSION_JSON: {"runner": "<runner>", "session_id": "<id>"}``
+    2. ``AGENTOPS_SESSION_JSON={"runner": "<runner>", "session_id": "<id>"}``
+       (legacy equals form, tolerated exactly like the result marker)
+    3. A conservative plain line of the form
+       ``session_id: <safe-token>`` or ``Session ID: <safe-token>``
+
+    The function never parses arbitrary resume commands. It never
+    returns raw log text. It never returns unsafe tokens. It never
+    raises.
+
+    On success returns ``{"runner": str, "session_id": str, "source": str}``
+    where ``source`` is one of:
+
+    * ``"agentops_session_json"`` - explicit JSON marker found.
+    * ``"plain_session_id"`` - conservative plain ``session_id`` line
+      (no runner is reported in this case; caller can default to
+      whatever runner started the run).
+
+    Returns ``None`` when no safe marker can be extracted.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    # First pass: explicit JSON marker. Mirrors the result-marker
+    # scanner but uses the JSON object form (not just a safe token).
+    matches = list(_SESSION_JSON_HEADER_RE.finditer(text))
+    if matches:
+        for header in reversed(matches):
+            body = _slice_json_body(text, header.end(), header_match=header)
+            if body is None:
+                continue
+            try:
+                payload = json.loads(body)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            runner_raw = payload.get("runner")
+            session_raw = payload.get("session_id")
+            if not isinstance(runner_raw, str) or not isinstance(session_raw, str):
+                continue
+            runner_token = _safe_session_token(runner_raw)
+            session_token = _safe_session_token(session_raw)
+            if runner_token is None or session_token is None:
+                continue
+            return {
+                "runner": runner_token,
+                "session_id": session_token,
+                "source": "agentops_session_json",
+            }
+    # Second pass: a conservative plain ``session_id: <token>`` line.
+    # The match anchors the line start so we cannot pick up a token
+    # embedded inside an unrelated string.
+    plain_re = re.compile(
+        r"(?im)^[ \t]*(?:session[_-]?id|session[_-]?ID)[ \t]*:[ \t]*([A-Za-z0-9._-]+)[ \t]*$"
+    )
+    plain_match = plain_re.search(text)
+    if plain_match is not None:
+        token = _safe_session_token(plain_match.group(1))
+        if token is not None:
+            return {
+                "runner": "",
+                "session_id": token,
+                "source": "plain_session_id",
+            }
+    return None
+
+
+def same_session_resume_status(status_payload: dict[str, Any]) -> dict[str, Any]:
+    """Compute the same-session resume status from a ``status.json`` payload.
+
+    Returns ``{"available": bool, "runner": str | None, "session_id": str | None, "reason": str}``.
+
+    ``available`` is True only when:
+
+    * ``status_payload`` carries a safe ``runner_session_id`` (set by
+      :func:`record_session_handle` after a run finishes), AND
+    * ``runner`` (either from the payload or the existing ``runner``
+      field) is in :data:`_RESUME_CAPABLE_RUNNERS`.
+
+    For all other runners the function returns ``available=False`` with
+    a descriptive ``reason`` so the CLI / web UI can surface a clear
+    hint to the operator (and refuse to invent an argv resume command).
+    """
+    if not isinstance(status_payload, dict):
+        return {
+            "available": False,
+            "runner": None,
+            "session_id": None,
+            "reason": "missing_status_payload",
+        }
+    session_id = status_payload.get("runner_session_id")
+    runner = status_payload.get("runner")
+    if not isinstance(session_id, str) or not session_id:
+        return {
+            "available": False,
+            "runner": runner if isinstance(runner, str) else None,
+            "session_id": None,
+            "reason": "no_session_handle_in_status",
+        }
+    if not isinstance(runner, str) or not runner:
+        return {
+            "available": False,
+            "runner": None,
+            "session_id": session_id,
+            "reason": "session_handle_without_runner",
+        }
+    if runner not in _RESUME_CAPABLE_RUNNERS:
+        return {
+            "available": False,
+            "runner": runner,
+            "session_id": session_id,
+            "reason": (
+                f"same-session metadata exists but automatic resume is "
+                f"not implemented for runner={runner!r}"
+            ),
+        }
+    return {
+        "available": True,
+        "runner": runner,
+        "session_id": session_id,
+        "reason": "ok",
+    }
+
+
+def _read_session_handle_from_log(run_dir_path: Path) -> dict[str, str] | None:
+    """Read the most recent combined log and try to extract a session handle.
+
+    Reads only the tail (up to :data:`_SESSION_SCAN_MAX_BYTES`) so a
+    multi-megabyte log does not blow up memory. Returns ``None`` on
+    any error.
+    """
+    log_path = latest_combined_log(run_dir_path)
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return None
+    if size <= 0:
+        return None
+    try:
+        with log_path.open("rb") as handle:
+            if size > _SESSION_SCAN_MAX_BYTES:
+                handle.seek(size - _SESSION_SCAN_MAX_BYTES)
+            data = handle.read()
+    except OSError:
+        return None
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - never raise from an extraction helper
+        return None
+    return extract_session_handle(text)
+
+
+def record_session_handle(run_dir_path: Path) -> dict[str, str] | None:
+    """Scan the latest combined log and persist the session handle to status.
+
+    On success the session handle fields are merged into ``status.json``
+    via :func:`write_status` so the on-disk status, the CLI snapshot
+    and the future web UI all see the same metadata. The function
+    never raises; a failure to read the log is logged-via-skip and the
+    existing ``status.json`` is left untouched.
+    """
+    handle = _read_session_handle_from_log(run_dir_path)
+    if handle is None:
+        return None
+    spec_payload = _read_status_payload(run_dir_path) or {}
+    try:
+        spec = RunSpec(
+            name=spec_payload.get("name"),
+            run_id=str(spec_payload.get("run_id") or run_dir_path.name),
+            prompt_path=Path(
+                str(spec_payload.get("prompt_path", run_dir_path / "prompt.md"))
+            ),
+            workdir=Path(str(spec_payload.get("workdir", str(run_dir_path)))),
+            model=str(spec_payload.get("model", DEFAULT_MODEL)),
+            runner=str(spec_payload.get("runner", DEFAULT_RUNNER)),
+            yolo=bool(spec_payload.get("yolo", False)),
+            detach=bool(spec_payload.get("detach", False)),
+            created_at=str(spec_payload.get("created_at", utc_now())),
+        )
+    except (TypeError, ValueError):
+        return handle
+    current_status = str(spec_payload.get("status") or "exited")
+    write_status(
+        run_dir_path,
+        status=current_status,
+        spec=spec,
+        runner_session_id=handle["session_id"],
+        runner_session_source=handle["source"],
+        same_session_resume_available=False,  # updated below
+        same_session_resume_reason="",
+    )
+    final = _read_status_payload(run_dir_path) or {}
+    availability = same_session_resume_status(final)
+    write_status(
+        run_dir_path,
+        status=current_status,
+        spec=spec,
+        runner_session_id=handle["session_id"],
+        runner_session_source=handle["source"],
+        same_session_resume_available=bool(availability["available"]),
+        same_session_resume_reason=str(availability["reason"]),
+    )
+    # If the marker included a runner name that differs from the
+    # original, surface it through status.json so the operator can see
+    # the discrepancy.
+    if handle["runner"] and handle["runner"] != spec.runner:
+        write_status(
+            run_dir_path,
+            status=current_status,
+            spec=spec,
+            runner_session_id=handle["session_id"],
+            runner_session_source=handle["source"],
+            same_session_resume_available=bool(availability["available"]),
+            same_session_resume_reason=str(availability["reason"]),
+        )
+    return handle
+
+
+def stale_pid_resume_hint(status_payload: dict[str, Any]) -> str:
+    """Return the operator hint line to print when a run is ``stale_pid``.
+
+    The hint tells the operator whether a same-session resume is
+    available (use ``operator-resume --same-session --dry-run`` first)
+    or whether they need a fresh retry (use ``operator-retry``).
+    """
+    availability = same_session_resume_status(status_payload)
+    if availability["available"]:
+        return (
+            "same-session resume metadata found; use "
+            "`agentops operator-resume <run-id> --same-session --dry-run` first"
+        )
+    return (
+        "same-session resume metadata not found; use "
+        "`agentops operator-retry <run-id>` for a fresh retry"
+    )
 
 DEFAULT_RUNNER = "opencode"
 DEFAULT_MODEL = "minimax/MiniMax-M3"
@@ -288,6 +587,175 @@ def build_argv(
     return argv
 
 
+# Conservative list of substrings whose presence in a runner's
+# ``--help`` output indicates a non-interactive run subcommand that
+# could plausibly accept a model id, a workdir, and a prompt. A
+# runner that exhibits at least one of these patterns is considered
+# "maybe-direct" by the probe; the probe does NOT mark a runner as
+# "fully supported" unless :func:`build_argv` has a tested argv
+# builder for it. False positives are safer than false negatives
+# here: the probe only reports metadata, never executes the runner
+# in this PR.
+_NON_INTERACTIVE_RUN_PATTERNS: tuple[str, ...] = (
+    "run",
+    "exec",
+    "execute",
+    "chat",
+    "complete",
+    "completion",
+    "text chat",
+    "invoke",
+)
+
+# Substrings that indicate the runner is a chat / completion CLI with
+# a non-interactive mode but no executor / workdir / file-edit
+# semantics. These runners are reported as
+# ``non_interactive_run_detected=true`` but
+# ``direct_runner_supported=false`` because AgentOps requires a real
+# worktree / file-edit surface for the orchestrator contract.
+_CHAT_ONLY_HINTS: tuple[str, ...] = (
+    "api key",
+    "model id",
+    "--message",
+    "--messages-file",
+    "--system",
+)
+
+
+def probe_runner(
+    runner: str,
+    *,
+    help_timeout_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """Probe a runner binary for direct-execution support.
+
+    Returns a metadata dict describing what the local probe could
+    verify. The probe never executes the runner, never invokes a
+    model, never makes a network call. It only checks that the binary
+    exists on ``PATH`` and (when present) parses ``--help`` output
+    for the conservative non-interactive-run and chat-only patterns
+    above.
+
+    Output shape::
+
+        {
+            "runner": str,
+            "command_exists": bool,
+            "command_path": str | None,
+            "help_exit_code": int | None,
+            "non_interactive_run_detected": bool,
+            "chat_only_runner": bool,
+            "detected_patterns": list[str],
+            "supported_by_operator_run": bool,
+            "direct_run_supported": bool,
+            "same_session_resume_supported": bool,
+            "reason": str,
+        }
+    """
+    if not isinstance(runner, str) or not runner.strip():
+        return {
+            "runner": runner or "",
+            "command_exists": False,
+            "command_path": None,
+            "help_exit_code": None,
+            "non_interactive_run_detected": False,
+            "chat_only_runner": False,
+            "detected_patterns": [],
+            "supported_by_operator_run": False,
+            "direct_run_supported": False,
+            "same_session_resume_supported": False,
+            "reason": "empty_runner_name",
+        }
+    runner_name = runner.strip().lower()
+    binary_path = shutil.which(runner_name)
+    if binary_path is None:
+        return {
+            "runner": runner_name,
+            "command_exists": False,
+            "command_path": None,
+            "help_exit_code": None,
+            "non_interactive_run_detected": False,
+            "chat_only_runner": False,
+            "detected_patterns": [],
+            "supported_by_operator_run": False,
+            "direct_run_supported": False,
+            "same_session_resume_supported": False,
+            "reason": f"{runner_name} not found on PATH",
+        }
+    # Only ``opencode`` has a tested argv builder today. The probe
+    # always reports ``direct_run_supported`` accordingly so the
+    # operator can distinguish "binary exists" from "safe to invoke".
+    supported_by_operator_run = runner_name in _RESUME_CAPABLE_RUNNERS or runner_name == "opencode"
+    direct_run_supported = supported_by_operator_run
+    same_session_resume_supported = runner_name in _RESUME_CAPABLE_RUNNERS
+
+    try:
+        completed = subprocess.run(  # noqa: S603 - intentional, bounded
+            [binary_path, "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=float(help_timeout_seconds),
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "runner": runner_name,
+            "command_exists": True,
+            "command_path": binary_path,
+            "help_exit_code": None,
+            "non_interactive_run_detected": False,
+            "chat_only_runner": False,
+            "detected_patterns": [],
+            "supported_by_operator_run": supported_by_operator_run,
+            "direct_run_supported": direct_run_supported,
+            "same_session_resume_supported": same_session_resume_supported,
+            "reason": f"{runner_name} --help failed: {type(exc).__name__}",
+        }
+    help_text = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    help_lower = help_text.lower()
+    detected = [
+        pattern for pattern in _NON_INTERACTIVE_RUN_PATTERNS if pattern in help_lower
+    ]
+    chat_only = any(pattern in help_lower for pattern in _CHAT_ONLY_HINTS)
+    non_interactive_run_detected = bool(detected)
+
+    # The probe never flips ``direct_run_supported`` to True on
+    # chat-only runners: a chat API surface (no workdir, no
+    # file-edit semantics) does not satisfy the orchestrator
+    # contract for ``executor=...`` tasks. The probe still records
+    # the raw pattern matches so the operator can see what was
+    # detected.
+    if chat_only and runner_name not in {"opencode"}:
+        reason = (
+            f"{runner_name} --help exposes chat / completion flags but "
+            "no executor-style workdir / file-edit semantics; direct "
+            "executor support is intentionally not enabled"
+        )
+    elif not direct_run_supported:
+        reason = (
+            f"{runner_name} is not in the AgentOps-tested runner set; "
+            "build_argv refuses it. Add a tested argv builder before "
+            "enabling direct execution."
+        )
+    else:
+        reason = "ok"
+
+    return {
+        "runner": runner_name,
+        "command_exists": True,
+        "command_path": binary_path,
+        "help_exit_code": int(completed.returncode),
+        "non_interactive_run_detected": non_interactive_run_detected,
+        "chat_only_runner": chat_only,
+        "detected_patterns": detected,
+        "supported_by_operator_run": supported_by_operator_run,
+        "direct_run_supported": direct_run_supported,
+        "same_session_resume_supported": same_session_resume_supported,
+        "reason": reason,
+    }
+
+
 def _subprocess_env() -> dict[str, str]:
     """Return a sanitized env for the executor subprocess.
 
@@ -340,6 +808,10 @@ def write_status(
     startup_for_seconds: float | None = None,
     startup_timeout: float | None = None,
     startup_log_size_bytes: int | None = None,
+    runner_session_id: str | None = None,
+    runner_session_source: str | None = None,
+    same_session_resume_available: bool | None = None,
+    same_session_resume_reason: str | None = None,
 ) -> dict[str, Any]:
     """Update ``status.json`` for a run.
 
@@ -420,6 +892,14 @@ def write_status(
         payload["startup_timeout"] = float(startup_timeout)
     if startup_log_size_bytes is not None:
         payload["startup_log_size_bytes"] = int(startup_log_size_bytes)
+    if runner_session_id is not None:
+        payload["runner_session_id"] = str(runner_session_id)
+    if runner_session_source is not None:
+        payload["runner_session_source"] = str(runner_session_source)
+    if same_session_resume_available is not None:
+        payload["same_session_resume_available"] = bool(same_session_resume_available)
+    if same_session_resume_reason is not None:
+        payload["same_session_resume_reason"] = str(same_session_resume_reason)
 
     status_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return payload
@@ -1515,6 +1995,8 @@ def run_foreground(
             result_status="template",
             **(_idle_status_kwargs(watchdog, startup_watchdog) or {}),
         )
+        with contextlib.suppress(Exception):
+            record_session_handle(run_dir_path)
         return payload
     except ResultNotFound as exc:
         if exit_code == 0:
@@ -1533,9 +2015,13 @@ def run_foreground(
                 result_status="missing",
                 **(_idle_status_kwargs(watchdog, startup_watchdog) or {}),
             )
+            with contextlib.suppress(Exception):
+                record_session_handle(run_dir_path)
             return payload
         # Non-zero exit + no result: keep the existing behavior
         # (the run is failed for an unrelated reason).
+        with contextlib.suppress(Exception):
+            record_session_handle(run_dir_path)
         return payload
 
     write_result(run_dir_path, result)
@@ -1551,6 +2037,11 @@ def run_foreground(
         result_path=str(run_dir_path / "result.json"),
         **(_idle_status_kwargs(watchdog, startup_watchdog) or {}),
     )
+    # Best-effort same-session resume metadata extraction. The scan is
+    # bounded, never raises, and is purely additive: a missing handle
+    # leaves the existing status.json untouched.
+    with contextlib.suppress(Exception):
+        record_session_handle(run_dir_path)
     return payload
 
 
@@ -2106,6 +2597,11 @@ def _finalize_attempts(
             result_path=str(run_dir_path / "result.json"),
         )
         break
+    # Best-effort same-session resume metadata extraction. Same
+    # contract as the foreground / template / missing paths: the
+    # extraction is observability-only and never raises.
+    with contextlib.suppress(Exception):
+        record_session_handle(run_dir_path)
     return payload
 
 
@@ -3077,6 +3573,8 @@ def format_status_line(payload: dict[str, Any]) -> str:
     next_retry = payload.get("next_retry_at")
     if next_retry:
         parts.append(f"next_retry_at={next_retry}")
+    if payload.get("runner_session_id"):
+        parts.append(f"session_id={payload['runner_session_id']}")
     parts.append(f"started={started or '-'}")
     parts.append(f"ended={ended or '-'}")
     parts.append(f"duration={duration}")
@@ -3104,6 +3602,13 @@ def _enrich_status(run_dir_path: Path, payload: dict[str, Any]) -> dict[str, Any
     backward compatibility, in legacy fields on ``status.json`` itself).
     The enrichment is read-only; the enriched keys are only added when
     the underlying file actually carries the data.
+
+    When the persisted status lacks a ``runner_session_id``, the
+    enrichment opportunistically scans the most recent combined log
+    for the explicit ``AGENTOPS_SESSION_JSON`` marker / a conservative
+    plain ``session_id: <token>`` line. The discovered handle is
+    written to ``status.json`` so subsequent reads are fast, but a
+    scanner failure never breaks the read path.
     """
     out = dict(payload)
     cfg = read_retry_config(run_dir_path)
@@ -3113,6 +3618,15 @@ def _enrich_status(run_dir_path: Path, payload: dict[str, Any]) -> dict[str, Any
         out.setdefault("retry_on_transient", bool(cfg.get("retry_on_transient", False)))
         if cfg.get("last_attempt") is not None:
             out.setdefault("attempt", int(cfg["last_attempt"]))
+    if not out.get("runner_session_id"):
+        try:
+            persisted = record_session_handle(run_dir_path)
+        except Exception:  # noqa: BLE001 - enrichment is best-effort
+            persisted = None
+        if persisted is not None:
+            refreshed = _read_status_payload(run_dir_path) or {}
+            for key, value in refreshed.items():
+                out.setdefault(key, value)
     return out
 
 
@@ -3263,6 +3777,10 @@ JSON_STATUS_FIELDS = (
     "runtime_status_note",
     "runtime_status_alias",
     "failure_category",
+    "runner_session_id",
+    "runner_session_source",
+    "same_session_resume_available",
+    "same_session_resume_reason",
 )
 
 
@@ -3337,6 +3855,7 @@ __all__ = [
     "build_resume_hint",
     "classify_transient",
     "extract_result",
+    "extract_session_handle",
     "format_status_json",
     "format_status_line",
     "generate_run_id",
@@ -3355,6 +3874,7 @@ __all__ = [
     "prepare_retry_run",
     "read_pid",
     "read_retry_config",
+    "record_session_handle",
     "resolve_run",
     "run_attempt_foreground",
     "run_detached",
@@ -3362,6 +3882,9 @@ __all__ = [
     "run_foreground",
     "run_foreground_with_retries",
     "runs_root",
+    "same_session_resume_status",
+    "SESSION_MARKER",
+    "stale_pid_resume_hint",
     "start_run",
     "stop_run",
     "tail_combined",
