@@ -856,7 +856,11 @@ def build_parser() -> argparse.ArgumentParser:
             "in the audit event log and advances the task to 'accepted' or "
             "'merged' without invoking an executor. "
             "Protected states (accepted / pushed / merged / skipped) "
-            "require --force. In-flight states are always refused."
+            "require --force. In-flight states are always refused. "
+            "The --allow-ready-external flag adds a narrow, evidence-gated "
+            "escape hatch for READY -> merged when work was completed "
+            "outside AgentOps and an external commit SHA plus reason are "
+            "provided. --force alone does not unlock it."
         ),
     )
     task_settle_cmd.add_argument(
@@ -904,6 +908,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Override the default refusal for tasks already in a protected "
             "terminal state (accepted / pushed / merged / skipped). "
             "Cannot override in-flight refusals."
+        ),
+    )
+    task_settle_cmd.add_argument(
+        "--allow-ready-external",
+        action="store_true",
+        help=(
+            "Allow READY -> merged settlement when work was completed "
+            "outside AgentOps and --external-commit plus --reason are "
+            "provided. This is a narrow, evidence-gated escape hatch. "
+            "It does not allow other in-flight states (planned / "
+            "preflight / executor_* / validating / ...) and does not "
+            "allow READY -> accepted. --force alone does not unlock "
+            "this path; the explicit flag is required."
         ),
     )
     task_settle_cmd.add_argument(
@@ -2629,6 +2646,7 @@ def _cmd_task_settle(state: StateStore, args: argparse.Namespace) -> int:
     external_commit = str(getattr(args, "external_commit", "") or "").strip() or None
     include_dependents = bool(getattr(args, "include_dependents", False))
     force = bool(getattr(args, "force", False))
+    allow_ready_external = bool(getattr(args, "allow_ready_external", False))
     dry_run = bool(getattr(args, "dry_run", False))
     as_json = bool(getattr(args, "json", False))
 
@@ -2662,6 +2680,7 @@ def _cmd_task_settle(state: StateStore, args: argparse.Namespace) -> int:
         external_commit=external_commit,
         include_dependents=include_dependents,
         force=force,
+        allow_ready_external=allow_ready_external,
     )
 
     if not decision.allowed:

@@ -701,6 +701,85 @@ class TaskSettlementApplyTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(int(row["c"]), 1)
 
+    def test_apply_emits_ready_external_event_when_allow_ready_external(self) -> None:
+        """apply_task_settle writes an extra task.settled_external_ready
+        event when the new flag is used, and records the flag in both
+        the operator_settle_requested and settled_external payloads."""
+        from agentops.task_settlement import (
+            apply_task_settle,
+            evaluate_task_settle,
+        )
+
+        self._seed_default(current_state="ready")
+        decision = evaluate_task_settle(
+            current_state="ready",
+            target_state="merged",
+            reason="principal reviewed external settlement",
+            external_commit="04053b4438e3446c7afc9e8c0ec9ecc48b7a2158",
+            allow_ready_external=True,
+        )
+        self.assertTrue(
+            decision.allowed,
+            f"expected allowed, got {decision.refusal_reason!r}",
+        )
+        apply_task_settle(
+            self.state,
+            roadmap_id=self.roadmap_id,
+            task_id=self.task_id,
+            decision=decision,
+            dry_run=False,
+        )
+        with self.state.connect() as conn:
+            events = conn.execute(
+                "SELECT type, payload_json FROM events "
+                "WHERE roadmap_id=? AND task_id=? AND type LIKE 'task.settled%' "
+                "ORDER BY seq",
+                (self.roadmap_id, self.task_id),
+            ).fetchall()
+        types = [row["type"] for row in events]
+        self.assertIn("task.settled_external", types)
+        self.assertIn("task.settled_external_ready", types)
+        with self.state.connect() as conn:
+            requested = conn.execute(
+                "SELECT payload_json FROM events "
+                "WHERE roadmap_id=? AND task_id=? AND type='task.operator_settle_requested' "
+                "ORDER BY seq DESC LIMIT 1",
+                (self.roadmap_id, self.task_id),
+            ).fetchone()
+        self.assertIsNotNone(requested)
+        self.assertIn('"allow_ready_external": true', str(requested["payload_json"]))
+
+    def test_apply_dry_run_with_allow_ready_external_does_not_mutate(self) -> None:
+        from agentops.task_settlement import (
+            apply_task_settle,
+            evaluate_task_settle,
+        )
+
+        self._seed_default(current_state="ready")
+        decision = evaluate_task_settle(
+            current_state="ready",
+            target_state="merged",
+            reason="principal reviewed",
+            external_commit="04053b4438e3446c7afc9e8c0ec9ecc48b7a2158",
+            allow_ready_external=True,
+        )
+        self.assertTrue(decision.allowed)
+        apply_task_settle(
+            self.state,
+            roadmap_id=self.roadmap_id,
+            task_id=self.task_id,
+            decision=decision,
+            dry_run=True,
+        )
+        with self.state.connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM tasks WHERE roadmap_id=? AND id=?",
+                (self.roadmap_id, self.task_id),
+            ).fetchone()
+        # dry-run must NOT have moved the task out of ready
+        self.assertEqual(str(row["state"]), "ready")
+
+
 
 class TaskSettlementCliTests(unittest.TestCase):
     """CLI smoke tests for the wired-up subcommand."""
@@ -745,6 +824,76 @@ class TaskSettlementCliTests(unittest.TestCase):
             except SystemExit as exc:
                 rc = int(exc.code) if exc.code is not None else 2
         return rc, buf_out.getvalue(), buf_err.getvalue()
+
+    def test_cli_refuses_ready_to_merged_without_flag(self) -> None:
+        # Move the seeded task to 'ready' via transition_task
+        from agentops.models import TaskState
+        self.state.transition_task(
+            self.roadmap_id, self.task_id, TaskState.READY, {"reason": "test"}
+        )
+        rc, _, err = self._run_cli(
+            "--state",
+            "merged",
+            "--reason",
+            "principal reviewed",
+            "--external-commit",
+            "04053b4438e3446c7afc9e8c0ec9ecc48b7a2158",
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("in-flight", err.lower())
+
+    def test_cli_allow_ready_external_settles_ready_to_merged(self) -> None:
+        from agentops.models import TaskState
+        self.state.transition_task(
+            self.roadmap_id, self.task_id, TaskState.READY, {"reason": "test"}
+        )
+        rc, out, _ = self._run_cli(
+            "--state",
+            "merged",
+            "--reason",
+            "principal reviewed external settlement",
+            "--external-commit",
+            "04053b4438e3446c7afc9e8c0ec9ecc48b7a2158",
+            "--allow-ready-external",
+            "--json",
+        )
+        self.assertEqual(rc, 0, f"cli failed: {out}")
+        payload = json.loads(out)
+        self.assertEqual(payload["decision"]["allowed"], True)
+        self.assertEqual(payload["decision"]["allow_ready_external"], True)
+        self.assertEqual(payload["new_state"], "merged")
+        # task is now merged
+        with self.state.connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM tasks WHERE roadmap_id=? AND id=?",
+                (self.roadmap_id, self.task_id),
+            ).fetchone()
+        self.assertEqual(str(row["state"]), "merged")
+        # task.settled_external_ready event was written
+        with self.state.connect() as conn:
+            row = conn.execute(
+                "SELECT type FROM events "
+                "WHERE roadmap_id=? AND task_id=? AND type='task.settled_external_ready'",
+                (self.roadmap_id, self.task_id),
+            ).fetchone()
+        self.assertIsNotNone(row)
+
+    def test_cli_allow_ready_external_refuses_bad_external_commit(self) -> None:
+        from agentops.models import TaskState
+        self.state.transition_task(
+            self.roadmap_id, self.task_id, TaskState.READY, {"reason": "test"}
+        )
+        rc, _, err = self._run_cli(
+            "--state",
+            "merged",
+            "--reason",
+            "principal reviewed",
+            "--external-commit",
+            "not-a-sha",
+            "--allow-ready-external",
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("hex sha", err.lower())
 
     def test_cli_refuses_when_reason_missing(self) -> None:
         rc, out, err = self._run_cli(
