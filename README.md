@@ -35,6 +35,37 @@ The reviewer is called only when the durable state says it is
 useful: a *bounded* read-only review packet in, a *structured*
 verdict out. The reviewer is never a live watcher.
 
+## Maintainer throughput
+
+AgentOps is designed to compress **maintainer wall-clock time**
+on long coding-agent workflows, not only token / cost.
+
+Without a durable control plane, a long roadmap stalls between
+steps: the executor finishes, the maintainer notices later,
+copies the next prompt, re-runs validation, asks for repair,
+waits again, and repeats. Each handoff is a gap where nothing
+useful happens, the context window has to be rehydrated by hand,
+and the next prompt is reconstructed from memory.
+
+AgentOps turns that loop into a queued, bounded roadmap. The
+maintainer can:
+
+* define 10–20 narrow tasks with allowed-file scope,
+  validations, attempt budgets, review policy, and merge gates;
+* start the run;
+* return later to durable state — accepted tasks, blocked
+  tasks, logs, artifacts, validation output, review packets, and
+  copyable recovery commands.
+
+This is **not** blind autonomy. Safety boundaries remain:
+file / branch / forbidden-glob policy, secret-like-value
+detection, an integration-branch merge gate that refuses to
+touch `main` / `master` / `audit/**` / `release/**`,
+executor environment sanitization, bounded transient retries,
+and human review required for blocked and high-risk states. See
+[`docs/security.md`](docs/security.md) and
+[`SECURITY.md`](SECURITY.md) for the full list.
+
 ## 60-second pitch
 
 ```text
@@ -542,14 +573,18 @@ tests/
   — evidence-based case study of using AgentOps to improve
   AgentOps itself.
 * [`docs/public-release-checklist.md`](docs/public-release-checklist.md)
-  — the release-readiness checklist used before switching the
-  repository public, including the final manual steps.
+  — the historical release-readiness checklist used before the
+  repository was switched public; now preserved as reusable
+  release-hygiene guidance for future releases.
 * [`docs/codex-for-oss-application.md`](docs/codex-for-oss-application.md)
-  — the prep document for the OpenAI Codex for Open Source
-  application, with form-ready answer drafts.
+  — the application record and post-submission follow-up plan
+  for the **OpenAI Codex for Open Source** program. Contains the
+  rationale and submitted answer drafts; states current status
+  honestly (application submitted, acceptance not guaranteed).
 * [`docs/public-release-audit.md`](docs/public-release-audit.md)
-  — the final readiness audit summarising metadata, license,
-  CI, safety, demo, docs, and remaining manual actions.
+  — the historical pre-public readiness audit summarising
+  metadata, license, CI, safety, demo, docs, and the final
+  manual actions; preserved as a record of what passed.
 
 ## Contributing
 
