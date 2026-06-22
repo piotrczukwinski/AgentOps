@@ -270,6 +270,43 @@ class FrontendCockpitTests(unittest.TestCase):
         self.assertIn("agentops task-tail ", html)
         self.assertIn("agentops timeline --task ", html)
 
+    def test_render_has_roadmap_resume_checkbox_and_help(self) -> None:
+        """Issue #45: the cockpit must surface an explicit resume
+        option so the operator does not accidentally restart the
+        earliest unfinished task instead of resuming. The checkbox,
+        help text, and warning copy must all render.
+        """
+        html = web.render_index_html()
+        self.assertIn("roadmap-resume", html)
+        self.assertIn("id=\"roadmap-resume\"", html)
+        self.assertIn("resume existing roadmap state", html)
+        self.assertIn("roadmap-resume-help", html)
+        self.assertIn("Fresh run starts from the earliest unfinished task", html)
+        self.assertIn("roadmap-resume-warning", html)
+        self.assertIn("This will start a fresh run, not resume existing state", html)
+
+    def test_render_blocked_task_detail_includes_task_retry_copy_hint(self) -> None:
+        """Issue #45: when the selected task is in a retryable state
+        (blocked / failed / validation_failed / merge_failed /
+        awaiting_human), the task-detail panel must surface a
+        copy-only ``agentops task-retry`` hint and the post-retry
+        ``agentops run --resume`` command. The hint is text only;
+        no POST endpoint is introduced.
+        """
+        html = web.render_index_html()
+        # Both the per-state command list and the static suggestion
+        # block must reference the task-retry copy-only command.
+        self.assertIn("agentops task-retry", html)
+        self.assertIn("agentops run --roadmap <path> --resume", html)
+        # Copy affordance must wrap the hint so it never binds to a
+        # click handler that would execute shell.
+        self.assertIn("data-copy-text", html)
+        # The retryable states must be enumerated client-side so the
+        # cockpit can decide which tasks to surface the hint for.
+        self.assertIn("validation_failed", html)
+        self.assertIn("awaiting_human", html)
+        self.assertIn("merge_failed", html)
+
     def test_render_has_stable_refresh_and_heavy_gating(self) -> None:
         html = web.render_index_html()
         # refreshAll renders the admin snapshot before tasks so the
@@ -487,6 +524,59 @@ class WebApiTests(unittest.TestCase):
         self.assertNotIn("--no-codex", argv)
         self.assertIn("--reviewer", argv)
         self.assertEqual(argv[argv.index("--reviewer") + 1], "codex")
+
+    def test_run_endpoint_resume_false_preserves_old_behavior(self) -> None:
+        """``resume=false`` (or omitted) must NOT add ``--resume``.
+
+        Without the new resume option, ``agentops run`` always
+        starts from the earliest unfinished task. The web launcher
+        must keep that default safe.
+        """
+        fake_proc = mock.Mock(pid=1234)
+        with mock.patch("agentops.web.subprocess.Popen", return_value=fake_proc):
+            status, data = self._post(
+                "/api/run",
+                {"roadmap": str(self.roadmap), "no_codex": True, "resume": False},
+            )
+        self.assertEqual(status, 200)
+        argv = data["argv"]
+        self.assertNotIn("--resume", argv)
+        self.assertFalse(data["resume"])
+
+        # Omitting resume also defaults to false.
+        with mock.patch("agentops.web.subprocess.Popen", return_value=fake_proc):
+            status, data = self._post(
+                "/api/run",
+                {"roadmap": str(self.roadmap), "no_codex": True},
+            )
+        self.assertEqual(status, 200)
+        argv = data["argv"]
+        self.assertNotIn("--resume", argv)
+        self.assertFalse(data["resume"])
+
+    def test_run_endpoint_resume_true_passes_resume_flag(self) -> None:
+        """``resume=true`` appends ``--resume`` so the run continues
+        from the persisted task state instead of restarting the
+        earliest unfinished task. Issue #45.
+        """
+        fake_proc = mock.Mock(pid=1234)
+        with mock.patch("agentops.web.subprocess.Popen", return_value=fake_proc):
+            status, data = self._post(
+                "/api/run",
+                {"roadmap": str(self.roadmap), "no_codex": True, "resume": True},
+            )
+        self.assertEqual(status, 200)
+        argv = data["argv"]
+        self.assertIn("--resume", argv)
+        self.assertTrue(data["resume"])
+
+    def test_run_endpoint_resume_must_be_boolean(self) -> None:
+        status, data = self._post(
+            "/api/run",
+            {"roadmap": str(self.roadmap), "no_codex": True, "resume": "yes"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("resume must be a boolean", data["error"])
 
     def test_run_endpoint_does_not_use_shell(self) -> None:
         # The argv must be a list (no shell) and can enable Codex review by

@@ -1172,6 +1172,78 @@ class Orchestrator:
                             },
                         )
                         continue
+                    # Bounded Codex takeover for missing_result /
+                    # template_result exhaustion (issue #45, no-stall
+                    # recovery). Mirrors the existing
+                    # empty_diff_codex_takeover pattern: only fires
+                    # once per task (guarded by ``codex_takeover_used``),
+                    # only when the run mode/reviewer config permits
+                    # Codex (``autonomous`` AND ``review.codex != never``
+                    # AND codex binary available), and never for shell
+                    # executors (shell result is the exit code, not a
+                    # marker — the existing shell path remains the
+                    # terminal BLOCK contract). When those gates do not
+                    # hold we keep the terminal BLOCK behaviour so the
+                    # safety default is unchanged.
+                    _takeover_category = (
+                        _category in {MISSING_RESULT_CATEGORY, TEMPLATE_RESULT_CATEGORY}
+                    )
+                    _codex_allowed = (
+                        self.options.autonomous
+                        and task.executor != "codex"
+                        and task.review.codex in {"required", "auto", "milestone_only"}
+                        and not self.options.no_codex
+                        and codex_service.is_available()
+                    )
+                    if (
+                        _takeover_category
+                        and _codex_allowed
+                        and attempt_no == max_attempts
+                        and not runtime.codex_takeover_used
+                    ):
+                        runtime.codex_takeover_active = True
+                        runtime.codex_takeover_used = True
+                        runtime.repair_prompt = _result_guard_repair_prompt(
+                            task=task,
+                            classification=_cls,
+                            failure_category=_category,
+                            attempt_no=attempt_no,
+                            max_attempts=max_attempts,
+                        )
+                        repair_path = artifact_store.write_text(
+                            attempt_dir, "repair.prompt.md", runtime.repair_prompt
+                        )
+                        self.state.record_artifact(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "repair_prompt",
+                            repair_path,
+                            artifact_store.sha256(repair_path),
+                        )
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            task.id,
+                            TaskState.REPAIR_PROMPT_READY,
+                            {
+                                "reason": "result_guard_codex_takeover",
+                                "failure_category": _category,
+                                "after_attempt": attempt_no,
+                                "next_executor": "codex",
+                            },
+                        )
+                        self._record_roadmap_event(
+                            roadmap,
+                            "task.codex_takeover_queued",
+                            task.id,
+                            extra={
+                                "reason": _category,
+                                "after_attempt": attempt_no,
+                                "next_attempt": attempt_no + 1,
+                                "classification": _cls,
+                            },
+                        )
+                        continue
                     self.state.event(
                         roadmap.roadmap_id,
                         task.id,

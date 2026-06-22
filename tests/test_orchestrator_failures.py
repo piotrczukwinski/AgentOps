@@ -597,5 +597,267 @@ class ImplementationResultGuardDefaultTests(unittest.TestCase):
             self.assertIn(rows["SH-1"], {"accepted", "pushed", "merged"})
 
 
+# ---------------------------------------------------------------------------
+# Bounded Codex takeover for result-guard exhaustion (issue #45)
+# ---------------------------------------------------------------------------
+
+
+class _FakeAvailableCodex:
+    """Stand-in for CodexReviewService that is always available.
+
+    On ``review()`` the fake writes a real ACCEPT verdict and the
+    matching result.json so the bounded takeover can complete a
+    task end-to-end without the operator's codex binary being on
+    PATH. The fake records every call so tests can assert the
+    takeover actually fired.
+    """
+
+    name = "fake-codex"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def is_available(self) -> bool:
+        return True
+
+    def review(self, prompt_path, cwd, artifact_dir, schema_path=None, timeout_seconds=None, **kwargs):  # type: ignore[no-untyped-def]
+        import json as _json
+
+        from agentops.models import ReviewVerdict
+
+        self.calls.append(str(artifact_dir))
+        result_path = artifact_dir / "review.result.json"
+        verdict = ReviewVerdict(
+            verdict="ACCEPT",
+            confidence="high",
+            summary="fake codex takeover ACCEPT",
+            safe_to_push=True,
+            safe_to_merge=True,
+            raw={"verdict": "ACCEPT", "summary": "fake codex takeover ACCEPT"},
+        )
+        result_path.write_text(
+            _json.dumps(
+                {
+                    "verdict": "ACCEPT",
+                    "confidence": "high",
+                    "summary": "fake codex takeover ACCEPT",
+                    "blocking_issues": [],
+                    "repair_prompt": "",
+                    "safe_to_push": True,
+                    "safe_to_merge": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return verdict, result_path
+
+
+class _FakeUnavailableCodex(_FakeAvailableCodex):
+    def is_available(self) -> bool:
+        return False
+
+
+class ResultGuardCodexTakeoverTests(unittest.TestCase):
+    """Phase 4 of the no-stall roadmap recovery (issue #45).
+
+    When a non-shell implementation task exhausts its result-guard
+    retry budget (``missing_result`` / ``template_result``) and the
+    run mode allows Codex (``autonomous`` AND ``review.codex in
+    {required, auto, milestone_only}`` AND codex binary available),
+    the orchestrator queues a single bounded Codex takeover attempt
+    instead of terminal-blocking the task.
+
+    The takeover fires at most once per task. When the run mode
+    does not allow Codex (no autonomous, codex=never, no-codex,
+    codex binary missing), the existing terminal-BLOCK behaviour
+    is preserved so the safety default is unchanged.
+    """
+
+    def _build_codex_roadmap(self, root: Path, repo: Path, *, codex_mode: str) -> Path:
+        prompt = root / "prompt.md"
+        prompt.write_text("do the thing", encoding="utf-8")
+        roadmap_path = root / "r.json"
+        roadmap_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "roadmap_id": "codex-takeover-test",
+                    "repo": {"id": "r", "path": str(repo), "base_branch": "HEAD"},
+                    "integration_branch": "agentops/integration/codex-takeover-test",
+                    "merge_policy": {
+                        "auto_merge": True,
+                        "strategy": "cherry_pick",
+                        "require_clean_validations": True,
+                        "require_safe_to_merge": True,
+                        "protected_branches": ["main", "master"],
+                    },
+                    "defaults": {
+                        "executor": "opencode",
+                        "execution_mode": "worktree_branch",
+                        "max_attempts": 2,
+                        "timeout_seconds": 120,
+                    },
+                    "tasks": [
+                        {
+                            "id": "CT-1",
+                            "kind": "implementation",
+                            "executor": "opencode",
+                            "prompt": str(prompt),
+                            "branch_prefix": "agentops",
+                            "allowed_files": ["out.txt"],
+                            "x_allow_empty_diff": True,
+                            "require_executor_result": True,
+                            "review": {"codex": codex_mode},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return roadmap_path
+
+    def _missing_body(self) -> str:
+        return "no marker here; no AGENTOPS_RESULT_JSON either\n"
+
+    def test_missing_result_exhaustion_queues_codex_takeover_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            (repo / "out.txt").write_text("ok\n", encoding="utf-8")
+            _git(repo, "add", "out.txt")
+            _git(repo, "commit", "-m", "seed out")
+            roadmap_path = self._build_codex_roadmap(root, repo, codex_mode="required")
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            fake_codex = _FakeAvailableCodex()
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    no_codex=False,
+                    autonomous=True,
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+            )
+            # The FakeOpencodeRunner is defined in test_result_guard_retry
+            # but uses the same simple signature. Inline a minimal copy.
+            self._run_with_missing(orch, roadmap)
+            with state.connect() as conn:
+                types = [
+                    row["type"]
+                    for row in conn.execute(
+                        "SELECT type FROM events WHERE roadmap_id='codex-takeover-test' "
+                        "AND task_id='CT-1' ORDER BY seq"
+                    ).fetchall()
+                ]
+                takeover_events = [
+                    row
+                    for row in conn.execute(
+                        "SELECT payload_json FROM events WHERE roadmap_id='codex-takeover-test' "
+                        "AND task_id='CT-1' AND type='task.codex_takeover_queued'"
+                    ).fetchall()
+                ]
+            self.assertIn("task.codex_takeover_queued", types)
+            self.assertEqual(len(takeover_events), 1, msg=types)
+            payload = json.loads(takeover_events[0]["payload_json"])
+            self.assertEqual(payload.get("reason"), MISSING_RESULT_CATEGORY)
+            self.assertEqual(payload.get("after_attempt"), 2)
+            self.assertEqual(payload.get("next_attempt"), 3)
+
+    def _run_with_missing(self, orch, roadmap) -> None:
+        """Inline a tiny executor that always prints a missing marker."""
+        from agentops.models import RunnerResult
+        from agentops.runners import utc_now
+
+        class _AlwaysMissing:
+            name = "fake-missing"
+
+            def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[no-untyped-def]
+                stdout_path = artifact_dir / "executor.stdout.log"
+                stderr_path = artifact_dir / "executor.stderr.log"
+                stdout_path.write_text("no marker here\n", encoding="utf-8")
+                stderr_path.write_text("", encoding="utf-8")
+                return RunnerResult(
+                    exit_code=0,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    started_at=utc_now(),
+                    ended_at=utc_now(),
+                )
+
+        # Replace the opencode runner with the always-missing fake.
+        orch._injected_opencode_runner = _AlwaysMissing()  # type: ignore[attr-defined]
+        orch.run_roadmap(roadmap)
+
+    def test_codex_takeover_does_not_fire_when_no_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            (repo / "out.txt").write_text("ok\n", encoding="utf-8")
+            _git(repo, "add", "out.txt")
+            _git(repo, "commit", "-m", "seed out")
+            roadmap_path = self._build_codex_roadmap(root, repo, codex_mode="required")
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            unavailable = _FakeUnavailableCodex()
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    no_codex=True,
+                    autonomous=True,
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                opencode_runner=None,
+                review_service=unavailable,
+            )
+            self._run_with_missing(orch, roadmap)
+            with state.connect() as conn:
+                types = [
+                    row["type"]
+                    for row in conn.execute(
+                        "SELECT type FROM events WHERE roadmap_id='codex-takeover-test' "
+                        "AND task_id='CT-1' ORDER BY seq"
+                    ).fetchall()
+                ]
+            self.assertNotIn("task.codex_takeover_queued", types)
+            self.assertIn("task.result_guard_blocked", types)
+            rows = {r["id"]: r["state"] for r in state.task_rows("codex-takeover-test")}
+            self.assertEqual(rows["CT-1"], "blocked")
+
+    def test_codex_takeover_does_not_fire_when_not_autonomous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            (repo / "out.txt").write_text("ok\n", encoding="utf-8")
+            _git(repo, "add", "out.txt")
+            _git(repo, "commit", "-m", "seed out")
+            roadmap_path = self._build_codex_roadmap(root, repo, codex_mode="required")
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    no_codex=True,
+                    autonomous=False,
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=_FakeAvailableCodex(),
+            )
+            self._run_with_missing(orch, roadmap)
+            with state.connect() as conn:
+                types = [
+                    row["type"]
+                    for row in conn.execute(
+                        "SELECT type FROM events WHERE roadmap_id='codex-takeover-test' "
+                        "AND task_id='CT-1' ORDER BY seq"
+                    ).fetchall()
+                ]
+            self.assertNotIn("task.codex_takeover_queued", types)
+            self.assertIn("task.result_guard_blocked", types)
+
+
 if __name__ == "__main__":
     unittest.main()
