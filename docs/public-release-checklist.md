@@ -169,11 +169,12 @@ output for each of the commands below.
 * [ ] No new telemetry, analytics, or hosted / cloud
       dependency has been added.
 
-## 6. Commands to run before switching the repo public
+## 6. Reusable release validation commands
 
-Run each command from the repository root, on the release
-branch, with a clean working tree. Attach the output to the
-release PR.
+For future releases or public-facing documentation changes,
+run each command from the repository root on the release branch
+with a clean working tree. Attach the output to the release PR
+or PR description.
 
 ```bash
 # Sensitive-term sweep (should return nothing in the diff).
@@ -210,10 +211,9 @@ gitleaks detect --no-banner --source .
 trufflehog filesystem .
 ```
 
-If any command returns a non-zero exit code or any non-empty
-match, the release is **not** ready and the issue must be
-fixed in the release branch before the repo is switched
-public.
+If any command returns a non-zero exit code or any unexpected
+match, the release or documentation PR is **not** ready and the
+issue must be fixed before merge.
 
 ## 7. Final manual steps (historical — used at v0.1.0)
 
