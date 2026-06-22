@@ -183,6 +183,105 @@ class FrontendMonitorHistoryTests(unittest.TestCase):
         self.assertNotIn('[truncated, showing tail]\n', html)
 
 
+class FrontendCockpitTests(unittest.TestCase):
+    """Operator-cockpit frontend contracts: the overview strip, work queue,
+    selected-detail pane, copy affordances, and task filter render into the
+    HTML. Pure ``render_index_html`` substring assertions, mirroring the
+    existing :class:`FrontendBundlesTests` pattern.
+    """
+
+    def test_render_has_cockpit_overview_anchors(self) -> None:
+        html = web.render_index_html()
+        for element_id in (
+            "cockpit-overview",
+            "overview-health",
+            "overview-running",
+            "overview-attention",
+            "overview-latest-error",
+            "overview-next-action",
+            "overview-next-action-text",
+            "overview-next-action-copy",
+        ):
+            self.assertIn(element_id, html)
+
+    def test_render_has_work_queue_and_selected_detail(self) -> None:
+        html = web.render_index_html()
+        for element_id in (
+            "work-queue",
+            "work-queue-attention",
+            "work-queue-running",
+            "work-queue-settled",
+            "work-queue-empty",
+            "selected-detail",
+            "detail-run-pane",
+            "detail-task-pane",
+            "detail-run-id",
+            "detail-run-suggested",
+            "detail-task-id",
+            "detail-tab-run",
+            "detail-tab-task",
+        ):
+            self.assertIn(element_id, html)
+
+    def test_render_has_copy_and_filter_affordances(self) -> None:
+        html = web.render_index_html()
+        # Copy buttons carry a copy-only contract: they reference text to
+        # copy, never a command to execute.
+        self.assertIn("copy-btn", html)
+        self.assertIn("data-copy-text", html)
+        self.assertIn("data-copy-target", html)
+        # The task explorer ships with an attention-first filter default.
+        self.assertIn("task-filter", html)
+        self.assertIn("Needs attention (default)", html)
+        self.assertIn("renderCockpitOverview", html)
+        self.assertIn("renderWorkQueue", html)
+
+    def test_render_keeps_reliability_and_admin_anchors(self) -> None:
+        html = web.render_index_html()
+        # The cockpit consumes reliability_summary inside /api/admin; the
+        # full reliability card and the admin panel must still render.
+        self.assertIn("Executor reliability", html)
+        self.assertIn("/api/reliability", html)
+        self.assertIn("renderReliability", html)
+        self.assertIn("Admin / Operator panel", html)
+        self.assertIn("/api/admin", html)
+
+    def test_render_introduces_no_forbidden_endpoints(self) -> None:
+        html = web.render_index_html()
+        for forbidden in (
+            "/api/exec",
+            "/api/shell",
+            "/api/command",
+            "/api/run_command",
+            "/api/codex",
+        ):
+            self.assertNotIn(forbidden, html)
+        # The CSS block must not contain the word "shell".
+        css = html.lower().split("<style>", 1)[1].split("</style>", 1)[0]
+        self.assertNotIn("shell", css)
+
+    def test_render_has_task_detail_index_and_commands(self) -> None:
+        html = web.render_index_html()
+        # Non-attention tasks get a rich detail pane backed by a client-side
+        # task index populated from /api/status, plus copy-only CLI hints.
+        self.assertIn("taskById", html)
+        self.assertIn("detail-task-commands", html)
+        self.assertIn("agentops logs ", html)
+        self.assertIn("agentops task-tail ", html)
+        self.assertIn("agentops timeline --task ", html)
+
+    def test_render_has_stable_refresh_and_heavy_gating(self) -> None:
+        html = web.render_index_html()
+        # refreshAll renders the admin snapshot before tasks so the
+        # attention-first task filter does not flicker empty each tick.
+        self.assertIn("refreshAll", html)
+        self.assertIn("isDetailsOpen", html)
+        # Heavy timeline/usage/reliability cards are gated on their
+        # <details> being open and render on toggle.
+        self.assertIn("usage-card", html)
+        self.assertIn('addEventListener("toggle"', html)
+
+
 class WebSafetyTests(unittest.TestCase):
     def test_is_loopback_host(self) -> None:
         self.assertTrue(web.is_loopback_host("127.0.0.1"))

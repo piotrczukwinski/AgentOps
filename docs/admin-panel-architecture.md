@@ -394,3 +394,56 @@ runner probe.
 
 The card auto-refreshes every 3 seconds alongside the rest of
 the dashboard.
+
+## 11. Operator cockpit rendering
+
+The dashboard is laid out as an **operator cockpit**: the first
+screen answers "what should I do next?" before any raw table.
+The cockpit is a pure frontend layer over the existing endpoints
+— it introduces **no new endpoints** and **no new fetches** for
+the overview, because the `timeline_summary`,
+`usage_summary`, and `reliability_summary` blocks are already
+embedded in `GET /api/admin`.
+
+The cockpit is composed of:
+
+* A **sticky header** (health, running, attention, latest-error
+  counts) and a five-card **overview strip** (Health, Running,
+  Attention, Latest error, Next action). The Attention card folds
+  in the `reliability_summary` counters (`result_guard_blocked`,
+  `stale_pid`, `needs_operator`); the Next-action card surfaces a
+  copyable CLI hint taken first from
+  `reliability_summary.latest_attention.first_cli` and then from
+  `attention_needed`.
+* A **work queue** beside a **selected-detail** pane. The work
+  queue buckets `attention_needed` (needs attention), in-flight
+  operator runs, and recently-settled runs. Clicking a row selects
+  it into the detail pane, which reuses the existing run/task
+  monitors (`operator-tail`, `Start live`, `Load logs`,
+  `Task live`). The task detail is backed by a client-side
+  `taskById` index populated from `GET /api/status`, so
+  non-attention tasks also show a rich detail (state, attempt,
+  risk, updated, plus copy-only `agentops logs`,
+  `agentops task-tail`, `agentops timeline --task` hints).
+* A **task explorer** whose filter defaults to "Needs attention".
+* **Collapsed reference cards** (Run timeline, Executor
+  reliability, Model usage, Admin tables, Operator runs monitor,
+  Bundles, History) rendered inside native `<details>` elements.
+
+Refresh model (`refreshAll`):
+
+* The auto-refresh tick renders the `/api/admin` snapshot
+  **first** (which populates the cockpit attention set), then
+  renders `GET /api/status` tasks so the attention-first task
+  filter does not flicker empty each tick.
+* The operator's current selection and any live `EventSource`
+  streams are never reset by a refresh.
+* The heavy timeline / usage / reliability cards are only polled
+  when their `<details>` is open; they render on first open via a
+  `toggle` listener and otherwise stay idle.
+
+Safety properties are unchanged: copy buttons write to the
+clipboard only, no suggested action is ever executed, and the
+cockpit reads only from the already-safe `/api/admin`,
+`/api/status`, `/api/operator-runs`, `/api/usage`, `/api/timeline`,
+and `/api/reliability` payloads.
