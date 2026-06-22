@@ -145,6 +145,14 @@ After T7, `agentops serve` is the Phase 1 admin panel.
 - Budget/cost ledger, parallel scheduling, remote workers, GitHub PR creation.
 - Codex runs from the UI (the UI stays `--no-codex`, matching the existing
   safety default; Codex runs are CLI-only).
+- A POST endpoint that triggers `agentops task-retry` from the web
+  UI (issue #45). The Roadmap launcher adds an explicit **resume**
+  checkbox that toggles the same internal path as
+  `agentops run --roadmap <path> --resume`; the cockpit surfaces
+  copy-only `agentops task-retry` / `agentops run --resume` hints
+  next to a selected blocked task but never executes them on the
+  operator's behalf. The CLI is the only place that mutates task
+  state for retry.
 
 ## 7. Operator-panel snapshot (`/api/admin`)
 

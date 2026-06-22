@@ -173,6 +173,7 @@ def build_run_command(
     max_tasks: int | None = None,
     db_path: str | Path | None = None,
     python_executable: str | None = None,
+    resume: bool = False,
 ) -> list[str]:
     """Build the controlled subprocess argv used by /api/run.
 
@@ -191,6 +192,13 @@ def build_run_command(
     * ``max_tasks`` (int, optional) — appends ``--max-tasks <int>`` only when
       a positive integer is passed. Booleans are explicitly rejected because
       ``bool`` is a subclass of ``int`` in Python.
+    * ``resume`` (bool, default ``False``) — appends ``--resume`` when truthy.
+      A resume run skips terminal/decision states (accepted / pushed /
+      merged / skipped / blocked / awaiting_review / awaiting_human / failed
+      / merge_failed) and recovers in-flight tasks; without ``--resume`` a
+      ``run`` invocation always starts fresh. The web UI passes ``resume``
+      only when the operator explicitly opts in via the
+      ``roadmap-resume`` checkbox (issue #45).
     """
     resolved = validate_roadmap_path(str(roadmap_path))
     py = python_executable or sys.executable
@@ -211,6 +219,8 @@ def build_run_command(
         and max_tasks > 0
     ):
         argv.extend(["--max-tasks", str(int(max_tasks))])
+    if resume:
+        argv.append("--resume")
     return argv
 
 
@@ -1813,6 +1823,8 @@ ADMIN_RECOMMENDED_COMMANDS: tuple[str, ...] = (
     "agentops operator-retry <run-id>",
     "agentops task-tail <task-id> --lines 200",
     "agentops logs <task-id>",
+    "agentops task-retry <task-id> --roadmap <path>",
+    "agentops run --roadmap <path> --resume",
     "agentops pr-loop <pr-number> --dry-run",
 )
 
@@ -2048,13 +2060,26 @@ def _admin_attention_for_task(task_row: dict[str, Any]) -> dict[str, Any] | None
         first_cli = first_cli.replace("<task-id>", task_id)
     except Exception:  # noqa: BLE001 - never raise
         first_cli = "agentops logs <task-id>"
-    return {
+    payload: dict[str, Any] = {
         "kind": "task",
         "task_id": task_id,
         "roadmap_id": roadmap_id,
         "state": state,
         "first_cli": first_cli,
     }
+    # Issue #45: when a blocked task is retryable (state in the
+    # default-openable set), surface a copyable `agentops task-retry`
+    # hint *in addition* to the existing logs hint so the operator
+    # does not have to read the runbook to recover the task. The
+    # dashboard renders this as plain text only; the web UI never
+    # POSTs to a task-retry endpoint.
+    if state in {"blocked", "failed", "validation_failed", "merge_failed", "awaiting_human"}:
+        safe = _safe_id_component(task_id)
+        if safe is not None:
+            payload["task_retry_hint"] = (
+                f"agentops task-retry {safe} --roadmap <path>"
+            )
+    return payload
 
 
 def _admin_pr_loop_root() -> Path:
@@ -3266,6 +3291,15 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             return
         autonomous = autonomous_raw
 
+        resume_raw = payload.get("resume", False)
+        if not isinstance(resume_raw, bool):
+            self._send_json(
+                {"started": False, "error": "resume must be a boolean"},
+                status=400,
+            )
+            return
+        resume = resume_raw
+
         reviewer_raw = payload.get("reviewer")
         reviewer: str | None = None
         if reviewer_raw is not None:
@@ -3309,6 +3343,7 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
                 reviewer=reviewer,
                 max_tasks=max_tasks,
                 db_path=self._server_state().state.db_path,
+                resume=resume,
             )
         except RoadmapPathError as exc:
             self._send_json({"started": False, "error": str(exc)}, status=400)
@@ -3321,7 +3356,15 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"started": False, "error": f"failed to start: {exc}"}, status=500)
             return
         run_id = self._server_state().remember_run(str(roadmap), proc, argv)
-        self._send_json({"started": True, "run_id": run_id, "pid": proc.pid, "argv": argv})
+        self._send_json(
+            {
+                "started": True,
+                "run_id": run_id,
+                "pid": proc.pid,
+                "argv": argv,
+                "resume": resume,
+            }
+        )
 
 
 def _safe_subprocess_env(*, no_codex: bool = False) -> dict[str, str]:
@@ -3578,8 +3621,15 @@ INDEX_TEMPLATE = """<!doctype html>
       <button id="plan-btn">Plan</button>
       <button id="run-btn">Run with Codex review</button>
       <label><input id="run-autonomous" type="checkbox" /> autonomous</label>
+      <label><input id="roadmap-resume" type="checkbox" /> resume existing roadmap state</label>
       <label>reviewer: <select id="run-reviewer"><option value="codex" selected>codex</option><option value="heuristic">heuristic</option><option value="">(roadmap default)</option></select></label>
       <label>max-tasks: <input id="run-max-tasks" type="number" min="1" placeholder="(none)" size="4" /></label>
+    </div>
+    <div class="muted section-note" id="roadmap-resume-help" style="margin:4px 0 0;">
+      Fresh run starts from the earliest unfinished task. Resume skips accepted/merged work and recovers interrupted in-flight tasks.
+    </div>
+    <div class="muted" id="roadmap-resume-warning" style="margin:4px 0 0;display:none;">
+      This will start a fresh run, not resume existing state.
     </div>
     <div id="plan-output" class="muted" style="margin-top:8px;"></div>
   </section>
@@ -3835,6 +3885,8 @@ INDEX_TEMPLATE = """<!doctype html>
   const bundleValidateOutput = $("bundle-validate-output");
   const bundleUploadBtn = $("bundle-upload-btn");
   const runAutonomous = $("run-autonomous");
+  const roadmapResume = $("roadmap-resume");
+  const roadmapResumeWarning = $("roadmap-resume-warning");
   const runReviewer = $("run-reviewer");
   const runMaxTasks = $("run-max-tasks");
   const monitorRunInput = $("monitor-run-input");
@@ -3958,6 +4010,38 @@ INDEX_TEMPLATE = """<!doctype html>
     if (explicit) return explicit;
     const opt = roadmapSelect.options[roadmapSelect.selectedIndex];
     return opt && opt.value ? opt.value : "";
+  }
+
+  // Show a copy-only warning when a selected roadmap has recorded
+  // state and the operator has not ticked "resume existing roadmap
+  // state". Pure DOM logic; never invokes a fetch and never executes
+  // anything (issue #45: web launcher accidentally restarted from the
+  // earliest unfinished task instead of resuming).
+  function updateResumeWarning(tasks) {
+    if (!roadmapResumeWarning) return;
+    const roadmap = getRoadmap();
+    const resumeOn = !!(roadmapResume && roadmapResume.checked);
+    if (resumeOn) {
+      roadmapResumeWarning.style.display = "none";
+      return;
+    }
+    if (!roadmap || !Array.isArray(tasks) || !tasks.length) {
+      roadmapResumeWarning.style.display = "none";
+      return;
+    }
+    const hasState = tasks.some(function (t) {
+      return t && t.roadmap_id && String(t.roadmap_id) === String(extractRoadmapId(roadmap))
+        && t.state && t.state !== "skipped";
+    });
+    roadmapResumeWarning.style.display = hasState ? "block" : "none";
+  }
+
+  function extractRoadmapId(path) {
+    const p = String(path || "");
+    const slash = p.lastIndexOf("/");
+    const base = slash >= 0 ? p.substring(slash + 1) : p;
+    const dot = base.lastIndexOf(".");
+    return dot > 0 ? base.substring(0, dot) : base;
   }
 
   async function fetchJson(path, options) {
@@ -4300,6 +4384,23 @@ INDEX_TEMPLATE = """<!doctype html>
             "agentops task-tail " + id + " --lines 200",
             "agentops timeline --task " + id,
           ];
+          // Issue #45: when the task is in a retryable state, add a
+          // copy-only `agentops task-retry` hint and the post-retry
+          // `agentops run --resume` command. The web UI never POSTs
+          // to a task-retry endpoint; both hints are plain text.
+          const retryableStates = {
+            blocked: true,
+            failed: true,
+            validation_failed: true,
+            merge_failed: true,
+            awaiting_human: true,
+          };
+          const taskState = t && t.state ? String(t.state) : "";
+          if (retryableStates[taskState]) {
+            cmds.push("agentops task-retry " + id + " --roadmap <path>");
+            cmds.push("agentops task-retry " + id + " --roadmap <path> --include-dependents");
+            cmds.push("agentops run --roadmap <path> --resume");
+          }
           detailTaskCommands.innerHTML = cmds.map(function (c) {
             return '<div style="margin-top:4px;"><code style="background:var(--subtle);padding:1px 5px;border-radius:4px;word-break:break-all;">'
               + escapeHtml(c) + "</code>"
@@ -4489,6 +4590,8 @@ INDEX_TEMPLATE = """<!doctype html>
     roadmapSelect.innerHTML = html;
   }
 
+  let lastStatusTasks = [];
+
   async function refresh() {
     const statusRes = await fetchJson("/api/status");
     if (!statusRes.ok) {
@@ -4499,8 +4602,10 @@ INDEX_TEMPLATE = """<!doctype html>
     statusPill.className = "pill";
     statusPill.innerHTML = '<span class="status-dot ok"></span> ok';
     dbPath.textContent = "db: " + statusRes.data.db_path;
-    renderTasks(statusRes.data.tasks);
+    lastStatusTasks = Array.isArray(statusRes.data.tasks) ? statusRes.data.tasks : [];
+    renderTasks(lastStatusTasks);
     renderEvents(statusRes.data.events);
+    updateResumeWarning(lastStatusTasks);
 
 
   const runsRes = await fetchJson("/api/runs");
@@ -5071,6 +5176,21 @@ async function tailOperatorRun() {
       monitorRunInput.value = runId;
     });
   }
+  if (roadmapResume) {
+    roadmapResume.addEventListener("change", function () {
+      updateResumeWarning(lastStatusTasks);
+    });
+  }
+  if (roadmapInput) {
+    roadmapInput.addEventListener("input", function () {
+      updateResumeWarning(lastStatusTasks);
+    });
+  }
+  if (roadmapSelect) {
+    roadmapSelect.addEventListener("change", function () {
+      updateResumeWarning(lastStatusTasks);
+    });
+  }
   if (operatorTailBtn) operatorTailBtn.addEventListener("click", tailOperatorRun);
   $("plan-btn").addEventListener("click", async function () {
     const roadmap = getRoadmap();
@@ -5084,17 +5204,21 @@ async function tailOperatorRun() {
   $("run-btn").addEventListener("click", async function () {
     const roadmap = getRoadmap();
     if (!roadmap) { planOutput.textContent = "select or type a roadmap first"; return; }
-    const body = { roadmap: roadmap, no_codex: false, autonomous: !!(runAutonomous && runAutonomous.checked) };
+    const resumeChecked = !!(roadmapResume && roadmapResume.checked);
+    const body = { roadmap: roadmap, no_codex: false, autonomous: !!(runAutonomous && runAutonomous.checked), resume: resumeChecked };
     if (runReviewer && runReviewer.value) body.reviewer = runReviewer.value;
     if (runMaxTasks && runMaxTasks.value) {
       const n = Number(runMaxTasks.value);
       if (n > 0) body.max_tasks = Math.floor(n);
     }
-    planOutput.textContent = "starting run with Codex review...";
+    planOutput.textContent = resumeChecked
+      ? "starting resumed run (skipping accepted/merged tasks)..."
+      : "starting run with Codex review...";
     const res = await postJson("/api/run", body);
     if (!res.ok) { planOutput.className = "err"; planOutput.textContent = res.data.error || "run failed"; return; }
     planOutput.className = "muted";
-    planOutput.textContent = "started run_id=" + res.data.run_id + " pid=" + res.data.pid;
+    planOutput.textContent = "started run_id=" + res.data.run_id + " pid=" + res.data.pid
+      + (resumeChecked ? " (resume)" : " (fresh run)");
     refresh();
   });
   $("logs-btn").addEventListener("click", async function () {

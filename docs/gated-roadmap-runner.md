@@ -473,10 +473,15 @@ agentops run --roadmap <path>             # run end-to-end
 agentops run --roadmap <path> --autonomous
 agentops run --roadmap <path> --no-codex
 agentops run --roadmap <path> --reviewer codex
+agentops run --roadmap <path> --resume    # skip accepted/merged, recover in-flight
 agentops run --roadmap <path> --max-tasks 5
 agentops review-queue                     # tasks awaiting review/human
 agentops review <task_id> --roadmap <path>
 agentops decide <task_id> --roadmap <path> --verdict ACCEPT|REQUEST_CHANGES|BLOCK
+agentops task-retry <task_id> --roadmap <path>            # issue #45, operator recovery
+agentops task-retry <task_id> --roadmap <path> --include-dependents
+agentops task-retry <task_id> --roadmap <path> --dry-run --json
+agentops task-tail <task_id> --follow
 agentops status
 agentops logs <task_id>
 agentops doctor
@@ -485,6 +490,21 @@ agentops doctor
 `decide` is the operator escape hatch: when a task lands in
 `awaiting_review` or `awaiting_human`, the operator can apply a verdict
 from the command line. The state machine advances accordingly.
+
+`task-retry` is the operator escape hatch for **blocked retryable**
+tasks (issue #45). The active run path already retries
+`missing_result` / `template_result` while the per-task attempt
+budget remains; when the budget is exhausted the task lands in a
+terminal state (`blocked` / `awaiting_review` / `awaiting_human` /
+`failed` / ...) and the active path stops touching it. `task-retry`
+flips the task state back to `READY` (or `REPAIR_PROMPT_READY` for
+the result-guard / empty-diff family) and records
+`task.operator_retry_requested` / `task.reopened` events. The
+next `agentops run --roadmap <path> --resume` actually re-runs the
+task.
+
+See `docs/failure-modes.md#operator-initiated-task-retry--reopen-issue-45`
+for the retryable / non-retryable matrix and the safety guarantees.
 
 ## State DB
 

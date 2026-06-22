@@ -64,8 +64,15 @@ python -m agentops serve --port 9000
 - Run `agentops plan` on a selected roadmap path, with the same lint logic
   the CLI uses (offline, model-free, no worktree creation).
 - Start `agentops run --roadmap <path> --no-codex` as a background
-  subprocess and report the active `pid` and `argv`.
+  subprocess and report the active `pid` and `argv`. Issue #45: the
+  Roadmap launcher ships an explicit **resume** checkbox so the
+  operator does not accidentally restart the earliest unfinished
+  task instead of resuming accepted/merged work.
 - Show a task's recorded artifacts and recent events.
+- Surface copy-only `agentops task-retry` and
+  `agentops run --resume` hints next to a selected blocked task
+  (issue #45). The cockpit never executes the hints; it only
+  writes them to the clipboard.
 - Auto-refresh every 3 seconds, with a manual refresh button.
 
 ## What the UI cannot do
@@ -78,6 +85,9 @@ python -m agentops serve --port 9000
 - It cannot push to git or open a pull request (use the CLI).
 - It cannot be used without the local SQLite state file
   (`.agentops/state.sqlite`).
+- It cannot POST to a `task-retry` endpoint. The cockpit surfaces
+  `agentops task-retry <task-id> --roadmap <path>` as a copy-only
+  hint and the operator runs it in a terminal.
 
 ## Endpoints
 
@@ -94,10 +104,18 @@ python -m agentops serve --port 9000
 | GET    | `/api/logs?task_id=...`    | Task row, artifacts, recent events. |
 | GET    | `/api/artifacts?task_id=...` | Artifact rows for a task. |
 | POST   | `/api/plan`                | `{"roadmap": "..."}` → runs `agentops plan` lint. |
-| POST   | `/api/run`                 | `{"roadmap": "...", "no_codex": true}` → starts background run. |
+| POST   | `/api/run`                 | `{"roadmap": "...", "no_codex": true, "resume": false}` → starts background run. `resume=true` mirrors `agentops run --resume`. |
 
 `/api/plan` never creates worktrees and never calls models.
 `/api/run` always passes `--no-codex`; `no_codex=false` is rejected.
+`resume` is a boolean defaulting to `false`. When true, the same
+safe internal path as `agentops run --roadmap <path> --resume`
+is invoked: accepted / merged / blocked / awaiting_review tasks
+are skipped, in-flight tasks are recovered to `ready`, and the
+roadmap continues from the persisted state. The Roadmap launcher
+checkbox (`roadmap-resume`) drives this field; without an explicit
+opt-in the cockpit starts a fresh run so a single accidentally
+unchecked box cannot silently undo a half-finished roadmap.
 
 
 ## Operator-run monitor (read-only)

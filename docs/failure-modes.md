@@ -137,6 +137,112 @@ contract.
      branch manually (squash the accepted task commits) and
      re-run the affected tasks.
 
+## Operator-initiated task retry / reopen (issue #45)
+
+The gated runner's **active** path retries missing / template
+`AGENTOPS_RESULT_JSON` while the per-task attempt budget remains
+(`task.result_guard_retry_queued`). When the budget is exhausted
+the task transitions to `blocked` / `awaiting_review` /
+`awaiting_human` and the active path stops touching it. Operator
+recovery for those terminal states is the dedicated
+`agentops task-retry <task-id> --roadmap <path>` CLI.
+
+Hard guarantees (issue #45, `agentops/task_recovery.py`):
+
+* **No infinite retries.** `task-retry` is operator-initiated and
+  the active run path remains the only auto-retry. The bounded
+  Codex takeover for `missing_result` / `template_result`
+  exhaustion fires once per task (`codex_takeover_used` guard).
+* **No automatic retries from the web UI.** The cockpit surfaces
+  copy-only `agentops task-retry` / `agentops run --resume`
+  hints next to a selected blocked task. No POST endpoint is
+  added in this PR.
+* **Accepted / pushed / merged tasks are protected.** Reopening
+  those requires `--force` and the CLI prints a scary warning.
+  Tests in `tests/test_task_retry.py` pin the default-rejection
+  contract.
+* **Policy / secret / branch / file-scope safety gates are
+  untouched.** `task-retry` only flips the task state and writes
+  a deterministic `repair.prompt.md`; the executor re-run is
+  driven by the next `agentops run --resume` invocation through
+  the existing orchestrator / policy pipeline.
+
+### Allowed by default
+
+| State | Behavior |
+| --- | --- |
+| `blocked` | reopen to `REPAIR_PROMPT_READY` if the latest failure category is in the result-guard / empty-diff family; otherwise reopen to `READY`. |
+| `failed` | reopen to `READY`. |
+| `validation_failed` | reopen to `READY`. |
+| `merge_failed` | reopen to `READY`. |
+| `awaiting_human` | reopen to `READY`. |
+| `awaiting_review` | reopen only when the latest failure category is `codex_unavailable` or `review_unavailable` (real reviewer verdicts must be acted on via `agentops decide`). |
+
+### Refused without `--force` (reopen requires explicit operator override)
+
+| State | Behavior |
+| --- | --- |
+| `accepted`, `pushed`, `merged` | task already landed on the integration branch; reopening re-runs work the run summary already counted as `passed`. |
+| `awaiting_review` with a real reviewer verdict | `agentops decide <task> --verdict ACCEPT\|REQUEST_CHANGES\|BLOCK` is the correct path. |
+| Non-retryable failure category (`forbidden_file`, `forbidden_glob`, `secret_detected`, `protected_branch`, `unsafe_merge`, `unsafe_push`, `policy_failed`, `budget_exceeded`, `validation_failed` after exhausted budget) | fix the underlying issue, then retry. |
+
+### Retryable failure categories
+
+`missing_result`, `template_result`, `empty_diff`, `files.empty_diff`,
+`executor_no_output_startup`, `no_output_startup`,
+`executor_idle_timeout`, `idle_timeout`, `transient_failure`,
+`transient_network`, `rate_limit`, `429`, `5xx`. Anything else
+falls through to the conservative default (reopen to `READY`).
+
+### Bounded Codex takeover for result-guard exhaustion
+
+When the active run exhausts the result-guard retry budget
+(`missing_result` / `template_result`) the orchestrator queues a
+single bounded Codex takeover attempt instead of terminal-blocking,
+mirroring the existing `empty_diff_codex_takeover` pattern. The
+takeover fires only when **all** of these hold:
+
+* `self.options.autonomous` is true (operator opt-in);
+* `task.executor != "codex"` (no point re-taking over the same
+  executor);
+* `task.review.codex in {"required", "auto", "milestone_only"}`;
+* `not self.options.no_codex` (operator did not explicitly disable
+  Codex);
+* `codex_service.is_available()` (binary on PATH).
+
+The takeover fires **once per task** (guarded by `codex_takeover_used`)
+and writes a `task.codex_takeover_queued` roadmap event with payload
+`{"reason": "missing_result" | "template_result", "after_attempt":
+attempt_no, "next_attempt": attempt_no + 1}`. Shell executors are
+exempt; their result is the exit code, not the marker.
+
+### Worked example
+
+```bash
+# Blocked retryable task (missing result after budget exhausted):
+agentops task-retry EX-001-OPERATOR-ACCEPTANCE-MATRIX \
+  --roadmap examples/roadmaps/demo-shell.json \
+  --reason "manual recovery after model API outage"
+
+# Reset blocked task and its skipped dependents:
+agentops task-retry EX-001-OPERATOR-ACCEPTANCE-MATRIX \
+  --roadmap examples/roadmaps/demo-shell.json \
+  --include-dependents
+
+# Dry-run preview:
+agentops task-retry EX-001-OPERATOR-ACCEPTANCE-MATRIX \
+  --roadmap examples/roadmaps/demo-shell.json \
+  --dry-run --json
+
+# Resume the run after the reopen:
+agentops run --roadmap examples/roadmaps/demo-shell.json --resume
+```
+
+The CLI prints `Next: agentops run --roadmap <path> --resume` so the
+operator can copy / paste it into a terminal. The cockpit surfaces
+the same hint as a copy-only text block on the selected-task detail
+pane; no command execution happens server-side.
+
 ## No-output startup stall
 
 * **Category:** `no_output_startup`

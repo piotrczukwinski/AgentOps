@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import __version__
 from .artifacts import safe_name
@@ -21,6 +21,9 @@ from .review import (
     HeuristicReviewer,
 )
 from .state import StateStore
+
+if TYPE_CHECKING:
+    from .task_recovery import TaskRetryResult
 
 DEFAULT_DB = Path(".agentops/state.sqlite")
 
@@ -760,6 +763,82 @@ def build_parser() -> argparse.ArgumentParser:
     decide_cmd.add_argument("--safe-to-merge", dest="safe_to_merge", action="store_true", default=True)
     decide_cmd.add_argument("--no-safe-to-merge", dest="safe_to_merge", action="store_false")
 
+    # Operator-initiated task-level retry / reopen (issue #45).
+    # Mirrors the safety guarantees of ``decide``: refuses to reopen
+    # accepted/pushed/merged/awaiting_review tasks without --force,
+    # preserves every previous attempt and artifact, and never invokes
+    # an executor itself. The actual re-run is driven by the next
+    # ``agentops run --resume`` invocation.
+    task_retry_cmd = sub.add_parser(
+        "task-retry",
+        help="Operator-initiated retry/reopen for a single roadmap task.",
+        description=(
+            "Reopen a single roadmap task without editing the SQLite state DB. "
+            "Allowed by default for: blocked, failed, validation_failed, "
+            "merge_failed, awaiting_human (when the latest failure category is "
+            "retryable). Refused without --force for: accepted, pushed, merged, "
+            "awaiting_review (unless the latest reason is reviewer-unavailable), "
+            "and any task whose latest failure category is non-retryable "
+            "(forbidden file, secret detected, protected branch, unsafe merge, "
+            "policy failure, budget exceeded). All previous attempts, logs, and "
+            "artifacts are preserved. The actual executor re-run is driven by "
+            "the next `agentops run --roadmap <path> --resume` invocation. "
+            "Tracks issue #45 (no-stall roadmap recovery)."
+        ),
+    )
+    task_retry_cmd.add_argument("task_id", help="Task id to retry/reopen.")
+    task_retry_cmd.add_argument(
+        "--roadmap",
+        required=True,
+        help="Path to the roadmap JSON/YAML file the task belongs to.",
+    )
+    task_retry_cmd.add_argument(
+        "--reason",
+        default=None,
+        help="Free-form operator note recorded on the task.reopened event payload.",
+    )
+    task_retry_cmd.add_argument(
+        "--include-dependents",
+        action="store_true",
+        help=(
+            "Reset every dependent task that was skipped because this task "
+            "was not satisfied. Only tasks in state=skipped with a "
+            "dependency-related skip reason are reset; accepted / merged / "
+            "pushed dependents are never touched."
+        ),
+    )
+    task_retry_cmd.add_argument(
+        "--state",
+        default=None,
+        choices=("ready", "repair_prompt_ready"),
+        help=(
+            "Override the auto-detected new state. Default: REPAIR_PROMPT_READY "
+            "when the latest failure category is retryable (result-guard / "
+            "empty-diff family) and the category is in the repair-prompt "
+            "allowlist; otherwise READY."
+        ),
+    )
+    task_retry_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the decision that would be applied and exit without mutating the SQLite state DB.",
+    )
+    task_retry_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a JSON object with the decision / mutations instead of a human summary.",
+    )
+    task_retry_cmd.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Reopen a task even when the default refuses (accepted / pushed / "
+            "merged / awaiting_review, or a non-retryable failure category). "
+            "Prints a warning before honoring the request. Existing "
+            "attempts/artifacts are still preserved."
+        ),
+    )
+
     # PR repair loop: turn a Codex-style review verdict JSON (matching
     # schemas/review_verdict.schema.json) into a deterministic
     # harness on the PR branch. The final merge is always
@@ -956,6 +1035,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "decide":
             return _cmd_decide(state, args)
+
+        if args.command == "task-retry":
+            return _cmd_task_retry(state, args)
 
         if args.command == "pr-loop":
             return _cmd_pr_loop(args)
@@ -2282,6 +2364,172 @@ def _cmd_decide(state: StateStore, args: argparse.Namespace) -> int:
         {"verdict": "BLOCK", "summary": args.summary, "reviewer": "human"},
     )
     state.event(roadmap.roadmap_id, task.id, attempt["id"], "task.blocked_by_review", {"reviewer": "human"})
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Task-level retry / reopen (issue #45)
+# ---------------------------------------------------------------------------
+
+
+def _print_task_retry_text(result: TaskRetryResult, *, roadmap_path: str, dry_run: bool) -> None:
+    decision = result.decision
+    print(f"task-retry: roadmap={result.roadmap_id} task={result.task_id}")
+    print(f"  previous_state=preserved  new_state={result.new_state}")
+    if decision.failure_category:
+        print(f"  failure_category={decision.failure_category}")
+    if decision.previous_attempt is not None:
+        print(f"  previous_attempt={decision.previous_attempt}")
+    print(f"  rationale: {decision.rationale}")
+    if decision.requires_force:
+        print("  WARNING: --force was used; safety default was overridden.")
+    if decision.warnings:
+        for warning in decision.warnings:
+            print(f"  WARNING: {warning}")
+    if decision.include_dependents:
+        print(f"  dependents_reset={len(result.dependent_ids)}")
+        for dep in result.dependent_ids:
+            print(f"    - {dep}")
+    if result.repair_prompt_path:
+        print(f"  repair_prompt={result.repair_prompt_path}")
+    if dry_run:
+        print("  dry-run: no mutations performed.")
+    else:
+        print(f"  events={','.join(result.events)}")
+    print()
+    print(f"Next: agentops run --roadmap {roadmap_path} --resume")
+    if decision.include_dependents and result.dependent_ids:
+        print("Note: dependent tasks were also reset to ready.")
+
+
+def _task_retry_json_payload(
+    result: TaskRetryResult,
+    *,
+    roadmap_path: str,
+    dry_run: bool,
+) -> dict[str, Any]:
+    return {
+        "roadmap_id": result.roadmap_id,
+        "task_id": result.task_id,
+        "new_state": result.new_state,
+        "previous_attempt": result.decision.previous_attempt,
+        "failure_category": result.decision.failure_category,
+        "rationale": result.decision.rationale,
+        "requires_force": bool(result.decision.requires_force),
+        "warnings": list(result.decision.warnings),
+        "include_dependents": bool(result.decision.include_dependents),
+        "dependent_ids": list(result.dependent_ids),
+        "repair_prompt_path": result.repair_prompt_path,
+        "events": list(result.events),
+        "dry_run": bool(dry_run),
+        "next_command": f"agentops run --roadmap {roadmap_path} --resume",
+    }
+
+
+def _cmd_task_retry(state: StateStore, args: argparse.Namespace) -> int:
+    """Operator-initiated task-level retry / reopen (issue #45)."""
+    from .task_recovery import (
+        TaskRetryResult,
+        apply_task_retry,
+        public_decision_from_state_row,
+    )
+
+    roadmap = _load_roadmap_or_error(args.roadmap)
+    roadmap_path = str(Path(args.roadmap).expanduser().resolve())
+    include_dependents = bool(getattr(args, "include_dependents", False))
+    force = bool(getattr(args, "force", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    decision = public_decision_from_state_row(
+        state,
+        roadmap_id=roadmap.roadmap_id,
+        task_id=str(args.task_id),
+        include_dependents=include_dependents,
+        force=force,
+    )
+
+    # Operator override for the new state. Only applies when the
+    # override is consistent with the decision matrix.
+    override_state = getattr(args, "state", None)
+    if override_state:
+        if not decision.allowed:
+            print(
+                f"task-retry: refusing to apply --state {override_state}: "
+                f"{decision.refusal_reason}",
+                file=sys.stderr,
+            )
+            if bool(getattr(args, "json", False)):
+                print(json.dumps({"allowed": False, "refusal_reason": decision.refusal_reason}, indent=2, sort_keys=True))
+            return 2
+        # Rebuild a decision with the same matrix verdict but the
+        # operator-chosen new state. The original decision already
+        # passed the safety check; we just substitute the target state.
+        from dataclasses import replace as _dc_replace
+
+        decision = _dc_replace(
+            decision,
+            new_state=str(override_state),
+            warnings=decision.warnings + (f"new_state overridden via --state={override_state}",),
+            rationale=(decision.rationale or "") + f" (forced via --state={override_state})",
+        )
+
+    if not decision.allowed:
+        msg = decision.refusal_reason or "refused"
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(
+                {
+                    "allowed": False,
+                    "refusal_reason": msg,
+                    "requires_force": bool(decision.requires_force),
+                    "failure_category": decision.failure_category,
+                },
+                indent=2,
+                sort_keys=True,
+            ))
+        else:
+            print(f"task-retry: {msg}", file=sys.stderr)
+            if decision.requires_force:
+                print("Hint: re-run with --force to override the safety default.", file=sys.stderr)
+        return 2
+
+    if dry_run:
+        # Build a synthetic result so the JSON / text output stays
+        # stable between dry-run and live invocations.
+        fake_result = TaskRetryResult(
+            decision=decision,
+            roadmap_id=roadmap.roadmap_id,
+            task_id=str(args.task_id),
+            new_state=decision.new_state,
+            dependent_ids=(),
+            repair_prompt_path=None,
+            events=("task.operator_retry_requested", "task.reopened"),
+        )
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(_task_retry_json_payload(fake_result, roadmap_path=roadmap_path, dry_run=True), indent=2, sort_keys=True))
+        else:
+            _print_task_retry_text(fake_result, roadmap_path=roadmap_path, dry_run=True)
+        return 0
+
+    # Live mutation. We pass the artifact root so the optional
+    # repair-prompt artefact lands under the same runs/ tree the
+    # orchestrator writes into; the SQLite record_artifact call is
+    # the source of truth even if the file write fails.
+    artifact_root = str((Path(roadmap.repo.path) / ".agentops").expanduser().resolve())
+    result = apply_task_retry(
+        state,
+        roadmap_id=roadmap.roadmap_id,
+        task_id=str(args.task_id),
+        decision=decision,
+        artifact_store=None,
+        artifact_root_for_prompt=artifact_root,
+        attempt_no_for_artifact=decision.previous_attempt,
+        reason_text=str(getattr(args, "reason", None) or "").strip() or None,
+    )
+
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(_task_retry_json_payload(result, roadmap_path=roadmap_path, dry_run=False), indent=2, sort_keys=True))
+    else:
+        _print_task_retry_text(result, roadmap_path=roadmap_path, dry_run=False)
     return 0
 
 

@@ -348,6 +348,39 @@ scope it with you before opening a draft PR.
 * **Risk:** high. A regression in the orchestrator is a
   regression in the whole safety model.
 
+### Task-level retry / reopen (issue #45)
+
+* **Description:** follow-up slices to
+  `agentops task-retry <task-id> --roadmap <path>`. The first
+  slice (already shipped) reopens blocked retryable tasks,
+  resets `--include-dependents`, preserves attempts/artifacts,
+  records `task.operator_retry_requested` / `task.reopened`,
+  and surfaces copy-only cockpit hints. Possible follow-ups:
+  a sibling `agentops task-stop` for in-flight tasks;
+  a wider retryable-category surface for non-shell executors
+  in the active path; per-task `--include-dependents` defaults
+  on the roadmap.
+* **Recommended issue:** open one using the
+  `feature_request` template. New behaviour must add at least
+  one happy-path, one refusal-path, and one dependent-reset
+  test, mirroring `tests/test_task_retry.py`.
+* **Files:** `agentops/task_recovery.py`,
+  `agentops/cli.py`, `agentops/web.py`,
+  `tests/test_task_retry.py`, `tests/test_cli.py`,
+  `tests/test_web.py`,
+  [`docs/failure-modes.md`](failure-modes.md),
+  [`docs/gated-roadmap-runner.md`](gated-roadmap-runner.md).
+* **Tests:** the default-rejection contract (accepted /
+  pushed / merged / non-retryable failure category refuse
+  without `--force`) and the preservation contract (attempts
+  and artifacts are never deleted) are pinned by the existing
+  `tests/test_task_retry.py` suite and must not regress.
+* **Risk:** medium-high. `task-retry` is the operator escape
+  hatch for stuck roadmaps; widening it accidentally so
+  accepted / merged tasks reopen by default would silently
+  undo merged work. Every change must keep the default
+  refusal contract and add a test that proves it.
+
 ### Async / non-blocking executor
 
 * **Description:** run the executor subprocess without
