@@ -336,3 +336,29 @@ CLI (cli.py)
   and [`docs/operator-run-harness.md`](operator-run-harness.md).
 * Looking for the contributor roadmap (good first / medium /
   advanced paths): [`docs/contributor-roadmap.md`](contributor-roadmap.md).
+## Profile registry
+
+### `agentops/profiles.py` and `agentops/codex_cli_runner.py`
+
+The typed model / profile registry (issue #52). The module owns:
+
+* the `ProfileRegistry` / `ExecutorProfile` / `ReviewerProfile` /
+  `ResolvedExecutorProfile` / `ResolvedReviewerProfile` /
+  `ProfileResolution` dataclasses;
+* validation: name regex, secret-shaped key rejection, provider
+  allowlist, reasoning effort allowlist, command template
+  safety (argv-only, registered placeholders);
+* lookup: explicit path → roadmap `profiles_path` → repo-local
+  `~/.agentops/profiles.json` → user-local
+  `$XDG_CONFIG_HOME/agentops/profiles.json` → built-in defaults;
+* resolution: per-task override precedence (CLI > task > roadmap >
+  registry > legacy) and the same shape for the reviewer side.
+
+`agentops/codex_cli_runner.py` owns the Codex CLI transport:
+prompt-file write, argv rendering, log redaction, env scrubbing,
+result shape, and the `shell=False` guarantee. The runner
+explicitly refuses to start a real codex process in unit tests;
+tests inject a fake `codex` binary on disk and point the runner
+at it.
+
+Companion docs: [`docs/model-profile-registry.md`](model-profile-registry.md).

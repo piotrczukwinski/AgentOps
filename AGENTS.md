@@ -201,3 +201,28 @@ one PR:
 If you are unsure about a design call, leave the existing
 behavior alone and open a follow-up issue. Do not silently
 change defaults in a "small" PR.
+
+## Model / profile registry (issue #52)
+
+When generating task prompts, **do not hardcode model details
+into the prompt body**. Pick the executor and reviewer via the
+typed profile registry:
+
+* Executor profiles live in `profiles.executors.<name>` and are
+  selected by setting `task.executor_profile` (or
+  `defaults.executor_profile` at the roadmap level). The
+  preferred default is `minimax-via-codex`.
+* Reviewer profiles live in `profiles.reviewers.<name>` and are
+  selected by setting `task.review.profile` (or
+  `defaults.reviewer_profile` at the roadmap level). The
+  preferred default is `codex-high`.
+* Reasoning effort is `low` / `medium` / `high`; the value lives
+  on the profile (or the override field).
+* The reviewer and the executor always run as **separate
+  processes**; the runner never switches role mid-session.
+
+See [`docs/model-profile-registry.md`](docs/model-profile-registry.md)
+for the full precedence, the validation rules, and the migration
+guide. New CLI commands are `agentops profiles validate|show|resolve`;
+the admin panel exposes the same selection through the Roadmap
+launcher card.

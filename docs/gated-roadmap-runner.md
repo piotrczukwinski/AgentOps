@@ -333,6 +333,29 @@ Resolution order (per task, applied uniformly to `codex_model` and
 
 1. `tasks[].review.model` / `tasks[].review.model_reasoning_effort`
    (per-task override).
+
+### Profile registry (issue #52)
+
+For full control over the executor / reviewer transport, the model
+identifier, the reasoning effort, and the command template, the
+runner consults a typed **profile registry**. The registry is a
+small JSON file; the orchestrator resolves the executor and the
+reviewer independently and refuses to fall through to legacy fields
+when a profile is selected.
+
+See [`docs/model-profile-registry.md`](model-profile-registry.md)
+for the format, the validation rules, and the migration guide. The
+short version:
+
+* `executor: codex_cli` runs the executor under the Codex CLI
+  transport, with the profile's `command_template` argv.
+* `executor_profile: minimax-via-codex` selects the new preferred
+  default (Codex CLI + `minimax` profile + `MiniMax-M3`).
+* `review.profile: codex-high` selects the default reviewer
+  (Codex CLI + `default` profile + `high` reasoning).
+* The reviewer and the executor always start as **separate
+  processes**; the runner never switches the role mid-session.
+
 2. `review.model` / `review.model_reasoning_effort` (roadmap-level).
 3. `defaults.codex_model` / `defaults.codex_model_reasoning_effort`
    (roadmap-level legacy default).

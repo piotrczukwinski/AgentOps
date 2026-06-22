@@ -285,3 +285,31 @@ for monitoring.
 - Tests live in `tests/test_web.py` and cover the allowlist, the HTML
   render, the JSON API contracts, and the safety properties
   (no shell, no Codex, no outside paths, secrets stripped).
+
+## Profile registry controls (issue #52)
+
+The local web UI exposes a small launcher form that lets the
+operator pick an executor profile, a reasoning effort, a
+reviewer profile, and a reviewer reasoning effort before starting
+a run. The form sends typed values to `POST /api/run`; the server
+builds the controlled argv via `build_run_command` so there is no
+shell and no free-form command entry.
+
+The form is fed by two new endpoints:
+
+* `GET /api/profiles` — returns the executor / reviewer profiles
+  from the resolved registry. Supports `profiles_path` /
+  `roadmap` / `repo` query parameters. Never includes
+  secret-shaped fields.
+* `POST /api/profiles/resolve` — resolves a single task against
+  the registry, with optional CLI overrides. Returns a
+  redacted command template preview and a list of warnings
+  (e.g. "reviewer should be an independent profile/process").
+
+The UI also shows two warnings:
+
+* When the resolved executor provider is `opencode`: "opencode is
+  legacy/fallback; MiniMax via Codex CLI is preferred for
+  implementation tasks".
+* When the operator picks the same profile for both executor and
+  reviewer: "reviewer should be an independent profile/process".

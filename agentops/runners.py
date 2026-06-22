@@ -585,6 +585,102 @@ def build_codex_command(
     return command
 
 
+class CodexCliProfileRunner(BaseRunner):
+    """Profile-registry driven Codex CLI executor (issue #52).
+
+    The runner is the bridge between the profile registry and the
+    orchestrator. It honours the ``executor_profile`` / ``executor_reasoning_effort``
+    fields on the task (or the roadmap-level default) and falls
+    back to the legacy codex executor when no profile is selected.
+
+    The implementation lives in :mod:`agentops.codex_cli_runner`;
+    this class is a thin adapter that translates the
+    ``BaseRunner.run`` contract into a :class:`CodexCliRunRequest`.
+    """
+
+    def run(
+        self,
+        task: TaskConfig,
+        prompt: str,
+        cwd: Path,
+        artifact_dir: Path,
+        *,
+        startup_timeout: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> RunnerResult:
+        from .codex_cli_runner import (
+            CodexCliRunnerError,
+            CodexCliRunRequest,
+            run_codex_cli_executor,
+        )
+        from .profiles import (
+            ExecutorProfile,
+            find_profile_registry,
+            resolve_executor_profile,
+        )
+
+        registry = find_profile_registry(
+            explicit_path=None,
+            roadmap_path=str(task.prompt_path) if task.prompt_path else None,
+            repo_path=str(cwd),
+        )
+        # ``roadmap`` is not on ``TaskConfig``; pass a minimal
+        # stand-in so the resolver can still consult the registry
+        # defaults. The standalone profile-name + reasoning-effort
+        # task fields take precedence over the registry default.
+        class _TaskRoadmapStandin:
+            pass
+        standin = _TaskRoadmapStandin()
+        standin.defaults = {
+            "executor_profile": task.executor_profile,
+            "executor_reasoning_effort": task.executor_reasoning_effort,
+        }
+        resolved = resolve_executor_profile(
+            task, standin, registry, cli_overrides={}
+        )
+        if resolved.profile is None:
+            # No profile selected; fall back to the legacy codex
+            # executor so the run does not crash.
+            return CodexExecutorRunner().run(
+                task,
+                prompt,
+                cwd,
+                artifact_dir,
+                startup_timeout=startup_timeout,
+                idle_timeout=idle_timeout,
+            )
+        try:
+            profile_obj = ExecutorProfile(
+                name=resolved.profile.name,
+                provider=resolved.profile.provider,
+                profile=resolved.profile.profile,
+                model=resolved.model or resolved.profile.model,
+                reasoning_effort=(
+                    resolved.reasoning_effort or resolved.profile.reasoning_effort
+                ),
+                command_template=(
+                    resolved.profile.command_template
+                ),
+                timeout_seconds=resolved.timeout_seconds or resolved.profile.timeout_seconds,
+                yolo=resolved.profile.yolo,
+                metadata=dict(resolved.profile.metadata),
+            )
+        except Exception as exc:  # noqa: BLE001 - dataclass validation
+            raise CodexCliRunnerError(
+                f"failed to construct ExecutorProfile for task {task.id!r}: {exc}"
+            ) from exc
+        request = CodexCliRunRequest(
+            profile=profile_obj,
+            prompt=prompt,
+            cwd=cwd,
+            artifact_dir=artifact_dir,
+            timeout_seconds=resolved.timeout_seconds,
+            startup_timeout=startup_timeout,
+            idle_timeout=idle_timeout,
+        )
+        return run_codex_cli_executor(request)
+
+
 def runner_for(task: TaskConfig) -> BaseRunner:
     if task.executor == "shell":
         return ShellRunner()
@@ -594,6 +690,11 @@ def runner_for(task: TaskConfig) -> BaseRunner:
         return ClaudeRunner()
     if task.executor == "codex":
         return CodexExecutorRunner()
+    if task.executor == "codex_cli":
+        # New profile-registry driven Codex CLI executor. Honours
+        # ``executor_profile`` on the task; falls back to the
+        # legacy codex executor when no profile is selected.
+        return CodexCliProfileRunner()
     raise ValueError(f"Unsupported executor {task.executor!r}")
 
 

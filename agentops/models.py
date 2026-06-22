@@ -87,6 +87,17 @@ class ReviewConfig:
     # re-run. Tasks/roadmaps can opt out with ``review.self_fix: false``.
     self_fix: bool = True
     self_fix_max_lines: int = 30
+    # Reviewer profile name (issue #52). When set, the resolved reviewer
+    # is drawn from the profile registry (``agentops profiles ...``)
+    # instead of from ``codex_model`` / ``model_reasoning_effort`` /
+    # env vars. ``None`` keeps the legacy codex/heuristic behaviour
+    # unchanged.
+    profile: str | None = None
+    # Optional alias for the reviewer's reasoning effort. Mirrors
+    # ``model_reasoning_effort`` semantically so a roadmap can use
+    # either spelling. ``None`` falls through to ``model_reasoning_effort``
+    # and then to the env var / profile.
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +149,14 @@ class TaskConfig:
     executor_options: dict[str, Any] = field(default_factory=dict)
     require_executor_result: bool | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional executor profile name (issue #52). When set, the
+    # resolved executor is drawn from the profile registry; ``None``
+    # keeps the legacy ``executor`` / ``model`` behaviour unchanged.
+    executor_profile: str | None = None
+    # Optional per-task override of the executor reasoning effort.
+    # Mirrors the reviewer ``reasoning_effort`` field. ``None`` falls
+    # through to the roadmap / defaults / profile registry.
+    executor_reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +184,24 @@ class RoadmapConfig:
     max_repair_attempts: int | None = None
     review: ReviewConfig = field(default_factory=ReviewConfig)
     reviewer: str = "codex"  # codex|heuristic
+    # Optional path to a profile registry file. When set, the file
+    # is consulted before the repo-local and user-local fallbacks
+    # during ``find_profile_registry``. The path may be relative to
+    # the roadmap file. See ``agentops.profiles`` for the format
+    # (issue #52).
+    profiles_path: str | None = None
+    # Optional roadmap-level executor profile name. Tasks that do
+    # not declare their own ``executor_profile`` inherit this value
+    # via the resolver. ``None`` keeps the legacy behaviour.
+    executor_profile: str | None = None
+    # Optional roadmap-level executor reasoning effort. Mirrors the
+    # reviewer ``review.reasoning_effort`` field; ``None`` falls
+    # through to the task / profile registry.
+    executor_reasoning_effort: str | None = None
+    # Optional roadmap-level reviewer profile name. Inherited by
+    # tasks that do not declare ``review.profile``. ``None`` keeps
+    # the legacy codex/heuristic behaviour.
+    reviewer_profile: str | None = None
 
 
 @dataclass(frozen=True)
