@@ -341,9 +341,11 @@ full repair-routing contract; the key fields on
 * `self_fix_hard_max_lines` (default 800) — safety cap.
 * `max_codex_self_fix_cycles` (default 2) — Codex self-fix
   cycles per task.
-* `max_executor_review_repairs` (default 100 for backwards
-  compatibility; the v1 hardening is 1) — MiniMax / opencode
-  repairs per task.
+* `max_executor_review_repairs` (v1 default **1**) — MiniMax /
+  opencode large mechanical repairs per task. After the budget
+  is exhausted, the orchestrator either lets Codex self-fix the
+  remaining issues (the default path) or asks the operator to
+  decide.
 
 The Codex-owns-repair-reasoning principle is enforced by the
 orchestrator's `REQUEST_CHANGES` branch: Codex self-fix is

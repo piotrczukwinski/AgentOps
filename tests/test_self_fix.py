@@ -129,9 +129,14 @@ class SelfFixPromptTests(unittest.TestCase):
         self.assertIn(SELF_FIX_SKIP_MARKER, text)
         self.assertIn("make NO file changes", text)
         # Repair classification contract is present (PR #58).
+        # PR #58.1: ``SELF_FIX_BY_CODEX`` is documented as the
+        # edit (not skip) classification; the skip marker only
+        # accepts ``LARGE_MECHANICAL_REPAIR`` /
+        # ``OPERATOR_DECISION_REQUIRED`` / ``BLOCK``.
         self.assertIn("SELF_FIX_BY_CODEX", text)
         self.assertIn("LARGE_MECHANICAL_REPAIR", text)
         self.assertIn("OPERATOR_DECISION_REQUIRED", text)
+        self.assertIn("Do NOT use SELF_FIX_BY_CODEX as a skip classification", text)
         self.assertIn("the repair-reasoning owner", text)
         # Blocking issue content is present.
         self.assertIn("bad name check", text)
@@ -311,7 +316,13 @@ class SelfFixOrchestratorTests(unittest.TestCase):
             state = StateStore(root / "state.sqlite")
 
             def skip(cwd: Path) -> str:
-                return f"{SELF_FIX_SKIP_MARKER}: needs architectural rework"
+                # PR #58.1: use a structured skip classification so
+                # the orchestrator knows this is a Codex-authorised
+                # large mechanical repair (allowed to fall through to
+                # the executor). The legacy plain "needs architectural
+                # rework" form would be classified as UNKNOWN and
+                # would block the executor repair path.
+                return f"{SELF_FIX_SKIP_MARKER}: LARGE_MECHANICAL_REPAIR needs architectural rework"
 
             fake = _SelfFixFakeCodex(
                 [ScriptedVerdict(verdict="REQUEST_CHANGES", summary="x", repair_prompt="x"),

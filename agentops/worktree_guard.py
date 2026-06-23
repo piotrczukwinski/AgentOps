@@ -358,6 +358,35 @@ def _matches_ignored(rel_path: str, ignore_patterns: Sequence[str]) -> bool:
     return False
 
 
+def snapshot_has_unignored_changes(
+    snapshot: GitSnapshot,
+    *,
+    ignore_paths: Sequence[str] = (),
+) -> bool:
+    """Return True when ``snapshot`` has un-ignored non-AgentOps changes.
+
+    Used by the orchestrator's preflight to refuse to launch an
+    executor against a source checkout that already has uncommitted
+    non-AgentOps changes. The path-set comparison used by the
+    post-attempt leak detector (``diff_snapshot_changed``) can miss
+    a leak when the executor edits an already-dirty file: the
+    *path* is in both ``before`` and ``after`` sets, so the
+    difference is empty. A preflight that requires the source repo
+    to be clean (modulo ``.agentops/`` / ``.operator-runs/``) before
+    the executor starts closes that gap and gives the leak detector
+    a reliable baseline.
+    """
+    if snapshot.error:
+        # Cannot determine state. Treat as "unknown": return False
+        # so the orchestrator does not block on a snapshot failure
+        # (the leak detector will still see the post-attempt state).
+        return False
+    paths = _changed_paths(snapshot)
+    if not paths:
+        return False
+    return any(not _matches_ignored(path, tuple(ignore_paths)) for path in paths)
+
+
 def _changed_paths(snapshot: GitSnapshot) -> tuple[str, ...]:
     """Return the de-duplicated, sorted list of paths touched in ``snapshot``."""
     paths: set[str] = set()

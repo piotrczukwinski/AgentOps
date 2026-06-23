@@ -160,7 +160,7 @@ class RequestChangesRepairLoopTests(unittest.TestCase):
                                 "validations": [
                                     "python3 -c \"from pathlib import Path; assert Path('out.txt').read_text(encoding='utf-8') == 'v3\\n'\"",
                                 ],
-                                "review": {"codex": "required"},
+                                "review": {"codex": "required", "self_fix": False, "max_executor_review_repairs": 3},
                                 "max_attempts": 3,
                             }
                         ],
@@ -228,7 +228,7 @@ class RequestChangesRepairLoopTests(unittest.TestCase):
                                 "validations": [
                                     "python3 -c \"from pathlib import Path; assert Path('out.txt').read_text(encoding='utf-8') == 'v3\\n'\"",
                                 ],
-                                "review": {"codex": "required"},
+                                "review": {"codex": "required", "self_fix": False, "max_executor_review_repairs": 3},
                                 "max_attempts": 3,
                             }
                         ],
@@ -691,7 +691,18 @@ class IntegrationBranchContinuationTests(unittest.TestCase):
             (repo / "README.md").write_text("operator branch\n", encoding="utf-8")
             git(repo, "add", "README.md")
             git(repo, "commit", "-m", "operator branch")
+            # PR #58.1: the source-repo dirty preflight refuses to
+            # launch the executor when the source checkout has
+            # uncommitted non-AgentOps changes. The operator's
+            # responsibility is to clean the source checkout before
+            # running AgentOps; this test now represents that by
+            # committing the dirty edit before the run. The post-run
+            # assertions still validate that the operator's working
+            # state is not touched and the integration branch ends
+            # up with the executor's changes.
             (repo / "README.md").write_text("dirty operator edit\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "operator dirty edit (committed before run)")
 
             state = StateStore(root / "state.sqlite")
             roadmap = load_roadmap(roadmap_path)
@@ -1494,6 +1505,9 @@ class CumulativeRepairDiffTests(unittest.TestCase):
         *,
         allowed_files: tuple[str, ...] = ("out.txt",),
         max_attempts: int = 3,
+        # PR #58.1: v1 default is 1; legacy tests opt into a higher
+        # budget explicitly via this parameter.
+        max_executor_review_repairs: int = 2,
     ) -> Path:
         prompt = root / "prompt.md"
         prompt.write_text("create out.txt", encoding="utf-8")
@@ -1513,7 +1527,11 @@ class CumulativeRepairDiffTests(unittest.TestCase):
                             "prompt": str(prompt),
                             "allowed_files": list(allowed_files),
                             "validations": ["true"],
-                            "review": {"codex": "required"},
+                            "review": {
+                                "codex": "required",
+                                "self_fix": False,
+                                "max_executor_review_repairs": max_executor_review_repairs,
+                            },
                             "max_attempts": max_attempts,
                         }
                     ],

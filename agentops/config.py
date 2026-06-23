@@ -491,7 +491,7 @@ def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -
                 "max_executor_review_repairs",
                 defaults.get(
                     "review_max_executor_review_repairs",
-                    100,
+                    1,
                 ),
             )
         ),

@@ -1064,7 +1064,7 @@ soft + hard budget pair:
 | `self_fix_max_lines`           | 300     | Soft budget. Carried in the prompt.    |
 | `self_fix_hard_max_lines`      | 800     | Safety cap. Exceeding it blocks.       |
 | `max_codex_self_fix_cycles`    | 2       | Codex self-fix cycles per task.        |
-| `max_executor_review_repairs`  | 100     | MiniMax repairs per task (v0 default; 1 is the v1 opt-in). |
+| `max_executor_review_repairs`  | 1       | MiniMax / opencode large mechanical repairs per task. |
 
 The orchestrator emits the new events:
 
@@ -1092,11 +1092,15 @@ It blocks the task with a canonical failure category when:
 * the hard self-fix budget is exceeded more than once;
 * or the executor repair budget is exhausted.
 
-The v1 default for `max_executor_review_repairs` is 100 to
-preserve the existing test suite; the v1 hardening
-recommendation is to set it to 1 explicitly. The two failure
-categories are `executor_repair_budget_exceeded` and
-`review_churn_limit` (see `docs/failure-modes.md`).
+The v1 default for `max_executor_review_repairs` is **1**: MiniMax
+/ opencode may do at most one large mechanical repair per task.
+After the budget is exhausted, the orchestrator either lets
+Codex self-fix the remaining issues (the default path) or asks
+the operator to decide. The two failure categories are
+`executor_repair_budget_exceeded` and `review_churn_limit` (see
+`docs/failure-modes.md`). Roadmaps that explicitly want more
+than one executor repair can opt in by setting
+`max_executor_review_repairs` to a higher value.
 
 ### Re-review
 

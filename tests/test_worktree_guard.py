@@ -38,6 +38,10 @@ from agentops.config import load_roadmap
 from agentops.orchestrator import Orchestrator, RunOptions
 from agentops.review import HeuristicReviewer
 from agentops.runners import RunnerResult, utc_now
+from agentops.self_fix import (
+    detect_skip,
+    parse_self_fix_skip,
+)
 from agentops.state import StateStore
 from agentops.worktree_guard import (
     EXECUTOR_WORKTREE_LEAK,
@@ -51,6 +55,7 @@ from agentops.worktree_guard import (
     render_worktree_discipline_prefix,
     write_worktree_leak_artifacts,
 )
+from tests.test_gated_roadmap import FakeCodexService, ScriptedVerdict, _init_repo
 
 
 def _git(path: Path, *args: str, check: bool = True) -> str:
@@ -63,17 +68,7 @@ def _git(path: Path, *args: str, check: bool = True) -> str:
     return proc.stdout
 
 
-def _init_repo(parent: Path) -> Path:
-    """Create a tiny git repo under ``parent`` with one seed commit."""
-    repo = parent / "repo"
-    repo.mkdir()
-    _git(repo, "init")
-    _git(repo, "config", "user.email", "agentops@example.invalid")
-    _git(repo, "config", "user.name", "AgentOps Test")
-    (repo / "README.md").write_text("seed\n", encoding="utf-8")
-    _git(repo, "add", "README.md")
-    _git(repo, "commit", "-m", "initial")
-    return repo
+# _init_repo is imported from tests.test_gated_roadmap.
 
 
 def _make_context(
@@ -582,3 +577,521 @@ class WorktreeLeakOrchestratorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# PR #58.1: worktree discipline prefix on repair prompts + source-repo
+# dirty preflight + structured skip parser.
+# ---------------------------------------------------------------------------
+
+
+class _WorktreeFakeCodex(FakeCodexService):
+    """Fake codex that records every prompt path for assertion.
+
+    Uses the FakeCodexService machinery (so it can be injected into
+    the orchestrator) but extends it with a ``prompt_paths`` list so
+    tests can inspect every prompt that was passed to the executor.
+    """
+
+    def __init__(self, verdicts):
+        super().__init__(verdicts)
+        self.prompt_paths: list[str] = []
+
+
+class WorktreePrefixOnRepairPromptTests(unittest.TestCase):
+    """The worktree discipline prefix must reach repair prompts too."""
+
+    def test_repair_prompt_carries_worktree_discipline_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "repair-prefix",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": (
+                                    "python3 -c \"from pathlib import Path; "
+                                    "Path('out.txt').write_text('v1\\n', encoding='utf-8')\""
+                                ),
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["test -f out.txt"],
+                                "review": {
+                                    "codex": "required",
+                                    "self_fix": False,
+                                    # opt in to a second executor
+                                    # repair so attempt 2 exists.
+                                    "max_executor_review_repairs": 2,
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake = _WorktreeFakeCodex(
+                [
+                    ScriptedVerdict(verdict="REQUEST_CHANGES", summary="r1", repair_prompt="fix1"),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+            )
+            orch.run_roadmap(roadmap)
+            # Attempt 1 + attempt 2 (repair) prompts were written.
+            executor_prompts = [
+                a for a in state.artifacts_for_task("T1")
+                if a["kind"] == "executor_prompt"
+            ]
+            self.assertGreaterEqual(len(executor_prompts), 2)
+            for artifact in executor_prompts:
+                text = Path(artifact["path"]).read_text(encoding="utf-8")
+                # The worktree discipline prefix header MUST be the
+                # first non-empty content of the prompt so the
+                # executor sees it before any task-specific
+                # instruction.
+                self.assertTrue(
+                    text.startswith("# WORKTREE DISCIPLINE — MANDATORY"),
+                    f"prompt does not start with worktree discipline header: {artifact['path']}",
+                )
+                self.assertIn("Never edit the source repo root", text)
+                self.assertIn("out.txt", text)
+                # Idempotency: only one prefix header per prompt
+                # (the "End of WORKTREE DISCIPLINE" trailer is OK;
+                # double-prefixing would mean two header lines).
+                self.assertEqual(
+                    text.count("# WORKTREE DISCIPLINE — MANDATORY"),
+                    1,
+                    f"prompt has multiple worktree discipline headers: {artifact['path']}",
+                )
+
+    def test_self_fix_prompt_does_not_carry_executor_worktree_prefix(self) -> None:
+        # The self-fix prompt is built by PromptCompiler outside the
+        # executor path; it must NOT carry the worktree discipline
+        # prefix (that prefix is for the executor runner only).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "self-fix-no-prefix",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": (
+                                    "python3 -c \"from pathlib import Path; "
+                                    "Path('out.txt').write_text('v1\\n', encoding='utf-8')\""
+                                ),
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["test -f out.txt"],
+                                "review": {
+                                    "codex": "required",
+                                    "self_fix": True,
+                                    "self_fix_max_lines": 300,
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake = _WorktreeFakeCodex(
+                [
+                    ScriptedVerdict(verdict="REQUEST_CHANGES", summary="r1", repair_prompt="fix1"),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+            )
+            orch.run_roadmap(roadmap)
+            # self_fix.prompt.md is written by _try_self_fix.
+            self_fix_prompts = [
+                a for a in state.artifacts_for_task("T1")
+                if a["kind"] == "self_fix_prompt"
+            ]
+            self.assertTrue(self_fix_prompts)
+            for artifact in self_fix_prompts:
+                text = Path(artifact["path"]).read_text(encoding="utf-8")
+                # The executor worktree discipline prefix is NOT
+                # prepended to the self-fix prompt (it is a Codex
+                # write-pass, not the executor runner path).
+                self.assertNotIn("WORKTREE DISCIPLINE — MANDATORY", text)
+
+    def test_review_prompt_does_not_carry_executor_worktree_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "review-no-prefix",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": (
+                                    "python3 -c \"from pathlib import Path; "
+                                    "Path('out.txt').write_text('v1\\n', encoding='utf-8')\""
+                                ),
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["test -f out.txt"],
+                                "review": {"codex": "required", "self_fix": False},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake = _WorktreeFakeCodex(
+                [ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True)]
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake,
+            )
+            orch.run_roadmap(roadmap)
+            review_prompts = [
+                a for a in state.artifacts_for_task("T1")
+                if a["kind"] == "review_prompt"
+            ]
+            self.assertTrue(review_prompts)
+            for artifact in review_prompts:
+                text = Path(artifact["path"]).read_text(encoding="utf-8")
+                # The review prompt is built by PromptCompiler outside
+                # the executor path; it must NOT carry the worktree
+                # discipline prefix.
+                self.assertNotIn("WORKTREE DISCIPLINE — MANDATORY", text)
+
+
+# ---------------------------------------------------------------------------
+# Source-repo dirty preflight (PR #58.1).
+# ---------------------------------------------------------------------------
+
+
+class _NonLeakyFakeRunner:
+    """Fake executor that creates out.txt and exits 0."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[override]
+        self.calls.append({"cwd": str(cwd)})
+        (Path(cwd) / "out.txt").write_text("ok\n", encoding="utf-8")
+        out = artifact_dir / "executor.stdout.log"
+        err = artifact_dir / "executor.stderr.log"
+        out.write_text("AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n", encoding="utf-8")
+        err.write_text("", encoding="utf-8")
+        return RunnerResult(0, out, err, utc_now(), utc_now())
+
+
+class SourceRepoDirtyPreflightTests(unittest.TestCase):
+    def test_blocks_when_source_repo_has_normal_dirty_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            # Make the source repo dirty BEFORE the run.
+            (repo / "leaked-notes.md").write_text("operator noise\n", encoding="utf-8")
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "source-dirty",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": (
+                                    "python3 -c \"from pathlib import Path; "
+                                    "Path('out.txt').write_text('ok\\n', encoding='utf-8')\""
+                                ),
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["test -f out.txt"],
+                                "review": {"codex": "never"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            runner = _NonLeakyFakeRunner()
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="heuristic",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                    no_codex=True,
+                ),
+                shell_runner=runner,
+                heuristic_reviewer=HeuristicReviewer(),
+            )
+            orch.run_roadmap(roadmap)
+            # The executor must NOT have been called.
+            self.assertEqual(len(runner.calls), 0)
+            row = state.task_rows("source-dirty")[0]
+            self.assertEqual(row["state"], "blocked")
+            events = [
+                e["type"] for e in state.latest_events(50)
+                if e["task_id"] == "T1"
+            ]
+            self.assertIn("task.source_repo_dirty", events)
+            blocked = [
+                json.loads(e["payload_json"])
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1" and e["type"] == "task.blocked"
+            ]
+            self.assertTrue(blocked)
+            self.assertEqual(blocked[-1].get("failure_category"), "source_repo_dirty")
+            # The dirty file is preserved (no auto-clean).
+            self.assertEqual(
+                (repo / "leaked-notes.md").read_text(encoding="utf-8"),
+                "operator noise\n",
+            )
+            # Diagnostic artifacts are written.
+            artifacts = state.artifacts_for_task("T1")
+            kinds = {a["kind"] for a in artifacts}
+            self.assertTrue(
+                any(k.startswith("source_repo_dirty:") for k in kinds),
+                f"expected source_repo_dirty artifacts, got {sorted(kinds)}",
+            )
+
+    def test_agentops_dirty_changes_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            # .agentops/ writes are legitimate AgentOps runtime metadata.
+            (repo / ".agentops").mkdir()
+            (repo / ".agentops" / "summary.json").write_text("{}", encoding="utf-8")
+            (repo / ".operator-runs").mkdir()
+            (repo / ".operator-runs" / "log.txt").write_text("noise\n", encoding="utf-8")
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "agentops-ok",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": (
+                                    "python3 -c \"from pathlib import Path; "
+                                    "Path('out.txt').write_text('ok\\n', encoding='utf-8')\""
+                                ),
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["test -f out.txt"],
+                                "review": {"codex": "never"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            runner = _NonLeakyFakeRunner()
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="heuristic",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                    no_codex=True,
+                ),
+                shell_runner=runner,
+                heuristic_reviewer=HeuristicReviewer(),
+            )
+            orch.run_roadmap(roadmap)
+            # The executor IS called because the only dirty paths
+            # are AgentOps runtime metadata.
+            self.assertEqual(len(runner.calls), 1)
+            row = state.task_rows("agentops-ok")[0]
+            self.assertEqual(row["state"], "accepted")
+
+    def test_clean_source_repo_passes_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            # Clean source repo.
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "clean-source",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": (
+                                    "python3 -c \"from pathlib import Path; "
+                                    "Path('out.txt').write_text('ok\\n', encoding='utf-8')\""
+                                ),
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["test -f out.txt"],
+                                "review": {"codex": "never"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            runner = _NonLeakyFakeRunner()
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="heuristic",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                    no_codex=True,
+                ),
+                shell_runner=runner,
+                heuristic_reviewer=HeuristicReviewer(),
+            )
+            orch.run_roadmap(roadmap)
+            self.assertEqual(len(runner.calls), 1)
+            row = state.task_rows("clean-source")[0]
+            self.assertEqual(row["state"], "accepted")
+
+
+# ---------------------------------------------------------------------------
+# Structured skip parser (PR #58.1).
+# ---------------------------------------------------------------------------
+
+
+class SelfFixSkipParserTests(unittest.TestCase):
+    def test_large_mechanical_repair(self) -> None:
+        skip = parse_self_fix_skip(
+            "preamble\nAGENTOPS_SELF_FIX_SKIP: LARGE_MECHANICAL_REPAIR needs full rewrite"
+        )
+        self.assertIsNotNone(skip)
+        self.assertEqual(skip.classification, "LARGE_MECHANICAL_REPAIR")
+        self.assertEqual(skip.reason, "needs full rewrite")
+        self.assertTrue(skip.is_valid)
+        self.assertTrue(skip.allows_executor_repair)
+
+    def test_operator_decision_required(self) -> None:
+        skip = parse_self_fix_skip(
+            "AGENTOPS_SELF_FIX_SKIP: OPERATOR_DECISION_REQUIRED product call"
+        )
+        self.assertIsNotNone(skip)
+        self.assertEqual(skip.classification, "OPERATOR_DECISION_REQUIRED")
+        self.assertFalse(skip.allows_executor_repair)
+        self.assertTrue(skip.is_valid)
+
+    def test_block(self) -> None:
+        skip = parse_self_fix_skip("AGENTOPS_SELF_FIX_SKIP: BLOCK unsafe")
+        self.assertIsNotNone(skip)
+        self.assertEqual(skip.classification, "BLOCK")
+        self.assertFalse(skip.allows_executor_repair)
+
+    def test_self_fix_by_codex_as_skip_is_unknown(self) -> None:
+        # PR #58.1: SELF_FIX_BY_CODEX is NOT a valid skip
+        # classification. If the reviewer emits it as a skip, the
+        # orchestrator must treat it as malformed (UNKNOWN) and
+        # refuse to queue the executor.
+        skip = parse_self_fix_skip("AGENTOPS_SELF_FIX_SKIP: SELF_FIX_BY_CODEX oops")
+        self.assertIsNotNone(skip)
+        self.assertEqual(skip.classification, "UNKNOWN")
+        self.assertFalse(skip.allows_executor_repair)
+        self.assertIn("SELF_FIX_BY_CODEX", skip.reason)
+
+    def test_malformed_skip_is_unknown(self) -> None:
+        skip = parse_self_fix_skip("AGENTOPS_SELF_FIX_SKIP: nope not a class")
+        self.assertIsNotNone(skip)
+        self.assertEqual(skip.classification, "UNKNOWN")
+        self.assertFalse(skip.allows_executor_repair)
+        self.assertEqual(skip.reason, "nope not a class")
+
+    def test_no_marker_returns_none(self) -> None:
+        self.assertIsNone(parse_self_fix_skip("applied the fix"))
+        self.assertIsNone(parse_self_fix_skip(""))
+
+    def test_detect_skip_legacy_wrapper(self) -> None:
+        # The legacy detect_skip returns the free-form reason only.
+        self.assertEqual(
+            detect_skip("AGENTOPS_SELF_FIX_SKIP: BLOCK unsafe"),
+            "unsafe",
+        )
+        self.assertEqual(
+            detect_skip("AGENTOPS_SELF_FIX_SKIP: needs architectural rework"),
+            "needs architectural rework",
+        )
+        self.assertIsNone(detect_skip("applied the fix"))
+
+    def test_classification_is_uppercased(self) -> None:
+        skip = parse_self_fix_skip(
+            "AGENTOPS_SELF_FIX_SKIP: large_mechanical_repair lowercase"
+        )
+        self.assertEqual(skip.classification, "LARGE_MECHANICAL_REPAIR")

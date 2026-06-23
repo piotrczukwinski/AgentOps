@@ -45,7 +45,11 @@ from .models import (
     EXECUTOR_NO_OUTPUT_STARTUP,
     EXECUTOR_REPAIR_BUDGET_EXCEEDED,
     EXECUTOR_WORKTREE_LEAK,
+    OPERATOR_DECISION_REQUIRED,
     REVIEW_CHURN_LIMIT,
+    SELF_FIX_BLOCK,
+    SELF_FIX_SKIP_UNKNOWN,
+    SOURCE_REPO_DIRTY,
     DiffSnapshot,
     ReviewVerdict,
     RoadmapConfig,
@@ -65,7 +69,7 @@ from .runners import BaseRunner, CodexCliProfileRunner, runner_for
 from .self_fix import (
     SelfFixOutcome,
     changed_line_count,
-    detect_skip,
+    parse_self_fix_skip,
     restore_working_files,
     snapshot_working_files,
 )
@@ -79,6 +83,7 @@ from .worktree_guard import (
     default_ignored_source_repo_patterns,
     detect_worktree_leak,
     prepend_worktree_discipline,
+    snapshot_has_unignored_changes,
     write_worktree_leak_artifacts,
 )
 
@@ -318,6 +323,57 @@ def _result_guard_repair_prompt(
         "Allowed status values: \"done\" or \"blocked\" only."
     )
     return "\n".join(prompt_lines) + "\n"
+
+
+def _write_source_repo_dirty_artifacts(
+    artifact_dir: Path,
+    context: WorktreeDisciplineContext,
+    snapshot: GitSnapshot,
+) -> tuple[Path, ...]:
+    """Write the source-repo-dirty preflight artifacts to ``artifact_dir``.
+
+    The artifact set mirrors the ``worktree-leak.*`` set so an
+    operator can compare the two when triaging a contamination:
+
+    * ``source-repo-dirty.status.txt`` — ``git status --short`` of
+      the source repo as captured by the preflight snapshot.
+    * ``source-repo-dirty.diff.patch`` — full ``git diff HEAD`` of
+      the source repo (the contamination evidence).
+    * ``source-repo-dirty.diagnosis.json`` — machine-readable
+      context (roadmap_id, task_id, expected worktree root,
+      operator hint).
+    """
+    artifact_dir = Path(artifact_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+
+    def _write(name: str, body: str) -> None:
+        path = artifact_dir / name
+        path.write_text(body, encoding="utf-8")
+        written.append(path)
+
+    _write("source-repo-dirty.status.txt", snapshot.status_short or "(empty)")
+    _write("source-repo-dirty.diff.patch", snapshot.diff_patch or "(empty diff)")
+    diagnosis = {
+        "failure_category": SOURCE_REPO_DIRTY,
+        "roadmap_id": context.roadmap_id,
+        "task_id": context.task_id,
+        "expected_worktree_root": str(context.worktree_root),
+        "actual_worktree_root": (
+            str(snapshot.top_level) if snapshot.top_level else None
+        ),
+        "branch_name": context.branch_name,
+        "execution_mode": context.execution_mode,
+        "executor": context.executor,
+        "executor_profile": context.executor_profile,
+        "operator_hint": (
+            "Source checkout has uncommitted non-AgentOps changes before "
+            "executor attempt. Clean or stash the source checkout before "
+            "retrying. AgentOps did not run the executor."
+        ),
+    }
+    _write("source-repo-dirty.diagnosis.json", json.dumps(diagnosis, indent=2, sort_keys=True))
+    return tuple(written)
 
 
 @dataclass(frozen=True)
@@ -795,18 +851,114 @@ class Orchestrator:
                 roadmap.roadmap_id, effective_task, attempt_no, execution_cwd, runtime.branch, runtime.base_sha
             )
             prompt = runtime.repair_prompt or compiler.executor_prompt(task)
-            # PR #58: prepend the mandatory worktree discipline prefix
-            # for worktree-backed executor attempts. Pure review,
-            # settlement, and self-fix prompts are untouched. The
-            # discipline context was built once per task; if it is
-            # missing the task is not a worktree task and no prefix
-            # is prepended (legacy behaviour preserved).
-            if runtime.worktree_discipline_context is not None and not runtime.repair_prompt:
-                prompt = prepend_worktree_discipline(prompt, runtime.worktree_discipline_context)
+            # PR #58 + #58.1: prepend the mandatory worktree discipline
+            # prefix to **every** executor attempt that runs in a
+            # task worktree, including:
+            #  * the initial executor prompt (compiler.executor_prompt),
+            #  * the validation repair prompt,
+            #  * the review repair prompt (REQUEST_CHANGES),
+            #  * the empty-diff retry prompt,
+            #  * the executor-idle retry prompt,
+            #  * the result-guard retry prompt,
+            #  * the Codex-takeover executor prompt (if it routes
+            #    through the executor runner path).
+            # The discipline prefix must reach the executor on repair
+            # attempts too: a repair prompt that omits the prefix
+            # regresses the Biuro P2 failure mode (executor resolved
+            # an absolute path from the source checkout and silently
+            # corrupted it). Pure read-only review prompts and Codex
+            # self-fix prompts are compiled by
+            # :class:`PromptCompiler` outside this branch, so they
+            # never go through this code path and are untouched.
+            # ``prepend_worktree_discipline`` is idempotent so a
+            # prompt that already carries the prefix is not
+            # double-prefixed on the next attempt.
+            if runtime.worktree_discipline_context is not None:
+                prompt = prepend_worktree_discipline(
+                    prompt, runtime.worktree_discipline_context
+                )
             prompt_path = artifact_store.write_text(attempt_dir, "executor.prompt.md", prompt)
             self.state.record_artifact(
                 roadmap.roadmap_id, task.id, attempt_id, "executor_prompt", prompt_path, artifact_store.sha256(prompt_path)
             )
+            # PR #58.1: source-repo dirty preflight. The post-attempt
+            # leak detector compares path sets before vs. after, which
+            # can miss a leak when the executor edits an *already
+            # dirty* file (the path is in both sets, the diff is
+            # empty). The preflight requires the source checkout to
+            # be clean (modulo ``.agentops/`` / ``.operator-runs/``)
+            # before the executor starts, so the leak detector has a
+            # reliable baseline. The block is conservative: a dirty
+            # source repo is the operator's problem to clean, not
+            # AgentOps's to silently absorb.
+            if runtime.worktree_discipline_context is not None:
+                preflight_snapshot = capture_git_snapshot(roadmap.repo.path)
+                if snapshot_has_unignored_changes(
+                    preflight_snapshot,
+                    ignore_paths=default_ignored_source_repo_patterns(),
+                ):
+                    dirty_artifact_dir = attempt_dir
+                    dirty_paths = _write_source_repo_dirty_artifacts(
+                        dirty_artifact_dir,
+                        runtime.worktree_discipline_context,
+                        preflight_snapshot,
+                    )
+                    for p in dirty_paths:
+                        self.state.record_artifact(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            f"source_repo_dirty:{p.name}",
+                            p,
+                            artifact_store.sha256(p),
+                        )
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.source_repo_dirty",
+                        {
+                            "reason": (
+                                "source checkout had non-AgentOps uncommitted "
+                                "changes before the executor attempt"
+                            ),
+                            "failure_category": SOURCE_REPO_DIRTY,
+                            "expected_worktree_root": str(
+                                runtime.worktree_discipline_context.worktree_root
+                            ),
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.source_repo_dirty",
+                        task.id,
+                        extra={"failure_category": SOURCE_REPO_DIRTY},
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.BLOCKED,
+                        {
+                            "reason": (
+                                "source checkout has uncommitted non-AgentOps "
+                                "changes before the executor attempt"
+                            ),
+                            "failure_category": SOURCE_REPO_DIRTY,
+                            "expected_worktree_root": str(
+                                runtime.worktree_discipline_context.worktree_root
+                            ),
+                            "artifacts": [str(p) for p in dirty_paths],
+                            "hint": (
+                                "Source checkout has uncommitted non-AgentOps "
+                                "changes before executor attempt. Clean or "
+                                "stash the source checkout before retrying. "
+                                "AgentOps did not run the executor."
+                            ),
+                            "attempt": attempt_no,
+                        },
+                    )
+                    return
+
             self.state.transition_task(
                 roadmap.roadmap_id, task.id, TaskState.EXECUTOR_RUNNING, {"attempt": attempt_no}
             )
@@ -1673,6 +1825,8 @@ class Orchestrator:
                             "accepted": sf.accepted,
                             "reason": sf.reason,
                             "skipped": sf.skipped,
+                            "skip_classification": sf.skip_classification,
+                            "skip_reason": sf.skip_reason,
                             "self_fix_cycle": runtime.codex_self_fix_cycles_used,
                             "max_codex_self_fix_cycles": max_self_fix_cycles,
                         },
@@ -1680,9 +1834,107 @@ class Orchestrator:
                     if sf.accepted:
                         accepted_outcome = True
                         return
-                # Self-fix is exhausted or unavailable. Decide
-                # whether the executor may be re-run for a large
-                # mechanical repair.
+                    # PR #58.1: structured skip-classification routing.
+                    # ``sf.skipped`` means the reviewer emitted the
+                    # ``AGENTOPS_SELF_FIX_SKIP`` marker. Only
+                    # ``LARGE_MECHANICAL_REPAIR`` is allowed to fall
+                    # through to the executor repair path. The other
+                    # classifications must NOT queue an executor
+                    # repair — they park the task for the operator or
+                    # block it with a canonical failure category so
+                    # the runbook and the morning checklist can grep
+                    # for the real cause.
+                    if sf.skipped and (
+                        sf.skip_classification is None
+                        or sf.skip_classification == "UNKNOWN"
+                        or sf.skip_classification == "OPERATOR_DECISION_REQUIRED"
+                        or sf.skip_classification == "BLOCK"
+                    ):
+                        # Decide the canonical failure category based
+                        # on the classification. ``UNKNOWN`` is
+                        # treated conservatively as a skip-unknown
+                        # block; the operator must investigate.
+                        if sf.skip_classification == "OPERATOR_DECISION_REQUIRED":
+                            skip_category = OPERATOR_DECISION_REQUIRED
+                            skip_event = "task.operator_decision_required"
+                            skip_target_state = TaskState.AWAITING_HUMAN
+                            skip_hint = (
+                                "Codex classified the repair as requiring "
+                                "operator / product / architecture decision; "
+                                "executor repair was not queued."
+                            )
+                        elif sf.skip_classification == "BLOCK":
+                            skip_category = SELF_FIX_BLOCK
+                            skip_event = "task.self_fix_blocked"
+                            skip_target_state = TaskState.BLOCKED
+                            skip_hint = (
+                                "Codex classified the repair as BLOCK; "
+                                "executor repair was not queued."
+                            )
+                        else:
+                            skip_category = SELF_FIX_SKIP_UNKNOWN
+                            skip_event = "task.self_fix_skip_unknown"
+                            skip_target_state = TaskState.BLOCKED
+                            skip_hint = (
+                                "Codex self-fix emitted a skip marker with "
+                                "an unrecognised classification; executor "
+                                "repair was not queued. Inspect the "
+                                "reviewer stdout to recover the original "
+                                "skip text."
+                            )
+                        self.state.event(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            skip_event,
+                            {
+                                "reason": sf.skip_reason,
+                                "skip_classification": sf.skip_classification,
+                                "self_fix_cycle": runtime.codex_self_fix_cycles_used,
+                            },
+                        )
+                        self._record_roadmap_event(
+                            roadmap,
+                            skip_event,
+                            task.id,
+                            extra={
+                                "reason": sf.skip_reason,
+                                "skip_classification": sf.skip_classification,
+                            },
+                        )
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            task.id,
+                            skip_target_state,
+                            {
+                                "reason": sf.skip_reason or "self_fix_skipped",
+                                "failure_category": skip_category,
+                                "skip_classification": sf.skip_classification,
+                                "self_fix_cycle": runtime.codex_self_fix_cycles_used,
+                                "attempt": attempt_no,
+                                "hint": skip_hint,
+                            },
+                        )
+                        return
+                    if sf.skipped and sf.skip_classification == "LARGE_MECHANICAL_REPAIR":
+                        # Codex explicitly delegated to a large
+                        # mechanical repair. Record the classification
+                        # on the timeline so the operator can audit
+                        # who authorised the executor repair.
+                        self.state.event(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "task.executor_repair_authorized_by_codex",
+                            {
+                                "skip_classification": sf.skip_classification,
+                                "skip_reason": sf.skip_reason,
+                                "self_fix_cycle": runtime.codex_self_fix_cycles_used,
+                            },
+                        )
+                # Self-fix is exhausted, unavailable, or delegated to
+                # a Codex-authored large mechanical repair. Decide
+                # whether the executor may be re-run.
                 executor_repair_allowed = (
                     attempt_no < max_attempts
                     and runtime.executor_review_repairs_used < max_executor_repairs
@@ -2278,10 +2530,22 @@ class Orchestrator:
         # attempt starts from the clean pre-self-fix state.
         pre_snap = snapshot_working_files(target_worktree)
 
-        def _fallback(reason: str, *, skipped: bool = False) -> SelfFixOutcome:
+        def _fallback(
+            reason: str,
+            *,
+            skipped: bool = False,
+            skip_classification: str | None = None,
+            skip_reason: str | None = None,
+        ) -> SelfFixOutcome:
             with contextlib.suppress(Exception):
                 restore_working_files(target_worktree, pre_snap)
-            return SelfFixOutcome(accepted=False, reason=reason, skipped=skipped)
+            return SelfFixOutcome(
+                accepted=False,
+                reason=reason,
+                skipped=skipped,
+                skip_classification=skip_classification,
+                skip_reason=skip_reason,
+            )
 
         try:
             self_fix_started_at = utc_now()
@@ -2342,20 +2606,51 @@ class Orchestrator:
                 exc_info=True,
             )
 
-        # 1. Skip marker: the reviewer decided the fix is too big / ambiguous.
+        # 1. Skip marker: the reviewer decided NOT to self-fix. The
+        # marker carries a structured classification (one of
+        # ``LARGE_MECHANICAL_REPAIR`` / ``OPERATOR_DECISION_REQUIRED``
+        # / ``BLOCK``; ``UNKNOWN`` for malformed / missing). The
+        # orchestrator surfaces the classification in the
+        # ``task.self_fix_skipped`` event and in the
+        # :class:`SelfFixOutcome` so the REQUEST_CHANGES branch can
+        # route it correctly: only ``LARGE_MECHANICAL_REPAIR`` is
+        # allowed to fall through to the executor repair path;
+        # ``OPERATOR_DECISION_REQUIRED`` and ``BLOCK`` must NOT.
         try:
             stdout_text = result.stdout_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             stdout_text = ""
-        skip_reason = detect_skip(stdout_text)
-        if skip_reason is not None:
+        skip_marker = parse_self_fix_skip(stdout_text)
+        if skip_marker is not None:
+            # Backwards-compatible: keep the legacy ``reason`` payload
+            # (the free-form text) so the runbook / existing grep
+            # targets still work, but add the classification so the
+            # REQUEST_CHANGES branch can route on it.
             self.state.event(
-                roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_skipped", {"reason": skip_reason}
+                roadmap.roadmap_id,
+                task.id,
+                attempt_id,
+                "task.self_fix_skipped",
+                {
+                    "reason": skip_marker.reason,
+                    "classification": skip_marker.classification,
+                },
             )
             self._record_roadmap_event(
-                roadmap, "task.self_fix_skipped", task.id, extra={"reason": skip_reason}
+                roadmap,
+                "task.self_fix_skipped",
+                task.id,
+                extra={
+                    "reason": skip_marker.reason,
+                    "classification": skip_marker.classification,
+                },
             )
-            return _fallback("self_fix_skipped", skipped=True)
+            return _fallback(
+                "self_fix_skipped",
+                skipped=True,
+                skip_classification=skip_marker.classification,
+                skip_reason=skip_marker.reason,
+            )
 
         # 2. Re-collect the diff and enforce the allowed_files policy.
         post_diff = collect_diff(target_worktree, base_branch, base_sha=runtime.base_sha)
