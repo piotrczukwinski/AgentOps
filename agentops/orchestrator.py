@@ -722,6 +722,16 @@ class Orchestrator:
         budget: BudgetManager,
     ) -> None:
         runtime = _TaskRuntime()
+        # PR #59 follow-up: clear any per-orchestrator misdirected-write
+        # state left over from a previous task. ``_last_misdirected_decision``
+        # and ``_last_misdirected_decision_packet`` are written by
+        # ``_handle_misdirected_write`` and read by ``_run_review`` via
+        # ``getattr`` fallbacks; if task T1 set them, task T2 would
+        # otherwise inherit the stale packet and forward it to its
+        # reviewer. Reset at the top of every task so the review
+        # packet only carries this task's own misdirected-write context.
+        self._last_misdirected_decision = None
+        self._last_misdirected_decision_packet = None
         # Apply profile-registry overrides (issue #57) so
         # ``task.executor_profile`` / ``task.executor`` / ``task.model``
         # / ``task.review`` reflect the CLI overrides (and the
