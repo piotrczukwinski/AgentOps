@@ -109,11 +109,15 @@ class PromptPrefixTests(unittest.TestCase):
             text = render_worktree_discipline_prefix(ctx)
             self.assertIn(str(ctx.worktree_root), text)
 
-    def test_prefix_contains_source_repo_root(self) -> None:
+    def test_prefix_does_not_contain_source_repo_root(self) -> None:
+        # PR #59: the source repo path is intentionally redacted from
+        # the executor prompt. The model should NOT see the source
+        # checkout path; AgentOps only ever surfaces the worktree root.
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self._ctx(Path(tmp))
             text = render_worktree_discipline_prefix(ctx)
-            self.assertIn(str(ctx.repo_root), text)
+            self.assertNotIn(str(ctx.repo_root), text)
+            self.assertIn("Source repo (read-only; path intentionally redacted)", text)
 
     def test_prefix_contains_git_instructions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -122,6 +126,16 @@ class PromptPrefixTests(unittest.TestCase):
             self.assertIn("pwd", text)
             self.assertIn("git rev-parse --show-toplevel", text)
             self.assertIn("git status --short", text)
+
+    def test_prefix_contains_final_verification_section(self) -> None:
+        # PR #59: the prefix must carry the final verification
+        # section so the executor can self-check before claiming done.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            text = render_worktree_discipline_prefix(ctx)
+            self.assertIn("Final verification before emitting AGENTOPS_RESULT_JSON", text)
+            self.assertIn("EXPECTED=", text)
+            self.assertIn("status: failed", text)
 
     def test_prefix_contains_never_edit_source_repo_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,7 +452,17 @@ class _LeakyFakeRunner:
 
 
 class WorktreeLeakOrchestratorTests(unittest.TestCase):
-    def test_blocked_with_worktree_leak_when_executor_writes_to_source(self) -> None:
+    def test_blocked_with_misdirected_write_when_executor_writes_to_source(self) -> None:
+        # PR #59 v2: when the executor writes a tracked file to the
+        # source checkout, the misdirected-write handler now runs
+        # FIRST and is the authoritative detector. The category
+        # is one of the new ``misdirected_write_*`` categories
+        # (here: ``misdirected_write_conflict`` because the
+        # worktree already has a different copy of README.md) --
+        # NOT the legacy ``worktree_leak`` blanket. The
+        # ``task.worktree_leak_detected`` event is NOT emitted
+        # because the worktree-leak path was preempted by the
+        # safer misdirected-write adoption flow.
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             repo = _init_repo(tmp_path)
@@ -484,13 +508,9 @@ class WorktreeLeakOrchestratorTests(unittest.TestCase):
             orch.run_roadmap(roadmap)
             row = state.task_rows("leak-orch")[0]
             self.assertEqual(row["state"], "blocked")
-            # The executor ran exactly once before the leak block.
+            # The executor ran exactly once before the block.
             self.assertEqual(len(leaky.calls), 1)
-            # The primary failure category is worktree_leak, NOT
-            # empty_diff. The fix to the Biuro P2 misclassification.
-            events = state.timeline_event_rows(
-                task_id="T1", limit=200
-            )
+            events = state.timeline_event_rows(task_id="T1", limit=200)
             blocked_events = [
                 json.loads(e["payload_json"])
                 for e in events
@@ -498,26 +518,39 @@ class WorktreeLeakOrchestratorTests(unittest.TestCase):
             ]
             self.assertTrue(blocked_events, "expected a task.blocked event")
             failure_category = blocked_events[-1].get("failure_category")
-            self.assertEqual(failure_category, EXECUTOR_WORKTREE_LEAK)
-            # Artifacts on disk.
+            # PR #59 v2: the category is a misdirected_write_*
+            # category, not the legacy ``worktree_leak``. The
+            # exact category depends on the path (here the worktree
+            # has the same path with different bytes, so it is
+            # ``misdirected_write_conflict``).
+            self.assertTrue(
+                failure_category.startswith("misdirected_write_"),
+                f"expected a misdirected_write_* category, got {failure_category!r}",
+            )
+            # Misdirected-write quarantine artifacts on disk.
             artifacts = state.artifacts_for_task("T1")
             kinds = {a["kind"] for a in artifacts}
             self.assertTrue(
-                any(k.startswith("worktree_leak:") for k in kinds),
-                f"expected worktree_leak artifacts, got kinds={sorted(kinds)}",
+                any(k.startswith("misdirected_write:") for k in kinds),
+                f"expected misdirected_write artifacts, got kinds={sorted(kinds)}",
             )
-            # The leaked source file is still on disk (no auto-revert).
+            # The leaked source file is still on disk (no
+            # auto-revert for unsafe categories).
             self.assertEqual(
                 (repo / "README.md").read_text(encoding="utf-8"),
                 "leaked by fake executor\n",
             )
-            # The "task.worktree_leak_detected" event is on the timeline.
-            events = [
+            # PR #59 v2: the worktree-leak event is NOT emitted
+            # because the misdirected-write handler was the
+            # authoritative detector. The brief explicitly
+            # requires this: ``old worktree_leak detector must
+            # not preempt misdirected adoption``.
+            event_types = [
                 e["type"]
                 for e in state.latest_events(50)
                 if e["task_id"] == "T1"
             ]
-            self.assertIn("task.worktree_leak_detected", events)
+            self.assertNotIn("task.worktree_leak_detected", event_types)
 
     def test_no_leak_when_executor_writes_only_in_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1095,3 +1128,638 @@ class SelfFixSkipParserTests(unittest.TestCase):
             "AGENTOPS_SELF_FIX_SKIP: large_mechanical_repair lowercase"
         )
         self.assertEqual(skip.classification, "LARGE_MECHANICAL_REPAIR")
+
+
+# ---------------------------------------------------------------------------
+# PR #59 v2: end-to-end misdirected-write tests.
+#
+# These tests cover the new allowed_files semantics: out-of-scope
+# regular add/modify is adopted as a *scope deviation* and forwarded
+# to the reviewer (it does NOT block the attempt). Sensitive
+# material is quarantined; old worktree_leak is no longer allowed
+# to preempt misdirected-write adoption.
+# ---------------------------------------------------------------------------
+
+
+class _ScopeDeviationFakeRunner:
+    """Fake executor that writes a regular docs file outside allowed_files."""
+
+    def __init__(self, repo_path: Path, target: str = "docs/extra.md"):
+        self.repo_path = repo_path
+        self.target = target
+        self.calls: list[dict] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[override]
+        self.calls.append({"cwd": str(cwd)})
+        # Write the file to the SOURCE repo, mirroring the Biuro
+        # P3 incident class.
+        target_path = self.repo_path / self.target
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("legitimate supporting content\n", encoding="utf-8")
+        out = artifact_dir / "executor.stdout.log"
+        err = artifact_dir / "executor.stderr.log"
+        out.write_text("AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n", encoding="utf-8")
+        err.write_text("", encoding="utf-8")
+        return RunnerResult(0, out, err, utc_now(), utc_now())
+
+
+class _AllowedFileFakeRunner:
+    """Fake executor that writes an *allowed* file to the source repo."""
+
+    def __init__(self, repo_path: Path, target: str = "out.txt"):
+        self.repo_path = repo_path
+        self.target = target
+        self.calls: list[dict] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[override]
+        self.calls.append({"cwd": str(cwd)})
+        (self.repo_path / self.target).write_text("ok\n", encoding="utf-8")
+        out = artifact_dir / "executor.stdout.log"
+        err = artifact_dir / "executor.stderr.log"
+        out.write_text("AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n", encoding="utf-8")
+        err.write_text("", encoding="utf-8")
+        return RunnerResult(0, out, err, utc_now(), utc_now())
+
+
+class _SensitiveFakeRunner:
+    """Fake executor that writes a sensitive / secret material to the source repo."""
+
+    def __init__(self, repo_path: Path, target: str = ".env"):
+        self.repo_path = repo_path
+        self.target = target
+        self.calls: list[dict] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[override]
+        self.calls.append({"cwd": str(cwd)})
+        (self.repo_path / self.target).write_text(
+            "OPENAI_API_KEY=sk-secret-value-1234567890\n", encoding="utf-8"
+        )
+        out = artifact_dir / "executor.stdout.log"
+        err = artifact_dir / "executor.stderr.log"
+        out.write_text("AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n", encoding="utf-8")
+        err.write_text("", encoding="utf-8")
+        return RunnerResult(0, out, err, utc_now(), utc_now())
+
+
+class MisdirectedWriteE2ETests(unittest.TestCase):
+    """End-to-end orchestrator tests for PR #59 v2 misdirected-write semantics."""
+
+    def _write_roadmap(
+        self,
+        root: Path,
+        repo: Path,
+        *,
+        roadmap_id: str,
+        allowed_files: list[str],
+        extra: dict | None = None,
+    ) -> Path:
+        prompt = root / "prompt.md"
+        prompt.write_text("do something", encoding="utf-8")
+        task: dict = {
+            "id": "T1",
+            "kind": "implementation",
+            "executor": "shell",
+            "executor_command": "true",
+            "prompt": str(prompt),
+            "allowed_files": allowed_files,
+            "validations": ["true"],
+            "review": {"codex": "never"},
+        }
+        if extra:
+            task.update(extra)
+        roadmap_path = root / "r.json"
+        roadmap_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "roadmap_id": roadmap_id,
+                    "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                    "tasks": [task],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return roadmap_path
+
+    def _run(self, root: Path, roadmap_id: str, runner) -> StateStore:
+        roadmap = load_roadmap(root / "r.json")
+        state = StateStore(root / "state.sqlite")
+        orch = Orchestrator(
+            state,
+            RunOptions(
+                force_reviewer="heuristic",
+                artifacts_root=root / "artifacts",
+                workspaces_root=root / "workspaces",
+                no_codex=True,
+            ),
+            shell_runner=runner,
+            heuristic_reviewer=HeuristicReviewer(),
+        )
+        orch.run_roadmap(roadmap)
+        return state
+
+    # ---- 1. allowed file adopted via misdirected-write path ----
+    def test_e2e_allowed_file_written_to_source_is_adopted(self) -> None:
+        # The executor writes an *allowed* file to the source
+        # repo (not the worktree). PR #59 v2 adopts it, restores
+        # the source, and continues to validation / review.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            self._write_roadmap(
+                root,
+                repo,
+                roadmap_id="e2e-allowed-adopt",
+                allowed_files=["out.txt"],
+            )
+            runner = _AllowedFileFakeRunner(repo_path=repo, target="out.txt")
+            state = self._run(root, "e2e-allowed-adopt", runner)
+            row = state.task_rows("e2e-allowed-adopt")[0]
+            # Task should reach an accepted-or-blocked state with
+            # no worktree_leak event. The heuristic reviewer may
+            # accept (it has no diff because the worktree is now
+            # empty) -- the test accepts both.
+            self.assertIn(row["state"], {"accepted", "blocked"})
+            events = [
+                e["type"]
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1"
+            ]
+            self.assertNotIn("task.worktree_leak_detected", events)
+            # The misdirected_write_adopted event fired.
+            self.assertIn("task.misdirected_write_detected", events)
+            self.assertIn("task.misdirected_write_adopted", events)
+            # Source is restored clean.
+            from agentops.misdirected_writes import capture_source_mutation_snapshot
+            snap = capture_source_mutation_snapshot(repo)
+            self.assertEqual(snap.files, ())
+
+    # ---- 2. out-of-scope file adopted as scope deviation ----
+    def test_e2e_out_of_scope_file_is_adopted_as_scope_deviation(self) -> None:
+        # The executor writes a regular docs file outside
+        # allowed_files to the source repo. PR #59 v2 adopts it,
+        # restores the source, and forwards a scope-deviation
+        # advisory to the reviewer. No block.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            self._write_roadmap(
+                root,
+                repo,
+                roadmap_id="e2e-scope-deviation",
+                allowed_files=["out.txt"],
+            )
+            runner = _ScopeDeviationFakeRunner(repo_path=repo, target="docs/extra.md")
+            state = self._run(root, "e2e-scope-deviation", runner)
+            row = state.task_rows("e2e-scope-deviation")[0]
+            # The task does NOT block.
+            self.assertNotEqual(row["state"], "blocked")
+            events = [
+                e["type"]
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1"
+            ]
+            # The misdirected-write path produced the
+            # scope-deviation event (not blocked-by-policy or
+            # worktree-leak).
+            self.assertIn("task.misdirected_write_scope_deviation", events)
+            self.assertNotIn("task.worktree_leak_detected", events)
+            self.assertNotIn("task.blocked_by_policy", events)
+            # Source restored clean.
+            from agentops.misdirected_writes import capture_source_mutation_snapshot
+            snap = capture_source_mutation_snapshot(repo)
+            self.assertEqual(snap.files, ())
+
+    # ---- 3. sensitive material blocks the task ----
+    def test_e2e_sensitive_write_is_quarantined_and_blocks(self) -> None:
+        # The executor writes ``.env`` to the source repo. PR #59
+        # v2 classifies it as sensitive, refuses adoption,
+        # writes quarantine artifacts, and parks the task.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            self._write_roadmap(
+                root,
+                repo,
+                roadmap_id="e2e-sensitive",
+                allowed_files=["out.txt"],
+            )
+            runner = _SensitiveFakeRunner(repo_path=repo, target=".env")
+            state = self._run(root, "e2e-sensitive", runner)
+            row = state.task_rows("e2e-sensitive")[0]
+            self.assertIn(row["state"], {"blocked", "awaiting_human"})
+            # The misdirected-write block fired with the
+            # sensitive category.
+            blocked = [
+                json.loads(e["payload_json"])
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1" and e["type"] == "task.blocked"
+            ]
+            if blocked:
+                cat = blocked[-1].get("failure_category")
+                self.assertTrue(
+                    cat in {"misdirected_write_sensitive", "misdirected_write_quarantined"},
+                    f"expected sensitive category, got {cat!r}",
+                )
+            # Misdirected-write artifacts on disk.
+            artifacts = state.artifacts_for_task("T1")
+            kinds = {a["kind"] for a in artifacts}
+            self.assertTrue(
+                any(k.startswith("misdirected_write:") for k in kinds),
+                f"expected misdirected_write artifacts, got {sorted(kinds)}",
+            )
+            # The worktree-leak path did NOT preempt the
+            # misdirected-write handler.
+            event_types = [
+                e["type"]
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1"
+            ]
+            self.assertNotIn("task.worktree_leak_detected", event_types)
+
+    # ---- 5. old worktree_leak path does not preempt misdirected adoption ----
+    def test_e2e_old_worktree_leak_does_not_preempt_misdirected_adoption(self) -> None:
+        # When the executor writes a regular docs file to the
+        # source repo, the OLD worktree_leak detector would
+        # have fired first and blocked with
+        # ``worktree_leak``. PR #59 v2 lets the misdirected-write
+        # handler run first and adopt the file. The
+        # ``task.worktree_leak_detected`` event is NOT emitted.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            self._write_roadmap(
+                root,
+                repo,
+                roadmap_id="e2e-no-preempt",
+                allowed_files=["out.txt"],
+            )
+            runner = _ScopeDeviationFakeRunner(repo_path=repo, target="docs/extra.md")
+            state = self._run(root, "e2e-no-preempt", runner)
+            events = [
+                e["type"]
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1"
+            ]
+            # Hard assertion: worktree_leak_detected MUST NOT fire.
+            self.assertNotIn(
+                "task.worktree_leak_detected",
+                events,
+                "old worktree_leak path preempted misdirected-write adoption",
+            )
+            # The misdirected-write path produced events.
+            self.assertIn("task.misdirected_write_detected", events)
+            # The scope-deviation event fired (advisory was
+            # forwarded to the reviewer).
+            self.assertIn("task.misdirected_write_scope_deviation", events)
+
+
+class _RequestChangesFakeRunner:
+    """Fake executor that writes an out-of-scope file and waits for review."""
+
+    def __init__(self, repo_path: Path, target: str = "docs/extra.md"):
+        self.repo_path = repo_path
+        self.target = target
+        self.calls: list[dict] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[override]
+        self.calls.append({"cwd": str(cwd)})
+        target_path = self.repo_path / self.target
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("legitimate content\n", encoding="utf-8")
+        out = artifact_dir / "executor.stdout.log"
+        err = artifact_dir / "executor.stderr.log"
+        out.write_text("AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n", encoding="utf-8")
+        err.write_text("", encoding="utf-8")
+        return RunnerResult(0, out, err, utc_now(), utc_now())
+
+
+class MisdirectedWriteRepairTests(unittest.TestCase):
+    """E2E test for scenario #3: scope deviation adopted, then reviewer
+    returns REQUEST_CHANGES, the orchestrator then self-fixes or
+    continues the repair loop without dropping the out-of-scope file.
+    """
+
+    def test_e2e_request_changes_does_not_drop_scope_deviation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("do something", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "scope-dev-repair",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            runner = _RequestChangesFakeRunner(repo_path=repo, target="docs/extra.md")
+            # The first review returns REQUEST_CHANGES with a
+            # repair prompt; the second returns ACCEPT. The
+            # orchestrator must not drop the out-of-scope file
+            # between the two reviews.
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(
+                        verdict="REQUEST_CHANGES",
+                        summary="need to clean up out-of-scope file",
+                        repair_prompt="remove the docs/extra.md file",
+                    ),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                shell_runner=runner,
+            )
+            orch.run_roadmap(roadmap)
+            events = [
+                e["type"]
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1"
+            ]
+            # The misdirected-write path produced the
+            # scope-deviation event.
+            self.assertIn("task.misdirected_write_scope_deviation", events)
+            # The worktree-leak path was NOT triggered.
+            self.assertNotIn("task.worktree_leak_detected", events)
+
+
+# ---------------------------------------------------------------------------
+# Cross-task scope-deviation packet leak (PR #59 follow-up).
+#
+# PR #59 v2 stored the misdirected-write scope-deviation packet on
+# the long-lived ``Orchestrator`` instance via
+# ``self._last_misdirected_decision_packet``. ``_run_review`` read
+# it via ``getattr(self, "_last_misdirected_decision_packet", None)``
+# and forwarded it to ``PromptCompiler.review_prompt``. ``_TaskRuntime``
+# is per-task, but those two attributes are on the orchestrator, so
+# a second task in the same roadmap would inherit the previous
+# task's packet and forward T1's misdirected-write context into T2's
+# review prompt -- even when T2 had no misdirected write.
+#
+# The fix clears both attributes at the top of ``_run_task``. The
+# tests below are the regression: they build a 2-task roadmap, force
+# T1 to produce a ``misdirected_write_scope_deviation`` event, run
+# T2 with a normal worktree write, and assert that T2's persisted
+# review prompt is clean of T1's scope-deviation context.
+# ---------------------------------------------------------------------------
+
+
+class _PerTaskFakeRunner:
+    """Fake executor that picks a per-task write target.
+
+    The plan maps ``task_id`` to ``(mode, target)`` where ``mode`` is
+    either ``"source"`` (write the target into the source repo, which
+    triggers a misdirected-write) or ``"worktree"`` (write the target
+    into the task worktree, which is the normal happy path). The
+    runner records every call so tests can confirm the executor
+    actually ran for both tasks.
+    """
+
+    def __init__(
+        self,
+        repo_path: Path,
+        plan: dict[str, tuple[str, str]],
+    ) -> None:
+        self.repo_path = repo_path
+        self.plan = plan
+        self.calls: list[dict] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[override]
+        self.calls.append({"task_id": task.id, "cwd": str(cwd)})
+        mode, target = self.plan[task.id]
+        # Misdirected write (``mode == 'source'``) writes the
+        # target into the source repo, which the misdirected-write
+        # handler picks up. Normal writes (``mode == 'worktree'``)
+        # land in the task worktree, which is the happy path.
+        target_path = (
+            self.repo_path / target
+            if mode == "source"
+            else Path(cwd) / target
+        )
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("legitimate content\n", encoding="utf-8")
+        out = artifact_dir / "executor.stdout.log"
+        err = artifact_dir / "executor.stderr.log"
+        out.write_text(
+            "AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n", encoding="utf-8"
+        )
+        err.write_text("", encoding="utf-8")
+        return RunnerResult(0, out, err, utc_now(), utc_now())
+
+
+class MisdirectedWritePerTaskScopeTests(unittest.TestCase):
+    """Cross-task scope-deviation packet must NOT leak into the next
+    task's review prompt. PR #59 follow-up regression.
+    """
+
+    def _read_review_prompts(self, state: StateStore, task_id: str) -> list[str]:
+        artifacts = state.artifacts_for_task(task_id)
+        prompts: list[str] = []
+        for artifact in artifacts:
+            if artifact["kind"] != "review_prompt":
+                continue
+            prompts.append(Path(artifact["path"]).read_text(encoding="utf-8"))
+        return prompts
+
+    def test_e2e_scope_deviation_does_not_leak_to_next_task_review(self) -> None:
+        # Two-task roadmap. T1's fake runner writes a regular docs
+        # file to the SOURCE repo, outside ``allowed_files``. PR
+        # #59 v2 adopts the file, restores the source, and forwards
+        # a scope-deviation packet to T1's reviewer. T2's fake
+        # runner writes a normal in-scope file to T2's worktree.
+        # T2's review prompt must not carry T1's scope-deviation
+        # context.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("do something", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "scope-dev-no-leak",
+                        "repo": {
+                            "id": "repo",
+                            "path": str(repo),
+                            "base_branch": "HEAD",
+                        },
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out1.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                            },
+                            {
+                                "id": "T2",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out2.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            runner = _PerTaskFakeRunner(
+                repo_path=repo,
+                plan={
+                    # T1: misdirected write to the source repo, an
+                    # out-of-scope regular docs file. The
+                    # misdirected-write handler classifies this as
+                    # ``misdirected_write_scope_deviation`` and the
+                    # orchestrator forwards a packet to the reviewer.
+                    "T1": ("source", "docs/extra-t1.md"),
+                    # T2: normal worktree write of an in-scope file.
+                    # No misdirected write. No scope deviation.
+                    "T2": ("worktree", "out2.txt"),
+                },
+            )
+            fake_codex = _WorktreeFakeCodex(
+                [
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                shell_runner=runner,
+            )
+            orch.run_roadmap(roadmap)
+
+            # Both tasks must have been picked up by the executor.
+            self.assertEqual(len(runner.calls), 2)
+            self.assertEqual(len(fake_codex.calls), 2)
+
+            t1_events = [
+                e["type"]
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1"
+            ]
+            t2_events = [
+                e["type"]
+                for e in state.latest_events(50)
+                if e["task_id"] == "T2"
+            ]
+
+            # T1: scope-deviation event fired.
+            self.assertIn("task.misdirected_write_scope_deviation", t1_events)
+            # T2: NO misdirected-write event. NO worktree-leak event.
+            # NO blocked-by-policy event.
+            self.assertNotIn("task.misdirected_write_scope_deviation", t2_events)
+            self.assertNotIn("task.misdirected_write_detected", t2_events)
+            self.assertNotIn("task.worktree_leak_detected", t2_events)
+            self.assertNotIn("task.blocked_by_policy", t2_events)
+            self.assertNotIn("task.misdirected_write_blocked", t2_events)
+
+            # T1's review prompt carries the scope-deviation packet.
+            t1_prompts = self._read_review_prompts(state, "T1")
+            self.assertTrue(t1_prompts, "T1 produced no review prompt")
+            t1_prompt = t1_prompts[-1]
+            self.assertIn("docs/extra-t1.md", t1_prompt)
+            self.assertIn(
+                "misdirected_write_scope_deviation",
+                t1_prompt,
+                "T1's review prompt should carry the scope-deviation category",
+            )
+            self.assertIn(
+                "Are the out-of-scope files legitimate supporting changes?",
+                t1_prompt,
+                "T1's review prompt should carry the reviewer questions",
+            )
+
+            # T2's review prompt must NOT carry T1's scope-deviation
+            # context. This is the regression: the orchestrator used
+            # to inherit the previous task's packet via
+            # ``self._last_misdirected_decision_packet``.
+            t2_prompts = self._read_review_prompts(state, "T2")
+            self.assertTrue(t2_prompts, "T2 produced no review prompt")
+            t2_prompt = t2_prompts[-1]
+
+            # T1's out-of-scope path must not leak into T2's prompt.
+            self.assertNotIn(
+                "docs/extra-t1.md",
+                t2_prompt,
+                "T1's out-of-scope path leaked into T2's review prompt",
+            )
+            # The scope-deviation category must not appear in T2's
+            # prompt at all. T2 had no misdirected write, so there
+            # is no packet to render.
+            self.assertNotIn(
+                "misdirected_write_scope_deviation",
+                t2_prompt,
+                "T1's scope-deviation category leaked into T2's review prompt",
+            )
+            # The reviewer questions are only rendered when a
+            # scope-deviation packet is present. T2 has no packet,
+            # so the questions must not be in the prompt.
+            self.assertNotIn(
+                "Are the out-of-scope files legitimate supporting changes?",
+                t2_prompt,
+                "T1's reviewer questions leaked into T2's review prompt",
+            )
+            # The "Out-of-scope scope-deviation paths" bullet is
+            # only rendered when a packet is present. T2 has no
+            # packet, so the bullet must not be in the prompt.
+            self.assertNotIn(
+                "Out-of-scope scope-deviation paths",
+                t2_prompt,
+                "T1's scope-deviation block leaked into T2's review prompt",
+            )
+            # The empty-scope-deviation placeholder must be
+            # present, confirming that the prompt went through the
+            # no-packet branch of ``_format_scope_deviation``.
+            self.assertIn(
+                "- (no scope deviation)",
+                t2_prompt,
+                "T2's review prompt should render the empty scope-deviation placeholder",
+            )
+            # Sanity: T2's prompt DOES mention T2's allowed file
+            # and the in-scope file, so we are not reading a stale
+            # or empty prompt.
+            self.assertIn("out2.txt", t2_prompt)

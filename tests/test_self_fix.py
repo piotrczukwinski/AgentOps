@@ -342,7 +342,14 @@ class SelfFixOrchestratorTests(unittest.TestCase):
             # Skipped -> executor ran the repair attempt (attempt 2).
             self.assertEqual(row["current_attempt"], 2)
 
-    def test_self_fix_out_of_scope_falls_back(self) -> None:
+    def test_self_fix_out_of_scope_advisory_in_default_mode(self) -> None:
+        # PR #59 v2: ``files.not_allowed`` is advisory by default.
+        # The self-fix write-pass may touch a file outside
+        # allowed_files; the policy records a warning (not a
+        # critical issue) so the task does NOT trip the
+        # ``task.self_fix_out_of_scope`` fallback. The reviewer
+        # sees the out-of-scope file via the review packet
+        # advisory and decides. The task reaches ACCEPT.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = _init_repo(root)
@@ -366,9 +373,70 @@ class SelfFixOrchestratorTests(unittest.TestCase):
             )
             orch.run_roadmap(roadmap)
             events = [e["type"] for e in state.latest_events(50) if e["task_id"] == "T1"]
-            self.assertIn("task.self_fix_out_of_scope", events)
+            # In default mode, the advisory does NOT trip the
+            # self-fix-out-of-scope fallback. The task reaches
+            # ACCEPT; the reviewer sees the out-of-scope file
+            # via the review packet advisory.
+            self.assertNotIn("task.self_fix_out_of_scope", events)
             row = state.task_rows("sf")[0]
             self.assertEqual(row["state"], "accepted")
+
+    def test_self_fix_out_of_scope_strict_mode_falls_back(self) -> None:
+        # PR #59 v2: when the task opts into strict mode
+        # (``metadata.x_allowed_files_strict=true``), the
+        # self-fix write-pass that touches a file outside
+        # allowed_files trips the legacy
+        # ``task.self_fix_out_of_scope`` fallback and falls
+        # back to executor repair.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "sf-strict",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "python3 -c \"from pathlib import Path; Path('out.txt').write_text('v1\\n', encoding='utf-8')\"",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["test -f out.txt"],
+                                "review": {"codex": "required", "self_fix": True, "self_fix_max_lines": 30},
+                                "x_allowed_files_strict": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            roadmap = load_roadmap(roadmap_path)
+            state = StateStore(root / "state.sqlite")
+
+            def oos(cwd: Path) -> str:
+                (cwd / "other.txt").write_text("nope\n", encoding="utf-8")
+                return "applied"
+
+            fake = _SelfFixFakeCodex(
+                [ScriptedVerdict(verdict="REQUEST_CHANGES", summary="x", repair_prompt="x"),
+                 ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True)],
+                self_fix_fn=oos,
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(force_reviewer="codex", artifacts_root=root / "artifacts", workspaces_root=root / "workspaces"),
+                review_service=fake,
+            )
+            orch.run_roadmap(roadmap)
+            events = [e["type"] for e in state.latest_events(50) if e["task_id"] == "T1"]
+            self.assertIn("task.self_fix_out_of_scope", events)
 
 
 if __name__ == "__main__":

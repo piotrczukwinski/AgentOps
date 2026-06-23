@@ -33,12 +33,21 @@ from .git_ops import (
     copy_allowed_files_back,
     create_gitless_mirror,
     create_worktree,
+    default_workspaces_root,
     is_git_repo,
     is_protected_branch,
     merge_integration,
     push,
     rev_parse,
     worktree_is_clean,
+)
+from .misdirected_writes import (
+    MisdirectedWriteDecision,
+    SourceMutationSnapshot,
+    adopt_misdirected_writes,
+    capture_source_mutation_snapshot,
+    detect_misdirected_writes,
+    quarantine_source_mutations,
 )
 from .models import (
     EXECUTOR_IDLE_TIMEOUT,
@@ -58,6 +67,10 @@ from .models import (
 )
 from .policy import PolicyEngine
 from .prompting import PromptCompiler
+from .provider_failures import (
+    classify_provider_failure,
+    is_non_retryable_provider,
+)
 from .repo_lock import acquire_run_lock
 from .review import (
     CodexReviewService,
@@ -436,6 +449,13 @@ class _TaskRuntime:
     # the runtime leak detector around every executor attempt.
     worktree_discipline_context: WorktreeDisciplineContext | None = None
     worktree_leak_blocked: bool = False
+    # PR #59 v2: set by the misdirected-write handler when the
+    # source-side mutation was safely adopted (either as
+    # ``misdirected_write_adopted`` or
+    # ``misdirected_write_scope_deviation``). When True, the
+    # worktree-leak detector is skipped so it does not preempt
+    # the safe adoption path.
+    misdirected_write_adopted: bool = False
     # Repair routing churn counters (PR #58).
     # Codex owns repair reasoning. The orchestrator only counts
     # cycles and refuses to rerun the executor past the policy
@@ -702,6 +722,16 @@ class Orchestrator:
         budget: BudgetManager,
     ) -> None:
         runtime = _TaskRuntime()
+        # PR #59 follow-up: clear any per-orchestrator misdirected-write
+        # state left over from a previous task. ``_last_misdirected_decision``
+        # and ``_last_misdirected_decision_packet`` are written by
+        # ``_handle_misdirected_write`` and read by ``_run_review`` via
+        # ``getattr`` fallbacks; if task T1 set them, task T2 would
+        # otherwise inherit the stale packet and forward it to its
+        # reviewer. Reset at the top of every task so the review
+        # packet only carries this task's own misdirected-write context.
+        self._last_misdirected_decision = None
+        self._last_misdirected_decision_packet = None
         # Apply profile-registry overrides (issue #57) so
         # ``task.executor_profile`` / ``task.executor`` / ``task.model``
         # / ``task.review`` reflect the CLI overrides (and the
@@ -734,7 +764,14 @@ class Orchestrator:
             self._record_roadmap_event(roadmap, "task.preflight_blocked", task.id)
             return
 
-        workspace_root = self.options.workspaces_root or (roadmap.repo.path / ".agentops" / "workspaces")
+        # PR #59: default workspace root is now external (not inside the source repo)
+        # unless the operator explicitly passes --workspaces-root or sets
+        # AGENTOPS_WORKSPACES_ROOT. Keeps the source checkout path out of executor
+        # prompts and out of common shell discovery.
+        if self.options.workspaces_root is not None:
+            workspace_root = self.options.workspaces_root
+        else:
+            workspace_root = default_workspaces_root(roadmap.repo.path)
         artifact_root = self.options.artifacts_root or (roadmap.repo.path / ".agentops")
         artifact_store = ArtifactStore(artifact_root)
         target_worktree = create_worktree(
@@ -1157,14 +1194,94 @@ class Orchestrator:
             if task.execution_mode == "gitless_mirror" and runtime.mirror is not None:
                 copy_allowed_files_back(runtime.mirror, target_worktree, task.allowed_files)
 
-            # PR #58: runtime worktree leak detection. Runs *after*
-            # the watchdog checks (a watchdog hit must surface the
-            # watchdog category, not a leak) and *before* the diff /
-            # policy / review stages. A leak blocks the task with
-            # ``failure_category=worktree_leak`` so the runbook and
-            # the morning checklist can grep for the real cause
-            # instead of the misleading ``empty_diff``.
+            # PR #59 v2: misdirected-write detection runs FIRST, before
+            # the worktree-leak detector. ``allowed_files`` is an
+            # expected-scope hint, not a hard safety boundary, so a
+            # misdirected write to a reviewable path is adopted (with
+            # a scope-deviation advisory) and the work continues
+            # to the reviewer. The worktree-leak detector only
+            # blocks when the source mutation is not safe to
+            # adopt (sensitive / forbidden / structural /
+            # unsafe), or when the worktree topology is wrong, or
+            # when the source cannot be restored.
             if runtime.worktree_discipline_context is not None:
+                source_after = capture_source_mutation_snapshot(roadmap.repo.path)
+                source_before = (
+                    capture_source_mutation_snapshot(roadmap.repo.path)
+                    if repo_before_snapshot is None
+                    else _git_snapshot_to_source_mutation(repo_before_snapshot, roadmap.repo.path)
+                )
+                # Pass the strict policy flag through. The detector
+                # re-classifies scope-deviation paths as blocking
+                # when the task / roadmap opted in.
+                _strict = False
+                try:
+                    from .policy import is_strict_allowed_files
+                    _strict = is_strict_allowed_files(roadmap, effective_task)
+                except Exception:  # noqa: BLE001 - defensive
+                    _strict = False
+                misdirected = detect_misdirected_writes(
+                    source_before,
+                    source_after,
+                    allowed_files=effective_task.allowed_files,
+                    worktree_root=target_worktree,
+                    repo_root=roadmap.repo.path,
+                    forbidden_globs=tuple(
+                        list(policy.global_forbidden) + list(effective_task.forbidden_globs)
+                    ),
+                    strict_allowed_files=_strict,
+                )
+                if misdirected.detected:
+                    _handle_misdirected_write(
+                        self,
+                        roadmap=roadmap,
+                        task=effective_task,
+                        attempt_id=attempt_id,
+                        attempt_no=attempt_no,
+                        attempt_dir=attempt_dir,
+                        source_before=source_before,
+                        source_after=source_after,
+                        decision=misdirected,
+                        target_worktree=target_worktree,
+                        artifact_store=artifact_store,
+                    )
+                    if not misdirected.adoptable:
+                        # The misdirected-write path is blocking:
+                        # sensitive / forbidden / structural /
+                        # conflict / unsafe. Park the task. We do
+                        # NOT fall through to the worktree-leak
+                        # detector: the source may still be dirty
+                        # because the misdirected-write quarantine
+                        # preserved the work intentionally.
+                        return
+                    # Adoption succeeded. The source is restored
+                    # (or the orchestrator continued for scope
+                    # deviations). Skip the worktree-leak detector
+                    # for the safe adoption path; its only job is
+                    # topology-mismatch / unsafe-class / restore
+                    # failure detection, none of which apply when
+                    # the misdirected-write handler has already
+                    # adopted the work.
+                    if misdirected.failure_category in (
+                        "misdirected_write_adopted",
+                        "misdirected_write_scope_deviation",
+                    ):
+                        runtime.misdirected_write_adopted = True
+                        # Fall through to diff / policy / review.
+
+            # PR #58: runtime worktree leak detection. Runs
+            # *after* the misdirected-write path. A leak blocks
+            # the task with ``failure_category=worktree_leak`` so
+            # the runbook and the morning checklist can grep for
+            # the real cause instead of the misleading
+            # ``empty_diff``. PR #59 v2 narrowed the trigger: the
+            # detector only blocks for topology mismatch, source
+            # changes that the misdirected-write path refused to
+            # adopt, or worktree-empty + source-dirty (the
+            # original Biuro P2 symptom).
+            if runtime.worktree_discipline_context is not None and not getattr(
+                runtime, "misdirected_write_adopted", False
+            ):
                 repo_after_snapshot = capture_git_snapshot(roadmap.repo.path)
                 worktree_after_snapshot = capture_git_snapshot(target_worktree)
                 leak_decision = detect_worktree_leak(
@@ -1174,7 +1291,20 @@ class Orchestrator:
                     runtime.worktree_discipline_context,
                     ignore_paths=default_ignored_source_repo_patterns(),
                 )
-                if leak_decision.leaked:
+                # PR #59 v2: only block on a leak when the
+                # detector surfaces an unsafe / topology-mismatch
+                # condition. ``repo_changed`` alone is no longer
+                # enough; the misdirected-write handler is the
+                # authoritative detector for the source-side
+                # mutation class.
+                wt_leak_blocks = (
+                    leak_decision.leaked
+                    and (
+                        leak_decision.top_level_mismatch
+                        or leak_decision.repo_changed
+                    )
+                )
+                if wt_leak_blocks:
                     artifact_paths = write_worktree_leak_artifacts(
                         attempt_dir,
                         runtime.worktree_discipline_context,
@@ -1243,6 +1373,89 @@ class Orchestrator:
                         },
                     )
                     runtime.worktree_leak_blocked = True
+                    return
+
+            # PR #59: classify the executor result as a provider failure
+            # BEFORE the misdirected-write / empty-diff checks. A
+            # non-retryable provider failure (missing env, 402
+            # balance, 401 key) must not enter the validation /
+            # self-fix / executor-repair loops. The attempt is parked
+            # with the right failure_category so the operator sees
+            # what to fix.
+            provider_failure = None
+            try:
+                stdout_text = ""
+                stderr_text = ""
+                combined_text = None
+                if getattr(result, "stdout_path", None):
+                    try:
+                        stdout_text = result.stdout_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    except OSError:
+                        stdout_text = ""
+                if getattr(result, "stderr_path", None):
+                    try:
+                        stderr_text = result.stderr_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    except OSError:
+                        stderr_text = ""
+                provider_failure = classify_provider_failure(
+                    result, stdout_text, stderr_text, combined_text
+                )
+            except Exception:  # noqa: BLE001 - defensive
+                provider_failure = None
+
+            if (
+                provider_failure is not None
+                and provider_failure.detected
+                and is_non_retryable_provider(provider_failure.category)
+            ):
+                # Park with the canonical provider category. Use
+                    # AWAITING_HUMAN because the operator must fix
+                    # the env / key / balance; the executor cannot
+                    # solve this on its own.
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.provider_failure",
+                        {
+                            "category": provider_failure.category,
+                            "retryable": provider_failure.retryable,
+                            "reason": provider_failure.reason,
+                            "evidence": provider_failure.evidence,
+                            "attempt": attempt_no,
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.provider_failure",
+                        task.id,
+                        extra={
+                            "category": provider_failure.category,
+                            "retryable": provider_failure.retryable,
+                            "reason": provider_failure.reason,
+                            "attempt": attempt_no,
+                        },
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.AWAITING_HUMAN,
+                        {
+                            "reason": provider_failure.reason,
+                            "failure_category": provider_failure.category,
+                            "evidence": provider_failure.evidence,
+                            "attempt": attempt_no,
+                            "hint": (
+                                "Provider / environment failure is not a code "
+                                "defect. Fix the env, key, balance, or endpoint "
+                                "shown above and re-run the roadmap."
+                            ),
+                        },
+                    )
                     return
 
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.DIFF_COLLECTED)
@@ -2174,8 +2387,57 @@ class Orchestrator:
         cumulative and a no-op repair may legitimately see no new
         changes since the prior attempt.
         """
+        # PR #59 v2: forward any advisory policy issues
+        # (``files.not_allowed`` warning) and the misdirected-write
+        # scope-deviation packet to the reviewer. The reviewer
+        # decides whether the out-of-scope files are legitimate.
+        _policy_advisory: list[dict[str, Any]] = []
+        for issue in getattr(policy_result, "issues", ()) or ():
+            sev = getattr(issue, "severity", "")
+            if sev in {"warning", "advisory"}:
+                _policy_advisory.append(
+                    {
+                        "name": getattr(issue, "name", "?"),
+                        "severity": sev,
+                        "message": getattr(issue, "message", ""),
+                        "path": getattr(issue, "path", None),
+                    }
+                )
+        _scope_deviation_packet: dict[str, Any] | None = getattr(
+            self, "_last_misdirected_decision_packet", None
+        )
+        # If we set the decision packet via the misdirected-write
+        # handler, prefer it; otherwise build a stub from the
+        # latest decision (defensive fallback for tests / older
+        # callers).
+        if _scope_deviation_packet is None:
+            _last_decision = getattr(self, "_last_misdirected_decision", None)
+            if _last_decision is not None and _last_decision.scope_deviation_paths:
+                _scope_deviation_packet = {
+                    "decision_category": _last_decision.failure_category,
+                    "scope_deviation_paths": list(_last_decision.scope_deviation_paths),
+                    "adoptable_paths": list(_last_decision.adoptable_paths),
+                    "strict_allowed_files": _last_decision.strict_allowed_files,
+                    "reviewer_questions": [
+                        "Are the out-of-scope files legitimate supporting changes?",
+                        "Should they be kept, moved, or removed?",
+                        "Do they require a follow-up task?",
+                    ],
+                    "reviewer_guidance": (
+                        "ACCEPT if out-of-scope files are legitimate and safe; "
+                        "REQUEST_CHANGES if they should be removed/moved/split; "
+                        "OPERATOR_DECISION_REQUIRED if product/architecture/safety "
+                        "ambiguity remains; BLOCK only for unsafe changes."
+                    ),
+                }
         review_prompt = PromptCompiler(self._policy_for(roadmap)).review_prompt(
-            task, diff, policy_result, validation, attempt=attempt_no
+            task,
+            diff,
+            policy_result,
+            validation,
+            attempt=attempt_no,
+            scope_deviation=_scope_deviation_packet,
+            policy_advisory=tuple(_policy_advisory),
         )
 
         # If the router decided not to call Codex, go straight to heuristic
@@ -3558,3 +3820,342 @@ class Orchestrator:
                 "run_verdict": run_verdict,
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# PR #59: helper functions for misdirected-write adoption / quarantine.
+# Kept at module level so they can be unit-tested in isolation.
+# ---------------------------------------------------------------------------
+
+
+def _git_snapshot_to_source_mutation(snapshot: Any, root: Path) -> SourceMutationSnapshot:
+    """Convert a PR #58 :class:`GitSnapshot` to a :class:`SourceMutationSnapshot`.
+
+    The conversion is best-effort: PR #58 stores the untracked set
+    and a porcelain status string; we do not have the per-file
+    hash / status detail for those. The diff is approximate; the
+    orchestrator uses it only for the "did anything change?"
+    question, not for adoption decisions.
+    """
+    from .misdirected_writes import SourceMutationFile
+    files: list[SourceMutationFile] = []
+    for line in (snapshot.status_short or "").splitlines():
+        if not line or len(line) < 4:
+            continue
+        status_raw = line[:2]
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        first = status_raw.strip() or "M"
+        if first in ("A", "??"):
+            status = "added"
+        elif first == "D":
+            status = "deleted"
+        elif first in ("R", "C"):
+            status = "renamed" if first == "R" else "unknown"
+        else:
+            status = "modified"
+        files.append(
+            SourceMutationFile(
+                relpath=path,
+                status=status,
+                before_sha256=None,
+                after_sha256=None,
+                before_exists=status not in ("added",),
+                after_exists=status not in ("deleted",),
+                after_size=None,
+                binary=None,
+            )
+        )
+    return SourceMutationSnapshot(
+        root=Path(snapshot.root) if snapshot.root else root,
+        head_sha=getattr(snapshot, "head_sha", None),
+        status_short=snapshot.status_short or "",
+        diff_name_status=getattr(snapshot, "diff_name_status", ""),
+        diff_patch=getattr(snapshot, "diff_patch", ""),
+        untracked=tuple(getattr(snapshot, "untracked", ()) or ()),
+        files=tuple(files),
+        error=getattr(snapshot, "error", None),
+    )
+
+
+def _handle_misdirected_write(
+    orchestrator: Any,
+    *,
+    roadmap: Any,
+    task: Any,
+    attempt_id: str,
+    attempt_no: int,
+    attempt_dir: Path,
+    source_before: SourceMutationSnapshot,
+    source_after: SourceMutationSnapshot,
+    decision: MisdirectedWriteDecision,
+    target_worktree: Path,
+    artifact_store: Any,
+) -> None:
+    """Quarantine / adopt / block the task for a misdirected write.
+
+    PR #59 v2: ``allowed_files`` is an expected-scope hint, not a
+    hard safety boundary. ``decision.adoptable=True`` covers two
+    distinct cases:
+
+    * ``misdirected_write_adopted``: all adopted files are under
+      ``allowed_files``; the reviewer sees a clean diff.
+    * ``misdirected_write_scope_deviation``: the adopted set
+      includes regular add/modify outside ``allowed_files``. The
+      orchestrator copies the files, restores the source, and
+      forwards a scope-deviation advisory to the reviewer.
+
+    Hard blocks are reserved for the unsafe / sensitive /
+    structural / conflict / quarantined / adoption-failed
+    categories. ``orchestrator.state`` is a :class:`StateStore`;
+    it does not own :class:`TaskState` -- that lives in
+    :mod:`agentops.models`. The function uses the imported
+    ``TaskState`` directly to avoid an ``AttributeError``.
+    """
+    from .misdirected_writes import (
+        MISDIRECTED_WRITE_ADOPTION_FAILED,
+        MISDIRECTED_WRITE_BLOCKING_CATEGORIES,
+        MISDIRECTED_WRITE_CONFLICT,
+        MISDIRECTED_WRITE_QUARANTINED,
+        MISDIRECTED_WRITE_SCOPE_DEVIATION,
+        MISDIRECTED_WRITE_SENSITIVE,
+        MISDIRECTED_WRITE_STRUCTURAL,
+        MISDIRECTED_WRITE_UNSAFE,
+    )
+
+    # 1) Quarantine (always).
+    quarantine_names = quarantine_source_mutations(
+        attempt_dir,
+        source_before,
+        source_after,
+        decision,
+        roadmap_id=roadmap.roadmap_id,
+        task_id=task.id,
+    )
+    for name in quarantine_names:
+        try:
+            path = attempt_dir / name
+            orchestrator.state.record_artifact(
+                roadmap.roadmap_id,
+                task.id,
+                attempt_id,
+                f"misdirected_write:{Path(name).name}",
+                path,
+                artifact_store.sha256(path),
+            )
+        except OSError:
+            pass
+
+    orchestrator.state.event(
+        roadmap.roadmap_id,
+        task.id,
+        attempt_id,
+        "task.misdirected_write_detected",
+        {
+            "decision": decision.to_dict(),
+            "source_paths": list(decision.source_paths),
+            "failure_category": decision.failure_category,
+            "reason": decision.reason,
+        },
+    )
+
+    if not decision.adoptable:
+        # Park the task with the right failure category. Use the
+        # imported ``TaskState`` -- ``orchestrator.state`` is a
+        # StateStore and does not have a ``TaskState`` attribute.
+        category = decision.failure_category or MISDIRECTED_WRITE_QUARANTINED
+        # Sensitive / unsafe / conflict / structural /
+        # quarantined / adoption-failed are hard blocks. Other
+        # categories (e.g. legacy ad-hoc categories) are
+        # AWAITING_HUMAN. The canonical ``BLOCKING_CATEGORIES``
+        # set is the single source of truth.
+        if category in MISDIRECTED_WRITE_BLOCKING_CATEGORIES or category in (
+            MISDIRECTED_WRITE_UNSAFE,
+            MISDIRECTED_WRITE_CONFLICT,
+            MISDIRECTED_WRITE_QUARANTINED,
+            MISDIRECTED_WRITE_ADOPTION_FAILED,
+            MISDIRECTED_WRITE_SENSITIVE,
+            MISDIRECTED_WRITE_STRUCTURAL,
+        ):
+            target_state = TaskState.BLOCKED
+        else:
+            target_state = TaskState.AWAITING_HUMAN
+        orchestrator._record_roadmap_event(
+            roadmap,
+            "task.misdirected_write_blocked",
+            task.id,
+            extra={
+                "failure_category": category,
+                "reason": decision.reason,
+                "attempt": attempt_no,
+            },
+        )
+        orchestrator.state.transition_task(
+            roadmap.roadmap_id,
+            task.id,
+            target_state,
+            {
+                "reason": decision.reason,
+                "failure_category": category,
+                "source_paths": list(decision.source_paths),
+                "unsafe_paths": list(decision.unsafe_paths),
+                "sensitive_paths": list(decision.sensitive_paths),
+                "conflict_paths": list(decision.conflict_paths),
+                "adoptable_paths": list(decision.adoptable_paths),
+                "artifacts": [str(attempt_dir / n) for n in quarantine_names],
+                "hint": _misdirected_block_hint(category),
+                "attempt": attempt_no,
+            },
+        )
+        return
+
+    # 2) Adopt the safe parts. The decision is adoptable; this
+    # covers both ``MISDIRECTED_WRITE_ADOPTED`` (under
+    # allowed_files) and ``MISDIRECTED_WRITE_SCOPE_DEVIATION``
+    # (regular add/modify outside allowed_files, forwarded to
+    # the reviewer as a scope-deviation advisory).
+    adoption = adopt_misdirected_writes(
+        roadmap.repo.path,
+        target_worktree,
+        decision,
+        attempt_dir=attempt_dir,
+        allowed_files=task.allowed_files,
+        restore_source=True,
+        forbidden_globs=tuple(
+            list(getattr(orchestrator._policy_for(roadmap), "global_forbidden", ()))
+            + list(task.forbidden_globs)
+        ),
+        roadmap_id=roadmap.roadmap_id,
+        task_id=task.id,
+    )
+
+    for name in adoption.artifact_names:
+        try:
+            path = attempt_dir / name
+            orchestrator.state.record_artifact(
+                roadmap.roadmap_id,
+                task.id,
+                attempt_id,
+                f"misdirected_write:{Path(name).name}",
+                path,
+                artifact_store.sha256(path),
+            )
+        except OSError:
+            pass
+
+    is_scope_deviation = decision.failure_category == MISDIRECTED_WRITE_SCOPE_DEVIATION
+    event_type = (
+        "task.misdirected_write_scope_deviation"
+        if is_scope_deviation
+        else "task.misdirected_write_adopted"
+    )
+    orchestrator.state.event(
+        roadmap.roadmap_id,
+        task.id,
+        attempt_id,
+        event_type,
+        {
+            "decision": decision.to_dict(),
+            "adoption": adoption.to_dict(),
+            "scope_deviation_paths": list(decision.scope_deviation_paths),
+            "reviewer_questions": [
+                "Are the out-of-scope files legitimate supporting changes?",
+                "Should they be kept, moved, or removed?",
+                "Do they require a follow-up task?",
+            ],
+        },
+    )
+
+    if not adoption.success:
+        # Adoption failed: park with the appropriate category.
+        category = adoption.failure_category or MISDIRECTED_WRITE_ADOPTION_FAILED
+        orchestrator._record_roadmap_event(
+            roadmap,
+            "task.misdirected_write_quarantined",
+            task.id,
+            extra={
+                "failure_category": category,
+                "reason": adoption.reason,
+                "copied_paths": list(adoption.copied_paths),
+                "remaining_source_dirty": list(adoption.remaining_source_dirty),
+                "attempt": attempt_no,
+            },
+        )
+        orchestrator.state.transition_task(
+            roadmap.roadmap_id,
+            task.id,
+            TaskState.BLOCKED,
+            {
+                "reason": adoption.reason,
+                "failure_category": category,
+                "copied_paths": list(adoption.copied_paths),
+                "remaining_source_dirty": list(adoption.remaining_source_dirty),
+                "artifacts": [str(attempt_dir / n) for n in quarantine_names],
+                "attempt": attempt_no,
+            },
+        )
+        return
+
+    # Successful adoption; the orchestrator continues to
+    # DIFF_COLLECTED with the freshly-copied files in the
+    # worktree. The next ``collect_diff`` will see them. When the
+    # decision was a scope deviation, the orchestrator forwards
+    # the advisory to the reviewer (see PromptCompiler review
+    # packet). The decision-adopted record is also surfaced on
+    # the runtime so the worktree-leak detector skips its hard
+    # block (PR #59 v2).
+    try:
+        orchestrator._last_misdirected_decision = decision
+        packet: dict[str, Any] = {
+            "decision_category": decision.failure_category,
+            "scope_deviation_paths": list(decision.scope_deviation_paths),
+            "adoptable_paths": list(decision.adoptable_paths),
+            "strict_allowed_files": decision.strict_allowed_files,
+            "reviewer_questions": [
+                "Are the out-of-scope files legitimate supporting changes?",
+                "Should they be kept, moved, or removed?",
+                "Do they require a follow-up task?",
+            ],
+            "reviewer_guidance": (
+                "ACCEPT if out-of-scope files are legitimate and safe; "
+                "REQUEST_CHANGES if they should be removed/moved/split; "
+                "OPERATOR_DECISION_REQUIRED if product/architecture/safety "
+                "ambiguity remains; BLOCK only for unsafe changes."
+            ),
+        }
+        orchestrator._last_misdirected_decision_packet = packet
+    except Exception:  # noqa: BLE001 - defensive
+        pass
+
+
+def _misdirected_block_hint(category: str) -> str:
+    """Return the operator-facing hint for a blocking category.
+
+    The hint tells the operator what to do with the artifacts.
+    Kept short so it fits the runbook.
+    """
+    from .misdirected_writes import (
+        MISDIRECTED_WRITE_SENSITIVE,
+        MISDIRECTED_WRITE_STRUCTURAL,
+    )
+    if category == MISDIRECTED_WRITE_SENSITIVE:
+        return (
+            "Executor wrote sensitive material (.env, secrets, lockfiles, "
+            "db files, etc.) to the source checkout. Work is preserved "
+            "in the misdirected-write artifacts. Operator must decide "
+            "whether to retry, settle, or manually clean the source."
+        )
+    if category == MISDIRECTED_WRITE_STRUCTURAL:
+        return (
+            "Executor made a structural change (deletion, rename, or "
+            "mode-only change) in the source checkout. v1 does not "
+            "auto-adopt structural changes. Work is preserved in the "
+            "misdirected-write artifacts. Operator must decide."
+        )
+    return (
+        "Executor wrote to the source checkout instead of the "
+        "AgentOps worktree. Work is preserved in the misdirected-write "
+        "artifacts. Operator must decide whether to retry, settle, or "
+        "manually reconcile the source checkout."
+    )

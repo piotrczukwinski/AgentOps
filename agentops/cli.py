@@ -294,6 +294,18 @@ def build_parser() -> argparse.ArgumentParser:
     timeline_cmd.add_argument("--roadmap", default=None, help="Filter by roadmap id.")
     timeline_cmd.add_argument("--task", default=None, help="Filter by task id.")
 
+    provenance_cmd = sub.add_parser(
+        "provenance",
+        help="Print AgentOps checkout provenance (HEAD SHA, dirty state).",
+        description=(
+            "Read the on-disk AgentOps package root, compute the current "
+            "git HEAD SHA and dirty state, and print a JSON blob. "
+            "Used by the web stale guard and by the operator's "
+            "post-merge checklist."
+        ),
+    )
+    provenance_cmd.add_argument("--json", action="store_true", help="Emit JSON (default behaviour).")
+
     plan = sub.add_parser("plan", help="Lint a roadmap file without running it. Does not call models or create worktrees.")
     plan.add_argument("--roadmap", required=True, help="Path to roadmap JSON/YAML file.")
     plan.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
@@ -1253,6 +1265,10 @@ def main(argv: list[str] | None = None) -> int:
             print(export_summary(state, args.roadmap_id))
             return 0
 
+        if args.command == "provenance":
+            from .provenance import collect_agentops_provenance
+            print(json.dumps(collect_agentops_provenance(), indent=2, sort_keys=True))
+            return 0
         if args.command == "usage":
             return _cmd_usage(state, args)
 

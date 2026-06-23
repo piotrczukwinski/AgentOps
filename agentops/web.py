@@ -50,6 +50,12 @@ from urllib.parse import parse_qs, urlparse
 from . import bundles
 from .artifacts import safe_name
 from .plan import lint_roadmap
+from .provenance import (
+    collect_agentops_provenance,
+)
+from .provenance import (
+    is_stale as _provenance_is_stale,
+)
 from .state import StateStore
 from .timeline import (
     latest_by_severity as _timeline_latest_by_severity,
@@ -2390,6 +2396,13 @@ class _State:
         self.state = state
         self._lock = threading.Lock()
         self._procs: dict[str, _RunRecord] = {}
+        # PR #59: provenance captured at server startup. The web
+        # endpoint compares this snapshot against the current
+        # AgentOps checkout on every /api/run call; when the SHAs
+        # differ the request is refused with HTTP 409 so the
+        # operator restarts the server before any roadmap run uses
+        # stale code.
+        self.startup_provenance = collect_agentops_provenance()
 
     def remember_run(self, roadmap: str, proc: subprocess.Popen[bytes], argv: list[str]) -> str:
         run_id = f"{Path(roadmap).stem}-{proc.pid}"
@@ -2582,7 +2595,23 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
             self._handle_bundle_validate(path)
             return
         if path == "/api/health":
-            self._send_json({"ok": True, "db_path": str(self._server_state().state.db_path)})
+            # PR #59: include startup + current provenance so the
+            # dashboard can surface "agentops server stale" without
+            # having to call /api/admin.
+            state = self._server_state()
+            startup = getattr(state, "startup_provenance", None) or {}
+            current = collect_agentops_provenance()
+            self._send_json(
+                {
+                    "ok": True,
+                    "db_path": str(state.state.db_path),
+                    "agentops_provenance": {
+                        "startup": startup,
+                        "current": current,
+                        "stale": _provenance_is_stale(startup, current),
+                    },
+                }
+            )
             return
         if path == "/api/admin":
             self._send_json(collect_admin_snapshot(self._server_state().state))
@@ -3473,6 +3502,28 @@ class AgentOpsRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_run(self, payload: dict[str, Any]) -> None:
+        # PR #59: refuse the run when the AgentOps checkout SHA has
+        # changed since the server was started. This prevents the
+        # running in-process code (with the old profile schema,
+        # old prompt prefix, old orchestrator logic) from being
+        # used to start a fresh roadmap run that expects the new
+        # behaviour. The operator must restart the server.
+        state = self._server_state()
+        startup = getattr(state, "startup_provenance", None)
+        if isinstance(startup, dict):
+            current = collect_agentops_provenance()
+            if _provenance_is_stale(startup, current):
+                self._send_json(
+                    {
+                        "started": False,
+                        "error": "agentops server stale; restart required",
+                        "failure_category": "agentops_server_stale",
+                        "server_sha": startup.get("head_sha"),
+                        "current_sha": current.get("head_sha"),
+                    },
+                    status=409,
+                )
+                return
         roadmap = payload.get("roadmap")
         if not isinstance(roadmap, str) or not roadmap.strip():
             self._send_json({"started": False, "error": "roadmap is required"}, status=400)

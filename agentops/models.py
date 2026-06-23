@@ -349,6 +349,87 @@ NON_WATCHDOG_BLOCKING_CATEGORIES = frozenset(
     }
 )
 
+# PR #59: misdirected write failure categories. Distinct from
+# ``worktree_leak`` (worktree top-level wrong) and ``source_repo_dirty``
+# (source was already dirty before the attempt). These describe the
+# executor's own writes landing in the source repo.
+#
+# v2 (PR #59 repair): the decision is no longer a hard 1/0 gate on
+# ``allowed_files``. Regular add/modify outside ``allowed_files`` is
+# adopted as a *scope deviation* (advisory) so the reviewer can decide.
+# Hard blocking is reserved for sensitive / forbidden / conflict /
+# structural changes that the reviewer must not see in a worktree.
+MISDIRECTED_WRITE_ADOPTED = "misdirected_write_adopted"
+MISDIRECTED_WRITE_SCOPE_DEVIATION = "misdirected_write_scope_deviation"
+MISDIRECTED_WRITE_SENSITIVE = "misdirected_write_sensitive"
+MISDIRECTED_WRITE_STRUCTURAL = "misdirected_write_structural"
+MISDIRECTED_WRITE_UNSAFE = "misdirected_write_unsafe"
+MISDIRECTED_WRITE_CONFLICT = "misdirected_write_conflict"
+MISDIRECTED_WRITE_QUARANTINED = "misdirected_write_quarantined"
+MISDIRECTED_WRITE_ADOPTION_FAILED = "misdirected_write_adoption_failed"
+
+# PR #59: provider/environment failure categories. Non-retryable
+# (operator must fix balance / env / key / endpoint). The orchestrator
+# parks the task with one of these instead of entering validation
+# repair or self-fix loops.
+PROVIDER_MISSING_ENV = "provider_missing_env"
+PROVIDER_AUTH_FAILED = "provider_auth_failed"
+PROVIDER_INSUFFICIENT_BALANCE = "provider_insufficient_balance"
+PROVIDER_ENDPOINT_MISMATCH = "provider_endpoint_mismatch"
+PROVIDER_RATE_LIMITED = "provider_rate_limited"
+PROVIDER_NETWORK_TRANSIENT = "provider_network_transient"
+
+# PR #59: web server staleness guard category.
+AGENTOPS_SERVER_STALE = "agentops_server_stale"
+
+PROVIDER_FAILURE_CATEGORIES = frozenset(
+    {
+        PROVIDER_MISSING_ENV,
+        PROVIDER_AUTH_FAILED,
+        PROVIDER_INSUFFICIENT_BALANCE,
+        PROVIDER_ENDPOINT_MISMATCH,
+        PROVIDER_RATE_LIMITED,
+        PROVIDER_NETWORK_TRANSIENT,
+    }
+)
+
+MISDIRECTED_FAILURE_CATEGORIES = frozenset(
+    {
+        MISDIRECTED_WRITE_ADOPTED,
+        MISDIRECTED_WRITE_SCOPE_DEVIATION,
+        MISDIRECTED_WRITE_SENSITIVE,
+        MISDIRECTED_WRITE_STRUCTURAL,
+        MISDIRECTED_WRITE_UNSAFE,
+        MISDIRECTED_WRITE_CONFLICT,
+        MISDIRECTED_WRITE_QUARANTINED,
+        MISDIRECTED_WRITE_ADOPTION_FAILED,
+    }
+)
+
+# Categories that describe a successful adoption (the work is in the
+# worktree, the source was restored). Used by docs / dashboards to
+# distinguish "we recovered useful work" from "we parked the task".
+MISDIRECTED_WRITE_ADOPTED_CATEGORIES = frozenset(
+    {
+        MISDIRECTED_WRITE_ADOPTED,
+        MISDIRECTED_WRITE_SCOPE_DEVIATION,
+    }
+)
+
+# Categories that mean the misdirected write blocks the attempt.
+# Sensitive / structural / unsafe / conflict / quarantined / adoption
+# failed all stop the task with an AWAITING_HUMAN / BLOCKED state.
+MISDIRECTED_WRITE_BLOCKING_CATEGORIES = frozenset(
+    {
+        MISDIRECTED_WRITE_SENSITIVE,
+        MISDIRECTED_WRITE_STRUCTURAL,
+        MISDIRECTED_WRITE_UNSAFE,
+        MISDIRECTED_WRITE_CONFLICT,
+        MISDIRECTED_WRITE_QUARANTINED,
+        MISDIRECTED_WRITE_ADOPTION_FAILED,
+    }
+)
+
 # Canonical v1 default for ``ReviewConfig.max_executor_review_repairs``.
 # Codex owns repair reasoning; MiniMax / opencode may do at most one
 # large mechanical repair per task. After the budget is exhausted the

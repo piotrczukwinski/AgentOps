@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from .models import DiffSnapshot, PolicyResult, ReviewVerdict, TaskConfig, ValidationResult
 from .policy import PolicyEngine
@@ -123,6 +124,8 @@ class PromptCompiler:
         validation: ValidationResult,
         *,
         attempt: int | None = None,
+        scope_deviation: dict[str, Any] | None = None,
+        policy_advisory: tuple[dict[str, Any], ...] | None = None,
     ) -> str:
         validation_summary = [
             {
@@ -146,6 +149,14 @@ class PromptCompiler:
             if attempt is not None
             else "Attempt: 1"
         )
+        # PR #59 v2: surface advisory policy issues
+        # (``files.not_allowed`` is warning by default) and the
+        # misdirected-write scope-deviation packet so the
+        # reviewer can decide whether the out-of-scope files
+        # are legitimate.
+        policy_advisory = policy_advisory or ()
+        advisory_block = _format_policy_advisory(policy_advisory)
+        scope_deviation_block = _format_scope_deviation(scope_deviation)
         return "\n".join(
             [
                 "# AgentOps Codex review packet",
@@ -190,6 +201,22 @@ class PromptCompiler:
                 changed_files_block,
                 "# Per-file scope table (in_scope=true means the change is allowed; do not block on it)",
                 scope_table,
+                "# Policy advisory (PR #59 v2)",
+                "``allowed_files`` is an expected-scope hint, not a hard safety boundary.",
+                "The following issues are advisory; they did NOT block the attempt.",
+                "Decide ACCEPT / REQUEST_CHANGES / BLOCK / OPERATOR_DECISION_REQUIRED accordingly:",
+                advisory_block,
+                "# Misdirected-write scope deviation (PR #59 v2)",
+                "The executor wrote some files outside the assigned worktree. The safe",
+                "ones were adopted into the worktree and the source was restored. The",
+                "reviewer must decide whether the out-of-scope files are legitimate.",
+                scope_deviation_block,
+                "# Reviewer guidance for scope deviations",
+                "- ACCEPT if out-of-scope files are legitimate supporting changes.",
+                "- REQUEST_CHANGES if they should be removed, moved, or split.",
+                "- OPERATOR_DECISION_REQUIRED if product / architecture / safety ambiguity remains.",
+                "- BLOCK only for unsafe changes (secrets, structural damage, conflicts).",
+                "",
                 "# Policy result",
                 json.dumps(self.policy_engine.as_jsonable(policy), ensure_ascii=False, indent=2),
                 "# Validation result",
@@ -597,3 +624,63 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n\n[TRUNCATED by AgentOps at {limit} characters]"
+
+
+def _format_policy_advisory(
+    issues: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> str:
+    """Format advisory policy issues for the review packet.
+
+    Returns a Markdown bullet list. When the list is empty,
+    returns the literal ``"- (no advisory issues)"`` so the
+    section is non-empty in the rendered prompt and the
+    reviewer always sees the section header.
+    """
+    if not issues:
+        return "- (no advisory issues)"
+    lines: list[str] = []
+    for issue in issues:
+        name = str(issue.get("name", "?"))
+        severity = str(issue.get("severity", "?"))
+        message = str(issue.get("message", ""))
+        path = issue.get("path")
+        path_part = f" (path: {path})" if path else ""
+        lines.append(f"- [{severity}] {name}{path_part}: {message}")
+    return "\n".join(lines)
+
+
+def _format_scope_deviation(packet: dict[str, Any] | None) -> str:
+    """Format the misdirected-write scope-deviation packet.
+
+    Returns a Markdown block describing the adopted paths,
+    the out-of-scope paths, and the reviewer questions. When
+    the packet is empty, returns ``"- (no scope deviation)"``
+    so the section is non-empty.
+    """
+    if not packet:
+        return "- (no scope deviation)"
+    paths = list(packet.get("scope_deviation_paths", ()) or ())
+    adopted = list(packet.get("adoptable_paths", ()) or ())
+    decision_category = str(packet.get("decision_category", ""))
+    strict = bool(packet.get("strict_allowed_files"))
+    questions = list(packet.get("reviewer_questions", ()) or [])
+    guidance = str(packet.get("reviewer_guidance", ""))
+    lines = [
+        f"- Decision category: {decision_category or '(unknown)'}",
+        f"- Strict allowed_files: {'yes' if strict else 'no'}",
+        f"- Adopted paths (now in worktree): {len(adopted)}",
+    ]
+    if adopted:
+        for path in adopted:
+            lines.append(f"  - `{path}`")
+    lines.append(f"- Out-of-scope scope-deviation paths: {len(paths)}")
+    if paths:
+        for path in paths:
+            lines.append(f"  - `{path}`")
+    if questions:
+        lines.append("- Reviewer questions:")
+        for question in questions:
+            lines.append(f"  - {question}")
+    if guidance:
+        lines.append(f"- Reviewer guidance: {guidance}")
+    return "\n".join(lines)

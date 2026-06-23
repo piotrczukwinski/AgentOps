@@ -35,6 +35,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# PR #59: env-var name validation constants. Module-private so
+# profiles can include an explicit allow-list of which env-var
+# names the runner is allowed to pass through to the executor
+# subprocess (and which are required).
+_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_ENV_FORBIDDEN_CHARS = frozenset(" \t\r\n;|&`<>$(){}[]\\\"'")
+
 # ---------------------------------------------------------------------------
 # Public constants
 # ---------------------------------------------------------------------------
@@ -154,6 +161,18 @@ class ExecutorProfile:
     opencode). ``command_template`` is the optional argv override
     for the ``codex_cli`` provider; when omitted, the runner uses a
     built-in safe default (see :data:`DEFAULT_CODEX_CLI_TEMPLATE`).
+
+    PR #59: ``required_env`` is the list of env-var names that MUST
+    be present in the executor's environment before the runner
+    launches the binary; missing entries are reported as
+    :data:`agentops.provider_failures.PROVIDER_MISSING_ENV` and the
+    attempt is parked instead of entering a repair loop.
+
+    ``env_passthrough`` is the explicit allow-list of env-var names
+    that the runner copies from its own environment into the
+    executor's environment. The default Codex / AgentOps env
+    strip-list is still applied; only the names listed here are
+    preserved.
     """
 
     name: str
@@ -164,6 +183,8 @@ class ExecutorProfile:
     command_template: tuple[str, ...] | None = None
     timeout_seconds: int | None = None
     yolo: bool = False
+    required_env: tuple[str, ...] = ()
+    env_passthrough: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -176,6 +197,8 @@ class ExecutorProfile:
             "command_template": list(self.command_template) if self.command_template is not None else None,
             "timeout_seconds": self.timeout_seconds,
             "yolo": self.yolo,
+            "required_env": list(self.required_env),
+            "env_passthrough": list(self.env_passthrough),
             "metadata": dict(self.metadata),
         }
 
@@ -390,6 +413,81 @@ def _ensure_profile_name(name: Any, *, role: str) -> str:
             "underscore, dash, no whitespace, no path separator"
         )
     return name
+
+
+def _validate_env_name(value: Any, *, field: str, issues: list) -> str | None:
+    """Validate an env-var name.
+
+    Names must be uppercase ASCII letters, digits, and underscore
+    only. They cannot be empty, contain whitespace, or contain
+    shell metacharacters. Returns the validated name or ``None`` if
+    the value was invalid (an issue has been appended to ``issues``).
+    """
+    if not isinstance(value, str) or not value:
+        issues.append(
+            ProfileIssue(
+                code="profile.invalid_env_name",
+                severity="error",
+                message=f"{field}: env-var name must be a non-empty string, got {type(value).__name__ if value is not None else 'None'}",
+                path=field,
+            )
+        )
+        return None
+    if not _ENV_NAME_RE.fullmatch(value):
+        issues.append(
+            ProfileIssue(
+                code="profile.invalid_env_name",
+                severity="error",
+                message=(
+                    f"{field}: env-var name must match ^[A-Z_][A-Z0-9_]*$ "
+                    f"(uppercase letters, digits, underscore), got {value!r}"
+                ),
+                path=field,
+            )
+        )
+        return None
+    if any(ch in value for ch in _ENV_FORBIDDEN_CHARS):
+        issues.append(
+            ProfileIssue(
+                code="profile.invalid_env_name",
+                severity="error",
+                message=f"{field}: env-var name contains forbidden character, got {value!r}",
+                path=field,
+            )
+        )
+        return None
+    return value
+
+
+def _as_env_tuple(
+    raw: Any,
+    *,
+    field: str,
+    issues: list,
+) -> tuple[str, ...]:
+    """Parse a list of env-var names from ``raw``.
+
+    Returns the validated tuple; on invalid entries an issue is
+    appended and the returned tuple excludes the invalid name.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        issues.append(
+            ProfileIssue(
+                code="profile.invalid_env_list",
+                severity="error",
+                message=f"{field}: must be a list of env-var names, got {type(raw).__name__}",
+                path=field,
+            )
+        )
+        return ()
+    out: list[str] = []
+    for index, entry in enumerate(raw):
+        name = _validate_env_name(entry, field=f"{field}[{index}]", issues=issues)
+        if name is not None:
+            out.append(name)
+    return tuple(dict.fromkeys(out))  # dedupe, preserve order
 
 
 def _as_optional_str(value: Any, *, field: str) -> str | None:
@@ -766,6 +864,16 @@ def _validate_executor_profile(
         )
         return None
     metadata = _as_metadata(raw.get("metadata"), field=f"profiles.executors.{name}.metadata")
+    required_env = _as_env_tuple(
+        raw.get("required_env"),
+        field=f"profiles.executors.{name}.required_env",
+        issues=issues,
+    )
+    env_passthrough = _as_env_tuple(
+        raw.get("env_passthrough"),
+        field=f"profiles.executors.{name}.env_passthrough",
+        issues=issues,
+    )
     if provider_raw == "codex_cli":
         if template is None and not _has_codex_cli_safe_default(profile):
             issues.append(
@@ -806,6 +914,8 @@ def _validate_executor_profile(
         command_template=template,
         timeout_seconds=timeout,
         yolo=bool(yolo_raw),
+        required_env=required_env,
+        env_passthrough=env_passthrough,
         metadata=metadata,
     )
 

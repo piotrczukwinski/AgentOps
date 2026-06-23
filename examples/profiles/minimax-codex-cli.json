@@ -17,19 +17,47 @@
           "{cwd}",
           "{prompt_file}"
         ],
-        "timeout_seconds": 5400
+        "timeout_seconds": 5400,
+        "required_env": [
+          "MINIMAX_API_KEY"
+        ],
+        "env_passthrough": [
+          "MINIMAX_API_KEY",
+          "ANTHROPIC_API_KEY",
+          "ANTHROPIC_AUTH_TOKEN",
+          "ANTHROPIC_BASE_URL",
+          "ANTHROPIC_MODEL",
+          "ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+        ]
       },
       "minimax-via-opencode": {
         "provider": "opencode",
         "model": "minimax/MiniMax-M3",
-        "timeout_seconds": 5400
+        "timeout_seconds": 5400,
+        "required_env": [
+          "MINIMAX_API_KEY"
+        ],
+        "env_passthrough": [
+          "MINIMAX_API_KEY"
+        ]
       }
     },
     "reviewers": {
       "codex-high": {
         "provider": "codex_cli",
         "profile": "default",
-        "reasoning_effort": "high"
+        "reasoning_effort": "high",
+        "env_passthrough": [
+          "ANTHROPIC_API_KEY",
+          "ANTHROPIC_AUTH_TOKEN",
+          "ANTHROPIC_BASE_URL",
+          "ANTHROPIC_MODEL",
+          "ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+        ]
       },
       "heuristic": {
         "provider": "heuristic"
