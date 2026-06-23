@@ -328,3 +328,30 @@ visible.
   resolved profile.
 * :doc:`local-web-ui` — the admin panel's UI surface.
 * :doc:`admin-panel-architecture` — the operator cockpit layout.
+
+## Repair routing v1 (PR #58)
+
+The Codex-CLI executor and the profile registry together own
+the runtime side of the repair contract; the *reasoning* side
+is owned by Codex. See `docs/gated-roadmap-runner.md` for the
+full repair-routing contract; the key fields on
+`ReviewConfig` are:
+
+* `self_fix_max_lines` (default 300) — soft budget.
+* `self_fix_hard_max_lines` (default 800) — safety cap.
+* `max_codex_self_fix_cycles` (default 2) — Codex self-fix
+  cycles per task.
+* `max_executor_review_repairs` (v1 default **1**) — MiniMax /
+  opencode large mechanical repairs per task. After the budget
+  is exhausted, the orchestrator either lets Codex self-fix the
+  remaining issues (the default path) or asks the operator to
+  decide.
+
+The Codex-owns-repair-reasoning principle is enforced by the
+orchestrator's `REQUEST_CHANGES` branch: Codex self-fix is
+attempted first; if the budget is exhausted and MiniMax has
+already been re-run, the task is blocked with
+`failure_category=executor_repair_budget_exceeded` or
+`review_churn_limit`. The reviewer prompt carries the repair
+classification contract; the orchestrator never invents a
+strategy.

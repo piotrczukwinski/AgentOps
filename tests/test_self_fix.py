@@ -116,20 +116,53 @@ class SelfFixPromptTests(unittest.TestCase):
         roadmap = RoadmapConfig(
             version=1, roadmap_id="r", repo=RepoConfig(id="r", path=Path("/tmp")), tasks=(self._task(),)
         )
-        text = PromptCompiler(PolicyEngine(roadmap)).self_fix_prompt(self._task(), verdict, max_lines=25)
-        # Size guidance is communicated upstream, without making it a hard stop.
+        text = PromptCompiler(PolicyEngine(roadmap)).self_fix_prompt(
+            self._task(), verdict, max_lines=25
+        )
+        # PR #58: soft budget is communicated upstream, hard budget is
+        # also surfaced so the reviewer sees the stop point.
         self.assertIn("roughly around 25 changed lines", text)
-        self.assertIn("you may apply it", text)
+        self.assertIn("Hard cap is", text)
         # Allowed files are listed.
         self.assertIn("widget.py", text)
         # Skip mechanism is documented.
         self.assertIn(SELF_FIX_SKIP_MARKER, text)
-        self.assertIn("NO file changes", text)
+        self.assertIn("make NO file changes", text)
+        # Repair classification contract is present (PR #58).
+        # PR #58.1: ``SELF_FIX_BY_CODEX`` is documented as the
+        # edit (not skip) classification; the skip marker only
+        # accepts ``LARGE_MECHANICAL_REPAIR`` /
+        # ``OPERATOR_DECISION_REQUIRED`` / ``BLOCK``.
+        self.assertIn("SELF_FIX_BY_CODEX", text)
+        self.assertIn("LARGE_MECHANICAL_REPAIR", text)
+        self.assertIn("OPERATOR_DECISION_REQUIRED", text)
+        self.assertIn("Do NOT use SELF_FIX_BY_CODEX as a skip classification", text)
+        self.assertIn("the repair-reasoning owner", text)
         # Blocking issue content is present.
         self.assertIn("bad name check", text)
         self.assertIn("Change the check to substring.", text)
         # Minimal-change instruction.
         self.assertIn("MINIMAL", text)
+
+    def test_prompt_uses_explicit_hard_max_when_provided(self) -> None:
+        # PR #58: callers can pass an explicit hard_max_lines; the
+        # prompt surfaces it verbatim so the reviewer knows the stop
+        # point.
+        verdict = ReviewVerdict(
+            verdict="REQUEST_CHANGES", summary="x", repair_prompt="y"
+        )
+        task = self._task()
+        roadmap = RoadmapConfig(
+            version=1,
+            roadmap_id="r",
+            repo=RepoConfig(id="r", path=Path("/tmp")),
+            tasks=(task,),
+        )
+        text = PromptCompiler(PolicyEngine(roadmap)).self_fix_prompt(
+            task, verdict, max_lines=300, hard_max_lines=800
+        )
+        self.assertIn("roughly around 300 changed lines", text)
+        self.assertIn("hard cap is 800", text)
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +316,13 @@ class SelfFixOrchestratorTests(unittest.TestCase):
             state = StateStore(root / "state.sqlite")
 
             def skip(cwd: Path) -> str:
-                return f"{SELF_FIX_SKIP_MARKER}: needs architectural rework"
+                # PR #58.1: use a structured skip classification so
+                # the orchestrator knows this is a Codex-authorised
+                # large mechanical repair (allowed to fall through to
+                # the executor). The legacy plain "needs architectural
+                # rework" form would be classified as UNKNOWN and
+                # would block the executor repair path.
+                return f"{SELF_FIX_SKIP_MARKER}: LARGE_MECHANICAL_REPAIR needs architectural rework"
 
             fake = _SelfFixFakeCodex(
                 [ScriptedVerdict(verdict="REQUEST_CHANGES", summary="x", repair_prompt="x"),

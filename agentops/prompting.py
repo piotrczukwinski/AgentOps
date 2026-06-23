@@ -209,6 +209,7 @@ class PromptCompiler:
         verdict: ReviewVerdict,
         *,
         max_lines: int,
+        hard_max_lines: int | None = None,
     ) -> str:
         """Build the bounded write-pass prompt for a REQUEST_CHANGES self-fix.
 
@@ -216,7 +217,15 @@ class PromptCompiler:
         self-fix candidate. The line budget is guidance for that decision,
         while the orchestrator still enforces allowed files, validations,
         and re-review after any edit.
+
+        PR #58: the prompt now carries a repair-classification contract
+        (SELF_FIX_BY_CODEX / LARGE_MECHANICAL_REPAIR /
+        OPERATOR_DECISION_REQUIRED / BLOCK) and an explicit soft +
+        hard budget. The reviewer decides which classification fits;
+        the orchestrator enforces the hard stop and the churn guard.
         """
+        if hard_max_lines is None:
+            hard_max_lines = max(max_lines * 4, max_lines + 50)
         blocking_lines: list[str] = []
         for index, issue in enumerate(verdict.blocking_issues or (), start=1):
             if not isinstance(issue, dict):
@@ -237,23 +246,69 @@ class PromptCompiler:
             [
                 "# AgentOps self-fix pass (REQUEST_CHANGES)",
                 "You previously reviewed this attempt and returned REQUEST_CHANGES.",
-                "You now have ONE bounded write pass to apply the fix YOURSELF.",
-                "Apply the MINIMAL edit that resolves the blocking issues below.",
+                "You are the repair-reasoning owner: you decide whether to apply",
+                "the fix YOURSELF (small/medium bounded), defer to the executor",
+                "for a large mechanical repair, request operator input, or block.",
+                "AgentOps enforces the soft + hard budget and the churn guard;",
+                "it does NOT choose the repair strategy for you.",
                 "",
-                "# Scope decision",
+                "# Repair classification (you MUST pick one)",
+                "",
+                "- SELF_FIX_BY_CODEX: apply the MINIMAL edit that resolves the",
+                "  blocking issues below. Use this when the fix is bounded,",
+                "  within the allowed files, testable, free of",
+                "  product/architecture ambiguity, and within the soft budget",
+                f"  (roughly {max_lines} changed lines). Hard cap is",
+                f"  {hard_max_lines}; exceeding it stops the task and asks",
+                "  the operator.",
+                "- LARGE_MECHANICAL_REPAIR: the fix is clearly scoped but",
+                "  larger than the soft budget (or touches many allowed files).",
+                "  You MUST author the repair prompt yourself, including the",
+                "  exact diagnosis, affected files, allowed files, non-goals,",
+                "  validation commands, and stop conditions. The executor will",
+                "  run at most one such repair per task. Skip with",
+                f"  {SELF_FIX_SKIP_MARKER}: LARGE_MECHANICAL_REPAIR <reason>.",
+                "- OPERATOR_DECISION_REQUIRED: the fix needs a product,",
+                "  architecture, schema, RBAC, tenant, audit, or security",
+                "  decision that AgentOps cannot make. Skip with",
+                f"  {SELF_FIX_SKIP_MARKER}: OPERATOR_DECISION_REQUIRED <reason>.",
+                "- BLOCK: the change is unsafe regardless of scope. Skip with",
+                f"  {SELF_FIX_SKIP_MARKER}: BLOCK <reason>.",
+                "",
+                "# Scope decision (when SELF_FIX_BY_CODEX)",
                 f"- Target a small/medium fix, roughly around {max_lines} changed lines when practical.",
-                "- If the correct fix is larger but still clearly scoped, you may apply it.",
+                f"- The hard cap is {hard_max_lines} changed lines; exceeding it stops the task.",
+                "- If the correct fix is larger but still clearly scoped, prefer",
+                "  LARGE_MECHANICAL_REPAIR and write the repair prompt.",
                 "- Edit ONLY files listed under Allowed files. Any other file is out of scope.",
                 "- Do NOT refactor, rename, reformat, reorder, or 'improve' anything else.",
                 "- Do NOT weaken or remove existing tests or validations.",
                 "- Make the smallest possible change that fixes the reported issues.",
                 "",
-                "# If the fix is too large or ambiguous",
-                "If the correct fix is large, ambiguous, risky, or needs architectural judgement:",
-                "make NO file changes and instead print exactly:",
-                f"    {SELF_FIX_SKIP_MARKER}: <short reason>",
-                "AgentOps will then fall back to the executor. Skipping is the correct",
-                "choice for broad repairs; do NOT attempt a partial edit.",
+                "# If you cannot self-fix",
+                "If the fix is too large, ambiguous, or needs architectural",
+                "judgement, make NO file changes and instead print exactly ONE",
+                "of these skip markers, on its own line:",
+                f"    {SELF_FIX_SKIP_MARKER}: LARGE_MECHANICAL_REPAIR <short reason>",
+                f"    {SELF_FIX_SKIP_MARKER}: OPERATOR_DECISION_REQUIRED <short reason>",
+                f"    {SELF_FIX_SKIP_MARKER}: BLOCK <short reason>",
+                "",
+                "Do NOT use SELF_FIX_BY_CODEX as a skip classification. If",
+                "you classify the fix as SELF_FIX_BY_CODEX, you must edit",
+                "(not skip). An unknown classification is treated",
+                "conservatively as a malformed marker and blocks the task;",
+                "the executor will NOT be re-run.",
+                "",
+                "AgentOps will route the marker as follows:",
+                "  - LARGE_MECHANICAL_REPAIR may queue exactly one",
+                "    executor repair per task, using your authored",
+                "    repair prompt.",
+                "  - OPERATOR_DECISION_REQUIRED does NOT queue an",
+                "    executor repair; the task is parked for the operator.",
+                "  - BLOCK does NOT queue an executor repair; the task",
+                "    is blocked.",
+                "Skipping is the correct choice for broad repairs; do NOT",
+                "attempt a partial edit.",
                 "",
                 "# Allowed files (edit only these)",
                 _bullet(task.allowed_files) or "- (none)",

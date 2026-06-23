@@ -967,3 +967,144 @@ pr-loop MVP JSON shape directly and feed it to `pr-loop` instead of
 pasting prompts manually between OpenCode and Codex. See
 `docs/operator-run-harness.md` for the per-cycle operator-run
 contract.
+
+## Worktree discipline (PR #58)
+
+`codex exec -C <worktree>` is **not** a hard lock. The executor
+can still resolve absolute paths from the source checkout, edit
+the wrong files, and silently corrupt the main checkout. PR #58
+adds two guards:
+
+1. **Prompt guard** — a mandatory, deterministic
+   `WORKTREE DISCIPLINE — MANDATORY` prefix is prepended to
+   every worktree-backed executor prompt. The prefix tells the
+   executor exactly:
+
+   * the expected worktree root,
+   * the source repo root (read-only for this task),
+   * the rule "edit only under the worktree root, never under
+     the source repo root",
+   * the safety-check commands (`pwd`, `git rev-parse
+     --show-toplevel`, `git status --short`),
+   * the list of allowed files,
+   * the failure category (`worktree_leak`) that will be
+     recorded on violation.
+
+   The prefix is rendered by
+   `agentops.worktree_guard.render_worktree_discipline_prefix`
+   and is unit-tested for determinism, allowed-files, the
+   safety-check commands, and the "never edit the source repo
+   root" rule. Pure review / settlement / self-fix prompts are
+   untouched.
+
+2. **Runtime leak detection** — for every executor attempt, the
+   orchestrator captures a `GitSnapshot` of the source repo
+   *before* and *after* the run, plus a snapshot of the
+   worktree. `detect_worktree_leak` reports a leak when:
+
+   * the source repo working tree changed (excluding
+     `.agentops/` and `.operator-runs/` which are legitimate
+     AgentOps runtime metadata),
+   * the worktree top-level is not the expected worktree
+     root,
+   * or the source repo changed while the worktree diff was
+     empty (the original Biuro P2 symptom).
+
+   On leak detection, the task transitions to `BLOCKED` with
+   `failure_category=worktree_leak` and a
+   `task.worktree_leak_detected` event. Durable artifacts are
+   written into the attempt directory:
+
+   * `worktree-leak.repo-before-status.txt`
+   * `worktree-leak.repo-after-status.txt`
+   * `worktree-leak.repo-after-diff.patch`
+   * `worktree-leak.worktree-status.txt`
+   * `worktree-leak.worktree-diff.patch`
+   * `worktree-leak.diagnosis.json`
+
+   **AgentOps does not auto-revert the leaked changes.** The
+   evidence is preserved for the operator. See
+   `docs/failure-modes.md` for the operator playbook.
+
+## Repair routing v1 (PR #58)
+
+The Codex-owns-repair-reasoning principle is the new v1 default.
+The orchestrator no longer lets MiniMax / opencode re-run
+indefinitely after a `REQUEST_CHANGES` verdict; the contract is:
+
+* **Codex self-fix** is the v1 default for small / medium
+  bounded repairs. The reviewer prompt carries a
+  *repair classification* (`SELF_FIX_BY_CODEX`,
+  `LARGE_MECHANICAL_REPAIR`, `OPERATOR_DECISION_REQUIRED`,
+  `BLOCK`) and a soft + hard line budget. The reviewer decides
+  which classification fits; the orchestrator enforces the
+  budgets and the churn guard.
+
+* **MiniMax may do at most one large mechanical repair per
+  task**, and only when Codex has already produced a
+  Codex-authored repair prompt (the
+  `LARGE_MECHANICAL_REPAIR` path). The v1 default is
+  `review.max_executor_review_repairs: 1`.
+
+* **Operator decision** is required for product / architecture
+  / schema / RBAC / tenant / audit / security changes. Codex
+  signals this with the `OPERATOR_DECISION_REQUIRED` skip
+  marker.
+
+### Soft + hard budget (replaces the 30-line hard cap)
+
+The pre-#58 behaviour used a single 30-line cap; real
+contract-level fixes were 50–300 lines, so the cap caused the
+self-fix to be rejected as `self_fix_size_exceeded` and the
+orchestrator re-ran the executor. PR #58 replaces this with a
+soft + hard budget pair:
+
+| Field                          | Default | Role                                   |
+| ------------------------------ | ------- | -------------------------------------- |
+| `self_fix_max_lines`           | 300     | Soft budget. Carried in the prompt.    |
+| `self_fix_hard_max_lines`      | 800     | Safety cap. Exceeding it blocks.       |
+| `max_codex_self_fix_cycles`    | 2       | Codex self-fix cycles per task.        |
+| `max_executor_review_repairs`  | 1       | MiniMax / opencode large mechanical repairs per task. |
+
+The orchestrator emits the new events:
+
+* `task.repair_classified` — telemetry for every
+  `REQUEST_CHANGES` cycle (cycle count, self-fix cycles used,
+  executor repairs used).
+* `task.codex_self_fix_started` / `task.codex_self_fix_completed`
+  — per self-fix pass.
+* `task.self_fix_soft_budget_exceeded` — soft-budget warning
+  (does not block; the fix can still be accepted).
+* `task.self_fix_hard_budget_exceeded` — hard-budget stop
+  (blocks the task; the fix is rolled back).
+* `task.executor_repair_queued` / `task.executor_repair_budget_exceeded`
+  — MiniMax repair churn guard.
+* `task.review_churn_limit_reached` — `REQUEST_CHANGES`
+  cycle cap reached.
+
+### Churn guard
+
+The churn guard is a safety / cost guard, not a quality bypass.
+It blocks the task with a canonical failure category when:
+
+* `REQUEST_CHANGES` cycles exceed
+  `max(2, max_codex_self_fix_cycles + max_executor_review_repairs)`;
+* the hard self-fix budget is exceeded more than once;
+* or the executor repair budget is exhausted.
+
+The v1 default for `max_executor_review_repairs` is **1**: MiniMax
+/ opencode may do at most one large mechanical repair per task.
+After the budget is exhausted, the orchestrator either lets
+Codex self-fix the remaining issues (the default path) or asks
+the operator to decide. The two failure categories are
+`executor_repair_budget_exceeded` and `review_churn_limit` (see
+`docs/failure-modes.md`). Roadmaps that explicitly want more
+than one executor repair can opt in by setting
+`max_executor_review_repairs` to a higher value.
+
+### Re-review
+
+Codex always re-reviews after any self-fix or MiniMax repair.
+The re-review verdict is the one that decides whether the fix
+is accepted; the orchestrator never silently re-uses a previous
+`ACCEPT` after a `REQUEST_CHANGES`.

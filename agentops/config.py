@@ -223,6 +223,9 @@ def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
                 model_reasoning_effort=roadmap_review.model_reasoning_effort,
                 self_fix=roadmap_review.self_fix,
                 self_fix_max_lines=roadmap_review.self_fix_max_lines,
+                self_fix_hard_max_lines=roadmap_review.self_fix_hard_max_lines,
+                max_codex_self_fix_cycles=roadmap_review.max_codex_self_fix_cycles,
+                max_executor_review_repairs=roadmap_review.max_executor_review_repairs,
             )
         elif isinstance(review_data, str):
             review = ReviewConfig(codex=review_data)
@@ -245,6 +248,24 @@ def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
                 self_fix=bool(review_data.get("self_fix", roadmap_review.self_fix)),
                 self_fix_max_lines=int(
                     review_data.get("self_fix_max_lines", roadmap_review.self_fix_max_lines)
+                ),
+                self_fix_hard_max_lines=int(
+                    review_data.get(
+                        "self_fix_hard_max_lines",
+                        roadmap_review.self_fix_hard_max_lines,
+                    )
+                ),
+                max_codex_self_fix_cycles=int(
+                    review_data.get(
+                        "max_codex_self_fix_cycles",
+                        roadmap_review.max_codex_self_fix_cycles,
+                    )
+                ),
+                max_executor_review_repairs=int(
+                    review_data.get(
+                        "max_executor_review_repairs",
+                        roadmap_review.max_executor_review_repairs,
+                    )
                 ),
                 profile=_as_optional_str(
                     review_data.get("profile"),
@@ -447,7 +468,33 @@ def _build_roadmap_review(value: Any, defaults: dict[str, Any], *, base: Path) -
         codex_model=_resolve_codex_model(value, defaults),
         model_reasoning_effort=_resolve_model_reasoning_effort(value, defaults),
         self_fix=bool(value.get("self_fix", defaults.get("review_self_fix", True))),
-        self_fix_max_lines=int(value.get("self_fix_max_lines", defaults.get("review_self_fix_max_lines", 30))),
+        self_fix_max_lines=int(
+            value.get(
+                "self_fix_max_lines",
+                defaults.get("review_self_fix_max_lines", 300),
+            )
+        ),
+        self_fix_hard_max_lines=int(
+            value.get(
+                "self_fix_hard_max_lines",
+                defaults.get("review_self_fix_hard_max_lines", 800),
+            )
+        ),
+        max_codex_self_fix_cycles=int(
+            value.get(
+                "max_codex_self_fix_cycles",
+                defaults.get("review_max_codex_self_fix_cycles", 2),
+            )
+        ),
+        max_executor_review_repairs=int(
+            value.get(
+                "max_executor_review_repairs",
+                defaults.get(
+                    "review_max_executor_review_repairs",
+                    1,
+                ),
+            )
+        ),
         profile=_as_optional_str(value.get("profile"), field="review.profile"),
         reasoning_effort=_normalize_reasoning_effort(
             value.get("reasoning_effort"),
