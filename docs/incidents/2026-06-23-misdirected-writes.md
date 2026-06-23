@@ -62,14 +62,22 @@ runtime containment layer in the orchestrator that:
 1. **Detects** the in-attempt source-repo write (Layer C,
    `agentops.misdirected_writes`).
 2. **Quarantines** the work — diagnosis JSON, source status
-   before / after, source diff, and a zip of every changed
-   source file — so the work is never lost.
+   before / after, source diff, a zip of every changed source
+   file, and a ``scope-deviation.json`` packet (PR #59 v2) so
+   the work is never lost.
 3. **Adopts** the safe parts (regular add / modify under
-   ``allowed_files``) into the worktree, **restoring** the
-   source repo to its pre-attempt state.
-4. **Blocks** the attempt with a canonical
-   ``misdirected_write_unsafe`` or ``misdirected_write_conflict``
-   category when the writes are not safe to adopt.
+   ``allowed_files`` **or** outside ``allowed_files`` as a
+   *scope deviation* — PR #59 v2) into the worktree,
+   **restoring** the source repo to its pre-attempt state.
+4. **Blocks** the attempt with a canonical category when the
+   writes are not safe to adopt:
+   * ``misdirected_write_sensitive`` — ``.env``, secrets,
+     lockfiles, db files, migrations.
+   * ``misdirected_write_structural`` — deletions / renames.
+   * ``misdirected_write_conflict`` — same path changed in
+     source and worktree with different bytes.
+   * ``misdirected_write_unsafe`` — only fires in strict mode
+     (``x_allowed_files_strict=true``) for out-of-scope files.
 5. **Redacts** the source repo path from the executor prompt
    (Layer B) so the model has no clue where the source
    checkout lives; the worktree is the only path the executor
@@ -90,12 +98,47 @@ runtime containment layer in the orchestrator that:
   the write at the syscall level.
 * It does **not** auto-adopt deletions or renames in v1.
   v1 only handles regular add / modify. Deletions and
-  renames are blocked with ``misdirected_write_unsafe`` so
-  the operator can decide.
+  renames are blocked with ``misdirected_write_structural``
+  so the operator can decide.
 * It does **not** add a new safety model around the source
   repo's own uncommitted state before the attempt. PR #58
   ``source_repo_dirty`` already handles that case; PR #59
   does not change it.
+* PR #59 v2 narrows the ``worktree_leak`` trigger to topology
+  mismatch and unsafe-class refusals; the safe-adoption path
+  through the misdirected-write handler is not preempted.
+
+## v1 -> v2 deltas (PR #59 v2)
+
+The original PR #59 treated ``allowed_files`` as a hard 1/0
+gate: a regular docs file outside ``allowed_files`` was a
+``misdirected_write_unsafe`` block. That is wrong for
+AgentOps. ``allowed_files`` is the *expected* scope of a task,
+not a hard safety boundary; the reviewer is responsible for
+deciding whether out-of-scope files are legitimate. The repair:
+
+* ``files.not_allowed`` policy issue: critical -> warning
+  (advisory, forwarded to the reviewer).
+* Strict opt-in: ``metadata.x_allowed_files_strict=true`` or
+  ``policies.allowed_files_mode="strict"`` re-enables the v1
+  hard-block.
+* Out-of-scope regular add/modify: blocked -> adopted as
+  ``misdirected_write_scope_deviation``.
+* ``.env`` / secrets / lockfiles / db / migrations: blocked as
+  ``misdirected_write_unsafe`` -> blocked as
+  ``misdirected_write_sensitive`` (operator decision).
+* Deletions / renames: blocked as ``misdirected_write_unsafe``
+  -> blocked as ``misdirected_write_structural``.
+* Worktree-leak detector: runs before misdirected-write ->
+  runs after, only blocks for topology mismatch / unsafe
+  class.
+* ``_handle_misdirected_write``: references
+  ``orchestrator.state.TaskState`` (AttributeError) -> uses
+  imported ``TaskState`` directly.
+* Review packet: includes the ``files.not_allowed`` warning
+  plus the misdirected-write ``scope-deviation.json`` packet
+  and explicit reviewer guidance (ACCEPT vs REQUEST_CHANGES
+  vs OPERATOR_DECISION_REQUIRED vs BLOCK).
 
 ## Repro / regression
 

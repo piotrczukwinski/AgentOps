@@ -1816,10 +1816,13 @@ class CumulativeRepairDiffTests(unittest.TestCase):
             self.assertIn("out.txt", final_prompt)
             self.assertIn("Attempt: 3", final_prompt)
 
-    def test_scenario_e_policy_still_blocks_out_of_scope_cumulative_files(self) -> None:
-        """Scenario E: the policy must still block on a forbidden /
-        out-of-scope file even when the file only appeared in a later
-        attempt. The cumulative diff still drives the decision.
+    def test_scenario_e_policy_advisory_does_not_block_out_of_scope_files(self) -> None:
+        """Scenario E (PR #59 v2): an out-of-scope file added in a
+        later attempt is **advisory** by default. The policy
+        records ``files.not_allowed`` with ``severity=warning``
+        and forwards it to the reviewer instead of blocking the
+        task before review. The reviewer decides whether the
+        out-of-scope file is acceptable.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1852,10 +1855,9 @@ class CumulativeRepairDiffTests(unittest.TestCase):
             )
             state = StateStore(root / "state.sqlite")
             roadmap = load_roadmap(roadmap_path)
-            # Force attempt 2 via REQUEST_CHANGES, then have the
-            # forbidden-file runner add an out-of-scope file. The
-            # cumulative diff on attempt 2 includes both out.txt and
-            # intruder.md, so the policy must block on the intruder.
+            # Attempt 1: codex REQUEST_CHANGES, then repair creates
+            # the out-of-scope file. PR #59 v2: the policy flags
+            # it as warning, the reviewer accepts.
             fake_codex = FakeCodexService(
                 [
                     ScriptedVerdict(verdict="REQUEST_CHANGES", summary="r1", repair_prompt="f1"),
@@ -1876,13 +1878,83 @@ class CumulativeRepairDiffTests(unittest.TestCase):
                 shell_runner=fake_runner,
             )
             orch.run_roadmap(roadmap)
+            # The policy decision was advisory; the orchestrator
+            # consulted the reviewer on both attempts and reached
+            # ACCEPT on attempt 2.
             row = state.task_rows("cum-forbidden")[0]
+            self.assertEqual(row["state"], TaskState.ACCEPTED.value)
+            # The runner ran twice (initial + repair).
+            self.assertEqual(len(fake_runner.calls), 2)
+            # Codex was consulted at least twice.
+            self.assertGreaterEqual(len(fake_codex.calls), 2)
+            # The cumulative diff includes both files, so the
+            # review-prompt advisory is on disk.
+            kinds = {a["kind"] for a in state.artifacts_for_task("T1")}
+            self.assertIn("review_prompt", kinds)
+
+    def test_scenario_e_strict_mode_blocks_out_of_scope_cumulative_files(self) -> None:
+        """Scenario E (strict mode): ``x_allowed_files_strict=true``
+        preserves the v1 hard-block for out-of-scope files. The
+        policy must still block on a forbidden / out-of-scope
+        file even when the file only appeared in a later attempt.
+        The cumulative diff still drives the decision.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            roadmap_path = root / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "cum-forbidden-strict",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "required"},
+                                "max_attempts": 3,
+                                "x_allowed_files_strict": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(root / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            fake_codex = FakeCodexService(
+                [
+                    ScriptedVerdict(verdict="REQUEST_CHANGES", summary="r1", repair_prompt="f1"),
+                    ScriptedVerdict(verdict="ACCEPT", safe_to_merge=True),
+                ]
+            )
+            fake_runner = _ForbiddenFileFakeRunner(
+                allowed_file="out.txt", forbidden_file="intruder.md"
+            )
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="codex",
+                    artifacts_root=root / "artifacts",
+                    workspaces_root=root / "workspaces",
+                ),
+                review_service=fake_codex,
+                shell_runner=fake_runner,
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("cum-forbidden-strict")[0]
             self.assertEqual(row["state"], TaskState.BLOCKED.value)
             # The runner ran twice (initial + repair).
             self.assertEqual(len(fake_runner.calls), 2)
-            # Locate the blocked transition. There may be multiple
-            # ``task.blocked`` events if the task went through several
-            # states; the *last* one is the final block.
             blocked_events = [
                 json.loads(e["payload_json"])
                 for e in state.latest_events(50)
@@ -1895,7 +1967,7 @@ class CumulativeRepairDiffTests(unittest.TestCase):
             self.assertIn(
                 "files.not_allowed",
                 names,
-                "cumulative out-of-scope file must be blocked by policy",
+                "strict mode: cumulative out-of-scope file must be blocked by policy",
             )
             # Codex was consulted at least once (REQUEST_CHANGES on
             # attempt 1) but the second review was never reached

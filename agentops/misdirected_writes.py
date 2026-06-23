@@ -27,12 +27,31 @@ Design constraints:
 Categories (mirrored in :mod:`agentops.models`):
 
 * :data:`MISDIRECTED_WRITE_ADOPTED` — work was outside the worktree
-  but matched ``allowed_files`` and was safely adopted.
-* :data:`MISDIRECTED_WRITE_UNSAFE` — work outside the worktree
-  touched files not in ``allowed_files`` (or was a deletion/rename).
-  Attempt is blocked; evidence preserved.
+  but matched ``allowed_files`` and was safely adopted. The
+  orchestrator continues to validation / review.
+* :data:`MISDIRECTED_WRITE_SCOPE_DEVIATION` — work was outside the
+  worktree AND outside ``allowed_files``, but the mutation is a
+  regular add/modify that is not sensitive, forbidden, conflicting, or
+  structural. PR #59 v2 treats ``allowed_files`` as an expected-scope
+  hint, not a hard safety boundary, so this category is **adopted** into
+  the worktree, the source is restored, and a scope-deviation packet
+  is forwarded to the reviewer. The reviewer decides whether the
+  out-of-scope files are legitimate. Roadmaps can opt into a strict
+  mode (see :mod:`agentops.policy`) to make scope-deviation blocking.
+* :data:`MISDIRECTED_WRITE_SENSITIVE` — work outside the worktree
+  touched a sensitive / forbidden path (``.env``, ``.env.*``,
+  secrets, huge binaries, lockfiles unless explicitly allowed, db /
+  sqlite / migrations unless explicitly allowed). Adoption is
+  refused; quarantine artifacts are written; source is restored if
+  safe. Operator decision required.
+* :data:`MISDIRECTED_WRITE_STRUCTURAL` — work outside the worktree
+  was a deletion / rename / mode-only change. v1 does not auto-adopt
+  structural changes; the task is parked with operator decision
+  required.
 * :data:`MISDIRECTED_WRITE_CONFLICT` — work outside the worktree
   targeted a path the worktree also modified differently. Blocked.
+* :data:`MISDIRECTED_WRITE_UNSAFE` — work outside the worktree could
+  not be classified into one of the safer categories. Blocked.
 * :data:`MISDIRECTED_WRITE_QUARANTINED` — work outside the worktree
   could not be adopted or restored; preserved in artifacts, source
   state flagged for operator.
@@ -65,10 +84,33 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 MISDIRECTED_WRITE_ADOPTED = "misdirected_write_adopted"
+MISDIRECTED_WRITE_SCOPE_DEVIATION = "misdirected_write_scope_deviation"
+MISDIRECTED_WRITE_SENSITIVE = "misdirected_write_sensitive"
+MISDIRECTED_WRITE_STRUCTURAL = "misdirected_write_structural"
 MISDIRECTED_WRITE_UNSAFE = "misdirected_write_unsafe"
 MISDIRECTED_WRITE_CONFLICT = "misdirected_write_conflict"
 MISDIRECTED_WRITE_QUARANTINED = "misdirected_write_quarantined"
 MISDIRECTED_WRITE_ADOPTION_FAILED = "misdirected_write_adoption_failed"
+
+# Sets consumed by tests / dashboards. Mirrors
+# :data:`agentops.models.MISDIRECTED_WRITE_ADOPTED_CATEGORIES` and
+# :data:`agentops.models.MISDIRECTED_WRITE_BLOCKING_CATEGORIES`.
+MISDIRECTED_WRITE_ADOPTED_CATEGORIES = frozenset(
+    {
+        MISDIRECTED_WRITE_ADOPTED,
+        MISDIRECTED_WRITE_SCOPE_DEVIATION,
+    }
+)
+MISDIRECTED_WRITE_BLOCKING_CATEGORIES = frozenset(
+    {
+        MISDIRECTED_WRITE_SENSITIVE,
+        MISDIRECTED_WRITE_STRUCTURAL,
+        MISDIRECTED_WRITE_UNSAFE,
+        MISDIRECTED_WRITE_CONFLICT,
+        MISDIRECTED_WRITE_QUARANTINED,
+        MISDIRECTED_WRITE_ADOPTION_FAILED,
+    }
+)
 
 
 # Default patterns ignored when capturing a source mutation snapshot.
@@ -170,7 +212,27 @@ class SourceMutationSnapshot:
 
 @dataclass(frozen=True)
 class MisdirectedWriteDecision:
-    """The verdict of :func:`detect_misdirected_writes`."""
+    """The verdict of :func:`detect_misdirected_writes`.
+
+    PR #59 v2 distinguishes several categories of misdirected write
+    so the orchestrator can adopt the safe ones and forward a
+    reviewer-friendly advisory instead of a hard block:
+
+    * ``adoptable_paths`` -- files that match ``allowed_files``
+      exactly; classic adoption.
+    * ``scope_deviation_paths`` -- regular add/modify outside
+      ``allowed_files`` that is reviewable; adopted and forwarded
+      to the reviewer as a scope-deviation advisory.
+    * ``sensitive_paths`` -- secrets / ``.env`` / huge binaries /
+      lockfiles / db / migrations (unless explicitly allowed). Hard
+      block; operator decision required.
+    * ``conflict_paths`` -- paths the worktree also modified with
+      different bytes. Hard block.
+    * ``unsafe_paths`` -- anything that did not fit the safer
+      buckets. Hard block.
+    ``source_paths`` is the union of every path seen in the
+    source-side mutation.
+    """
 
     detected: bool
     adoptable: bool
@@ -178,9 +240,17 @@ class MisdirectedWriteDecision:
     reason: str
     source_paths: tuple[str, ...] = ()
     adoptable_paths: tuple[str, ...] = ()
+    scope_deviation_paths: tuple[str, ...] = ()
+    sensitive_paths: tuple[str, ...] = ()
     unsafe_paths: tuple[str, ...] = ()
     conflict_paths: tuple[str, ...] = ()
     artifact_names: tuple[str, ...] = ()
+    # Set when the decision is adoptable. ``strict_allowed_files``
+    # preserves the v1 hard-block behaviour for code paths that opt
+    # in (the orchestrator / policy engine still classify the
+    # mutation; the orchestrator then re-raises a blocking
+    # ``scope_deviation`` decision when the policy is strict).
+    strict_allowed_files: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -190,9 +260,12 @@ class MisdirectedWriteDecision:
             "reason": self.reason,
             "source_paths": list(self.source_paths),
             "adoptable_paths": list(self.adoptable_paths),
+            "scope_deviation_paths": list(self.scope_deviation_paths),
+            "sensitive_paths": list(self.sensitive_paths),
             "unsafe_paths": list(self.unsafe_paths),
             "conflict_paths": list(self.conflict_paths),
             "artifact_names": list(self.artifact_names),
+            "strict_allowed_files": self.strict_allowed_files,
         }
 
 
@@ -206,6 +279,7 @@ class AdoptionResult:
     remaining_source_dirty: tuple[str, ...] = ()
     failure_category: str | None = None
     reason: str = ""
+    artifact_names: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -215,6 +289,7 @@ class AdoptionResult:
             "remaining_source_dirty": list(self.remaining_source_dirty),
             "failure_category": self.failure_category,
             "reason": self.reason,
+            "artifact_names": list(self.artifact_names),
         }
 
 
@@ -271,6 +346,128 @@ def _matches_allowed(relpath: str, allowed_files: Sequence[str]) -> bool:
         if candidate == entry:
             return True
     return False
+
+
+def _classify_sensitive(
+    relpath: str,
+    *,
+    allowed_files: Sequence[str],
+    forbidden_globs: Sequence[str] = (),
+    after_size: int | None = None,
+    binary: bool | None = None,
+) -> str | None:
+    """Classify ``relpath`` as one of the sensitive categories.
+
+    Returns the matching reason string, or ``None`` when the path
+    is not sensitive and can be adopted or treated as a scope
+    deviation. ``allowed_files`` is checked so a path that is
+    explicitly allowed (e.g. a project that owns its own
+    ``package-lock.json``) skips the default lockfile rule.
+    ``forbidden_globs`` is the caller's resolved policy globs and
+    is honoured with a strict prefix / glob match.
+    """
+    candidate = relpath.replace("\\", "/").lstrip("/")
+    name = candidate.rsplit("/", 1)[-1]
+    lowered = name.lower()
+
+    # Forbidden globs (e.g. ``.env*``, ``secrets/*``) are ALWAYS
+    # sensitive regardless of explicit allow-listing. Operators opt
+    # out by removing the pattern from the policy, not by adding
+    # the file to ``allowed_files``.
+    for raw in forbidden_globs:
+        if not isinstance(raw, str) or not raw:
+            continue
+        pattern = raw.replace("\\", "/").strip("/")
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(candidate, pattern):
+            return f"matches forbidden glob {raw!r}"
+        if fnmatch.fnmatch("/" + candidate, "/" + pattern):
+            return f"matches forbidden glob {raw!r}"
+
+    # Sensitive filename / extension patterns. These match the
+    # runbook categories: secrets, dotenv, lockfiles (unless
+    # explicitly allowed), databases, migration folders.
+    sensitive_filenames = {
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".env.development",
+        ".env.test",
+        ".envrc",
+        "credentials",
+        "credentials.json",
+        "service-account.json",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+    }
+    if lowered in sensitive_filenames:
+        return f"sensitive filename {name!r}"
+
+    if lowered.startswith(".env."):
+        return "dotenv variant"
+
+    # ``secrets.env`` and similar dotenv-shaped filenames that the
+    # runbook treats as secret material. Match ``*.env`` (any
+    # basename ending in ``.env``) plus the bare ``secrets.*`` /
+    # ``*.secret`` / ``*.token`` shapes.
+    if lowered.endswith(".env"):
+        return f"dotenv-shaped filename {name!r}"
+    for suffix in (".secret", ".secrets", ".token", ".key", ".pem"):
+        if lowered.endswith(suffix):
+            return f"sensitive filename {name!r}"
+    if lowered in {"secrets", "secret", ".secrets"} or lowered.startswith("secrets."):
+        return f"sensitive filename {name!r}"
+
+    if lowered in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb") and not any(
+        _matches_allowed(candidate, [allowed])
+        for allowed in allowed_files
+        if isinstance(allowed, str)
+    ):
+        return f"lockfile {name!r} (not in allowed_files)"
+
+    db_extensions = (".sqlite", ".sqlite3", ".db", ".db3", ".s3db", ".sqlitedb")
+    if any(lowered.endswith(ext) for ext in db_extensions):
+        return f"database file {name!r}"
+
+    if (candidate.startswith("migrations/") or candidate.startswith("migrations\\")) and not any(
+        _matches_allowed(candidate, [allowed])
+        for allowed in allowed_files
+        if isinstance(allowed, str)
+    ):
+        return "migrations/ path"
+    if (candidate.startswith("alembic/") or candidate.startswith("alembic\\")) and not any(
+        _matches_allowed(candidate, [allowed])
+        for allowed in allowed_files
+        if isinstance(allowed, str)
+    ):
+        return "alembic/ path"
+
+    # Huge binary. ``after_size`` comes from the snapshot; we err on
+    # the side of caution (5 MiB cap mirrors the runtime
+    # ``_FILE_BYTES_CAP``). Operators that need to move big files
+    # add them to ``allowed_files`` so the rule is skipped.
+    if (
+        after_size is not None
+        and after_size > _FILE_BYTES_CAP
+        and not _matches_allowed(candidate, allowed_files)
+    ):
+        return f"oversized file ({after_size} bytes)"
+
+    # Binary blob larger than 256 KiB is treated as opaque content
+    # and not adopted unless explicitly allowed. Small binaries
+    # (icons, glyphs) are still reviewable.
+    if (
+        binary is True
+        and after_size is not None
+        and after_size > 256 * 1024
+        and not _matches_allowed(candidate, allowed_files)
+    ):
+        return f"large binary ({after_size} bytes)"
+
+    return None
 
 
 def _file_sha256(path: Path) -> str | None:
@@ -557,12 +754,30 @@ def detect_misdirected_writes(
     allowed_files: Sequence[str],
     worktree_root: Path,
     repo_root: Path,
+    forbidden_globs: Sequence[str] = (),
+    strict_allowed_files: bool = False,
 ) -> MisdirectedWriteDecision:
     """Classify the difference between two source repo snapshots.
 
-    Returns a :class:`MisdirectedWriteDecision` describing whether
-    the executor wrote to the source repo, whether those writes are
-    safe to adopt, and the failure category if not.
+    PR #59 v2: ``allowed_files`` is an expected-scope hint, not a
+    hard safety boundary. Regular add/modify outside
+    ``allowed_files`` is reported as ``adoptable=True`` with
+    ``scope_deviation_paths`` populated; the orchestrator copies
+    those files into the worktree, restores the source, and forwards
+    a scope-deviation packet to the reviewer. Hard blocks are
+    reserved for:
+
+    * sensitive / forbidden paths (secrets, .env, large binaries,
+      lockfiles, db / sqlite, migrations) -- :data:`MISDIRECTED_WRITE_SENSITIVE`,
+    * deletions / renames / mode-only changes -- :data:`MISDIRECTED_WRITE_STRUCTURAL`,
+    * worktree conflicts with different bytes -- :data:`MISDIRECTED_WRITE_CONFLICT`,
+    * everything that does not fit the safer buckets -- :data:`MISDIRECTED_WRITE_UNSAFE`.
+
+    ``strict_allowed_files=True`` re-enables the v1 hard-block
+    behaviour for out-of-scope files. Roadmaps opt in via
+    ``metadata.x_allowed_files_strict`` or
+    ``policies.allowed_files_mode="strict"``; the orchestrator
+    passes the value through.
     """
     if before.error is not None or after.error is not None:
         return MisdirectedWriteDecision(
@@ -594,11 +809,27 @@ def detect_misdirected_writes(
             reason="no source mutation between snapshots",
         )
 
-    # Filter to non-ignored mutations
+    # Filter to non-ignored mutations.
     ignore = tuple(_DEFAULT_IGNORED_PATTERNS)
     candidate_new = tuple(p for p in new_paths if not _matches_ignored(p, ignore))
     candidate_removed = tuple(p for p in removed_paths if not _matches_ignored(p, ignore))
     candidate_changed = tuple(p for p in changed_common if not _matches_ignored(p, ignore))
+
+    # The before/after file-set diff can miss deletions when the
+    # pre-attempt snapshot is empty (the source repo was clean).
+    # Walk the after snapshot and lift deletions / renames into
+    # ``candidate_removed`` so the structural block fires correctly.
+    structural_removed: list[str] = [
+        entry.relpath
+        for entry in after.files
+        if entry.status in ("deleted", "renamed", "unknown")
+        and not _matches_ignored(entry.relpath, ignore)
+    ]
+    for relpath in structural_removed:
+        if relpath not in candidate_removed and relpath in candidate_new:
+            candidate_new = tuple(p for p in candidate_new if p != relpath)
+        if relpath not in candidate_removed:
+            candidate_removed = candidate_removed + (relpath,)
 
     if not candidate_new and not candidate_removed and not candidate_changed:
         return MisdirectedWriteDecision(
@@ -608,21 +839,37 @@ def detect_misdirected_writes(
             reason="source mutation only inside ignored runtime paths",
         )
 
+    # Pre-compute per-file metadata for the sensitive classifier.
+    file_meta: dict[str, SourceMutationFile] = {f.relpath: f for f in after.files}
+    for f in before.files:
+        file_meta.setdefault(f.relpath, f)
+
+    def _size_and_binary(relpath: str) -> tuple[int | None, bool | None]:
+        meta = file_meta.get(relpath)
+        if meta is None:
+            return None, None
+        return meta.after_size, meta.binary
+
     # v1: deletions / renames are NOT auto-adopted.
     if candidate_removed:
         return MisdirectedWriteDecision(
             detected=True,
             adoptable=False,
-            failure_category=MISDIRECTED_WRITE_UNSAFE,
+            failure_category=MISDIRECTED_WRITE_STRUCTURAL,
             reason=(
-                "source mutations include deletions; v1 only auto-adopts "
-                "regular add/modify. Operator must recover."
+                "source mutations include deletions / renames; "
+                "v1 only auto-adopts regular add/modify. "
+                "Operator must recover."
             ),
             source_paths=candidate_new + candidate_removed + candidate_changed,
             unsafe_paths=candidate_removed,
+            strict_allowed_files=strict_allowed_files,
         )
 
-    # allowed_files empty → never auto-adopt
+    # Hard refusal when the task forgot to declare allowed_files. The
+    # caller (orchestrator) is expected to set ``x_allow_any_files``
+    # for genuine any-file tasks; an empty ``allowed_files`` is still
+    # treated as a misconfiguration that blocks auto-adoption.
     if not allowed_files:
         return MisdirectedWriteDecision(
             detected=True,
@@ -631,20 +878,54 @@ def detect_misdirected_writes(
             reason="allowed_files is empty; refusing to auto-adopt any write",
             source_paths=candidate_new + candidate_changed,
             unsafe_paths=candidate_new + candidate_changed,
+            strict_allowed_files=strict_allowed_files,
         )
 
     allowed_set = tuple(allowed_files)
     adoptable: list[str] = []
-    unsafe: list[str] = []
+    scope_deviation: list[str] = []
+    sensitive: list[str] = []
+
     for relpath in candidate_new + candidate_changed:
+        size, binary = _size_and_binary(relpath)
+        sensitive_reason = _classify_sensitive(
+            relpath,
+            allowed_files=allowed_set,
+            forbidden_globs=forbidden_globs,
+            after_size=size,
+            binary=binary,
+        )
+        if sensitive_reason is not None:
+            sensitive.append(relpath)
+            continue
         if _matches_allowed(relpath, allowed_set):
             adoptable.append(relpath)
         else:
-            unsafe.append(relpath)
+            scope_deviation.append(relpath)
+
+    # If a sensitive path is present the whole attempt is sensitive
+    # (no normal adoption of the safer paths while a secret is in
+    # play). Operator decides.
+    if sensitive:
+        return MisdirectedWriteDecision(
+            detected=True,
+            adoptable=False,
+            failure_category=MISDIRECTED_WRITE_SENSITIVE,
+            reason=(
+                "source mutations touched sensitive paths: "
+                f"{sensitive!r}. Quarantined; operator decision required."
+            ),
+            source_paths=candidate_new + candidate_changed,
+            adoptable_paths=tuple(adoptable),
+            scope_deviation_paths=tuple(scope_deviation),
+            sensitive_paths=tuple(sensitive),
+            strict_allowed_files=strict_allowed_files,
+        )
 
     # conflict with the worktree?
     worktree_changes = _worktree_changed_paths(worktree_root)
-    conflict = sorted(set(adoptable) & set(worktree_changes))
+    all_adopt_candidates = sorted(set(adoptable) | set(scope_deviation))
+    conflict = sorted(set(all_adopt_candidates) & set(worktree_changes))
 
     if conflict:
         return MisdirectedWriteDecision(
@@ -657,22 +938,76 @@ def detect_misdirected_writes(
             ),
             source_paths=candidate_new + candidate_changed,
             adoptable_paths=tuple(adoptable),
-            unsafe_paths=tuple(unsafe),
+            scope_deviation_paths=tuple(scope_deviation),
             conflict_paths=tuple(conflict),
+            strict_allowed_files=strict_allowed_files,
         )
 
-    if unsafe:
+    # Strict mode re-enables the v1 hard-block for out-of-scope
+    # files. The mutation is still classified, but the decision is
+    # returned as a blocking ``UNSAFE`` instead of an adopted
+    # ``SCOPE_DEVIATION``. Operators that genuinely need the
+    # strict block opt in via ``metadata.x_allowed_files_strict`` or
+    # ``policies.allowed_files_mode="strict"``.
+    if strict_allowed_files and scope_deviation:
         return MisdirectedWriteDecision(
             detected=True,
             adoptable=False,
             failure_category=MISDIRECTED_WRITE_UNSAFE,
             reason=(
-                "source mutations touched files outside allowed_files: "
-                f"{unsafe!r}"
+                "strict allowed_files mode: source mutations touched "
+                f"paths outside allowed_files: {scope_deviation!r}"
             ),
             source_paths=candidate_new + candidate_changed,
             adoptable_paths=tuple(adoptable),
-            unsafe_paths=tuple(unsafe),
+            scope_deviation_paths=tuple(scope_deviation),
+            unsafe_paths=tuple(scope_deviation),
+            strict_allowed_files=True,
+        )
+
+    if not adoptable and not scope_deviation:
+        return MisdirectedWriteDecision(
+            detected=False,
+            adoptable=False,
+            failure_category=None,
+            reason="source mutations exist but none are candidate adoption paths",
+            strict_allowed_files=strict_allowed_files,
+        )
+
+    # Default advisory: classify, adopt, forward to the reviewer.
+    if scope_deviation and not adoptable:
+        # Whole attempt is out of scope. The classification is
+        # ``SCOPE_DEVIATION`` so dashboards / runbooks can grep for
+        # the new category. The orchestrator continues to
+        # validation / review.
+        return MisdirectedWriteDecision(
+            detected=True,
+            adoptable=True,
+            failure_category=MISDIRECTED_WRITE_SCOPE_DEVIATION,
+            reason=(
+                "source mutations are regular add/modify outside "
+                "allowed_files; adopting as scope deviation for "
+                "reviewer decision."
+            ),
+            source_paths=candidate_new + candidate_changed,
+            adoptable_paths=tuple(scope_deviation),
+            scope_deviation_paths=tuple(scope_deviation),
+            strict_allowed_files=strict_allowed_files,
+        )
+
+    if scope_deviation and adoptable:
+        return MisdirectedWriteDecision(
+            detected=True,
+            adoptable=True,
+            failure_category=MISDIRECTED_WRITE_SCOPE_DEVIATION,
+            reason=(
+                "source mutations include out-of-scope regular add/modify; "
+                "adopting the lot as scope deviation for reviewer decision."
+            ),
+            source_paths=candidate_new + candidate_changed,
+            adoptable_paths=tuple(sorted(set(adoptable) | set(scope_deviation))),
+            scope_deviation_paths=tuple(scope_deviation),
+            strict_allowed_files=strict_allowed_files,
         )
 
     if not adoptable:
@@ -681,6 +1016,7 @@ def detect_misdirected_writes(
             adoptable=False,
             failure_category=None,
             reason="source mutations exist but none are candidate adoption paths",
+            strict_allowed_files=strict_allowed_files,
         )
 
     return MisdirectedWriteDecision(
@@ -690,6 +1026,7 @@ def detect_misdirected_writes(
         reason="source mutations are regular add/modify under allowed_files",
         source_paths=candidate_new + candidate_changed,
         adoptable_paths=tuple(adoptable),
+        strict_allowed_files=strict_allowed_files,
     )
 
 
@@ -853,18 +1190,37 @@ def adopt_misdirected_writes(
     attempt_dir: Path,
     allowed_files: Sequence[str],
     restore_source: bool = True,
+    forbidden_globs: Sequence[str] = (),
+    roadmap_id: str = "",
+    task_id: str = "",
 ) -> AdoptionResult:
     """Adopt ``decision.adoptable_paths`` from source repo into the worktree.
 
+    PR #59 v2: ``adoptable_paths`` is the union of files that match
+    ``allowed_files`` AND files that are out-of-scope but
+    reviewable (regular add/modify, not sensitive / forbidden /
+    conflicting / structural). The latter are forwarded to the
+    reviewer as scope-deviation context. ``scope_deviation_paths``
+    is preserved on the decision and written to
+    ``misdirected-write/scope-deviation.json`` so the review packet
+    can quote it.
+
     Steps:
 
-    1. Copy the source files into the worktree (preserving bytes).
-    2. ``git add -N`` for new files so ``git diff HEAD`` sees them.
-    3. If ``restore_source`` is True, restore the source repo to the
-       pre-attempt clean state (path-targeted; no broad destructive
-       commands).
-    4. Verify the source repo is clean modulo runtime paths; if not,
-       mark the attempt as quarantined so the operator can recover.
+    1. Re-classify each ``adoptable_paths`` entry. Refuse sensitive
+       / forbidden / structural / conflict paths (defense in depth;
+       the detector already filtered them, but a caller that
+       hand-builds a decision cannot accidentally adopt secrets).
+    2. Copy the source files into the worktree (preserving bytes).
+    3. ``git add -N`` for new files so ``git diff HEAD`` sees them.
+    4. If ``restore_source`` is True, restore the source repo to
+       the pre-attempt clean state (path-targeted; no broad
+       destructive commands).
+    5. Verify the source repo is clean modulo runtime paths; if
+       not, mark the attempt as quarantined so the operator can
+       recover.
+    6. Write ``misdirected-write/scope-deviation.json`` when the
+       decision included out-of-scope paths.
 
     Returns an :class:`AdoptionResult` describing what happened.
     """
@@ -880,12 +1236,51 @@ def adopt_misdirected_writes(
             reason=decision.reason or "decision.adoptable is False",
         )
 
+    # Defense in depth: re-classify each adoptable path so a caller
+    # that hand-builds a decision cannot accidentally adopt
+    # sensitive / forbidden / structural content. The detector
+    # already filtered them; this is a safety net that does not
+    # depend on the detector's purity.
+    allowed_set = tuple(allowed_files)
+    safe_to_adopt: list[str] = []
+    refused: list[tuple[str, str]] = []
+    for relpath in decision.adoptable_paths:
+        try:
+            size_path = repo_root / relpath
+            after_size = size_path.stat().st_size if size_path.is_file() else None
+        except OSError:
+            after_size = None
+        sensitive_reason = _classify_sensitive(
+            relpath,
+            allowed_files=allowed_set,
+            forbidden_globs=forbidden_globs,
+            after_size=after_size,
+            binary=None,
+        )
+        if sensitive_reason is not None:
+            refused.append((relpath, sensitive_reason))
+            continue
+        safe_to_adopt.append(relpath)
+
+    if refused and not safe_to_adopt:
+        # The decision was mis-classified; refuse the whole batch.
+        log_lines.extend(
+            f"refused {relpath}: {reason}" for relpath, reason in refused
+        )
+        restore_log.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        return AdoptionResult(
+            success=False,
+            failure_category=MISDIRECTED_WRITE_SENSITIVE,
+            reason=(
+                "adopt_misdirected_writes rejected a decision that "
+                "contained only sensitive paths: "
+                f"{[p for p, _ in refused]!r}"
+            ),
+        )
+
     copied: list[str] = []
     try:
-        for relpath in decision.adoptable_paths:
-            if not _matches_allowed(relpath, allowed_files):
-                log_lines.append(f"refused {relpath}: not in allowed_files")
-                continue
+        for relpath in safe_to_adopt:
             source_path = repo_root / relpath
             if not source_path.is_file():
                 log_lines.append(f"refused {relpath}: source file missing")
@@ -930,8 +1325,10 @@ def adopt_misdirected_writes(
     finally:
         restore_log.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
 
-    if restore_source:
-        restore_result = _restore_source_repo(repo_root, decision.adoptable_paths, log_lines)
+    # Restore the source repo for the files we actually copied.
+    restore_targets = list(copied) + [p for p, _ in refused]
+    if restore_source and restore_targets:
+        restore_result = _restore_source_repo(repo_root, restore_targets, log_lines)
         restore_log.write_text(
             "\n".join(log_lines) + "\n", encoding="utf-8"
         )
@@ -945,10 +1342,54 @@ def adopt_misdirected_writes(
                 reason=restore_result[3] or "source restore failed",
             )
 
+    # Write the scope-deviation packet when the decision included
+    # out-of-scope paths. The reviewer / dashboard / runbook reads
+    # this file to surface the out-of-scope files alongside the
+    # accepted diff.
+    scope_deviation_written: tuple[str, ...] = ()
+    if decision.scope_deviation_paths:
+        scope_deviation_path = quarantine_dir / "scope-deviation.json"
+        scope_deviation_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            scope_deviation_path.write_text(
+                json.dumps(
+                    {
+                        "roadmap_id": roadmap_id,
+                        "task_id": task_id,
+                        "captured_at": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                        ),
+                        "decision_category": decision.failure_category,
+                        "scope_deviation_paths": list(decision.scope_deviation_paths),
+                        "adoptable_paths": list(decision.adoptable_paths),
+                        "strict_allowed_files": decision.strict_allowed_files,
+                        "reviewer_questions": [
+                            "Are the out-of-scope files legitimate supporting changes?",
+                            "Should they be kept, moved, or removed?",
+                            "Do they require a follow-up task?",
+                        ],
+                        "reviewer_guidance": (
+                            "ACCEPT if out-of-scope files are legitimate and safe; "
+                            "REQUEST_CHANGES if they should be removed/moved/split; "
+                            "OPERATOR_DECISION_REQUIRED if product/architecture/safety "
+                            "ambiguity remains; BLOCK only for unsafe changes."
+                        ),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            scope_deviation_written = ("misdirected-write/scope-deviation.json",)
+        except OSError as exc:
+            log_lines.append(f"scope-deviation.json write failed: {exc!r}")
+            restore_log.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
     return AdoptionResult(
         success=True,
         copied_paths=tuple(copied),
-        restored_source_paths=tuple(decision.adoptable_paths) if restore_source else (),
+        restored_source_paths=tuple(restore_targets) if restore_source else (),
+        artifact_names=scope_deviation_written,
     )
 
 
@@ -1039,10 +1480,15 @@ def _restore_source_repo(
 
 __all__ = [
     "MISDIRECTED_WRITE_ADOPTED",
+    "MISDIRECTED_WRITE_SCOPE_DEVIATION",
+    "MISDIRECTED_WRITE_SENSITIVE",
+    "MISDIRECTED_WRITE_STRUCTURAL",
     "MISDIRECTED_WRITE_UNSAFE",
     "MISDIRECTED_WRITE_CONFLICT",
     "MISDIRECTED_WRITE_QUARANTINED",
     "MISDIRECTED_WRITE_ADOPTION_FAILED",
+    "MISDIRECTED_WRITE_ADOPTED_CATEGORIES",
+    "MISDIRECTED_WRITE_BLOCKING_CATEGORIES",
     "SourceMutationFile",
     "SourceMutationSnapshot",
     "MisdirectedWriteDecision",

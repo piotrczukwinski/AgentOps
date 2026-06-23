@@ -60,9 +60,15 @@ sees the same baseline as the first one.
 | Empty diff in source | not detected | none |
 | New file under ``allowed_files`` | adopted | `misdirected_write_adopted` |
 | Modified tracked file under ``allowed_files`` | adopted | `misdirected_write_adopted` |
-| New / modified file outside ``allowed_files`` | blocked | `misdirected_write_unsafe` |
-| Deletion in source (any path) | blocked | `misdirected_write_unsafe` |
-| Rename in source (any path) | blocked | `misdirected_write_unsafe` |
+| New / modified file outside ``allowed_files`` (regular docs / supporting) | **adopted as scope deviation** | `misdirected_write_scope_deviation` |
+| Same as above with ``x_allowed_files_strict=true`` or ``policies.allowed_files_mode=strict`` | blocked | `misdirected_write_unsafe` |
+| ``.env`` / ``.env.*`` / ``secrets.*`` / ``*.secret`` / ``*.token`` / ``*.pem`` / ``*.key`` (sensitive filename) | blocked, quarantined | `misdirected_write_sensitive` |
+| Lockfile (``package-lock.json`` / ``pnpm-lock.yaml`` / ``yarn.lock``) not in ``allowed_files`` | blocked, quarantined | `misdirected_write_sensitive` |
+| Database file (``*.sqlite`` / ``*.db`` / ``*.sqlite3``) | blocked, quarantined | `misdirected_write_sensitive` |
+| ``migrations/`` / ``alembic/`` path not in ``allowed_files`` | blocked, quarantined | `misdirected_write_sensitive` |
+| Oversized file (> 5 MiB) or large binary (> 256 KiB) not in ``allowed_files`` | blocked, quarantined | `misdirected_write_sensitive` |
+| Deletion in source (any path) | blocked, operator decision | `misdirected_write_structural` |
+| Rename in source (any path) | blocked, operator decision | `misdirected_write_structural` |
 | Source file also changed in the worktree with different bytes | blocked | `misdirected_write_conflict` |
 | Source restore fails after adoption | blocked | `misdirected_write_quarantined` |
 | Adoption copies fail mid-stream | blocked | `misdirected_write_adoption_failed` |
@@ -70,6 +76,46 @@ sees the same baseline as the first one.
 
 When adoption is blocked, quarantine artifacts are still written
 so the operator can recover the work.
+
+### ``allowed_files`` is an expected-scope hint, not a hard safety boundary (PR #59 v2)
+
+In AgentOps, ``allowed_files`` is the *expected* scope of a task,
+not a hard safety boundary. The reviewer is responsible for
+deciding whether out-of-scope files are legitimate. This is by
+design:
+
+* ``allowed_files`` only optimises the prompt and the policy
+  checker. It is not a sandbox.
+* Hard safety boundaries are the *forbidden* rules in
+  ``agentops.policy`` (secrets, lockfiles, db files, etc.) and
+  the *structural* rules (deletions / renames).
+* A regular add/modify outside ``allowed_files`` is **adopted**
+  as a *scope deviation*, the source is restored, and the
+  reviewer sees the out-of-scope file via the
+  ``task.misdirected_write_scope_deviation`` event and the
+  ``misdirected-write/scope-deviation.json`` advisory packet.
+* The reviewer's verdict determines the next step: ACCEPT
+  commits the out-of-scope file, REQUEST_CHANGES triggers a
+  repair loop, OPERATOR_DECISION_REQUIRED asks the operator.
+* Roadmaps / tasks that genuinely need the v1 hard-block opt
+  in via ``metadata.x_allowed_files_strict=true`` (task-level)
+  or ``policies.allowed_files_mode="strict"`` (roadmap-level).
+
+### Reviewer guidance for scope deviations
+
+When a task is forwarded with a scope-deviation packet the
+reviewer should:
+
+* ACCEPT if the out-of-scope files are legitimate supporting
+  changes (e.g. a docs update the executor thought was needed).
+* REQUEST_CHANGES if the files should be removed, moved to a
+  follow-up task, or split into a separate commit.
+* OPERATOR_DECISION_REQUIRED if the legitimacy is a product /
+  architecture / safety call.
+* BLOCK only for unsafe changes (secrets, structural damage,
+  conflicts). The unsafe classes never reach the reviewer as
+  scope deviations; they are quarantined by the
+  misdirected-write handler first.
 
 ## Source restore rules (Layer C)
 
@@ -132,7 +178,7 @@ considered stale.
   anywhere on the operator's filesystem; the orchestrator
   detects, quarantines, and restores.
 * No auto-adoption of deletions or renames in v1. Those are
-  blocked with ``misdirected_write_unsafe`` and require an
+  blocked with ``misdirected_write_structural`` and require an
   operator decision.
 * No CLI guard for ``agentops run`` against a dirty checkout
   (the web guard is mandatory; the CLI may still be used in
@@ -140,13 +186,33 @@ considered stale.
 * No replacement of PR #58's ``worktree_leak`` or
   ``source_repo_dirty`` categories. They detect a different
   class of failure (worktree top-level wrong; source already
-  dirty before the attempt). PR #59 extends the taxonomy.
+  dirty before the attempt). PR #59 v2 narrows the
+  ``worktree_leak`` trigger to *topology mismatch* and
+  *unsafe-class refusals*; the safe-adoption path through the
+  misdirected-write handler is not preempted.
+
+## v1 -> v2 deltas (PR #59 v2)
+
+| Behaviour | v1 (PR #59) | v2 (PR #59 repair) |
+|---|---|---|
+| ``files.not_allowed`` policy issue | critical (blocks) | warning (advisory, forwarded to reviewer) |
+| Strict mode opt-in | none | ``metadata.x_allowed_files_strict`` / ``policies.allowed_files_mode="strict"`` |
+| Out-of-scope regular docs / supporting file | blocked with ``misdirected_write_unsafe`` | **adopted** as ``misdirected_write_scope_deviation`` |
+| Worktree-leak detector order | runs BEFORE misdirected-write, hard-blocks on any source change | runs AFTER misdirected-write, only blocks for topology mismatch / unsafe class |
+| ``.env`` / secrets | blocked as ``misdirected_write_unsafe`` | blocked as ``misdirected_write_sensitive`` (operator decision) |
+| Deletion / rename | blocked as ``misdirected_write_unsafe`` | blocked as ``misdirected_write_structural`` (operator decision) |
+| ``_handle_misdirected_write`` | references ``orchestrator.state.TaskState`` (AttributeError) | uses imported ``TaskState`` directly |
+| Review packet advisory | only ``files.not_allowed`` | ``files.not_allowed`` warning + ``misdirected-write/scope-deviation.json`` packet + reviewer guidance |
+| Worktree-leak artifact for safe adoption | emitted (false positive) | suppressed (skipped) |
 
 ## Operator playbook
 
 | Situation | Action |
 |---|---|
-| Roadmap task fails with ``misdirected_write_unsafe`` | Inspect the ``misdirected-write/`` artifacts. Decide whether the writes are safe to apply to the worktree. If yes, copy them by hand and use ``task-settle``. |
+| Roadmap task fails with ``misdirected_write_scope_deviation`` (default advisory) | The reviewer should decide. Inspect the ``misdirected-write/scope-deviation.json`` packet. Either ACCEPT the out-of-scope files or REQUEST_CHANGES to drop them. |
+| Roadmap task fails with ``misdirected_write_unsafe`` (strict mode or no allowed_files) | Inspect the ``misdirected-write/`` artifacts. Decide whether the writes are safe to apply to the worktree. If yes, copy them by hand and use ``task-settle``. |
+| Roadmap task fails with ``misdirected_write_sensitive`` | The executor wrote ``.env`` / secrets / lockfiles / db files. Work is quarantined. Operator must decide whether to retry, settle, or clean the source manually. |
+| Roadmap task fails with ``misdirected_write_structural`` | The executor made a deletion / rename in the source. v1 does not auto-adopt structural changes. Quarantine holds the work. Operator must decide. |
 | Roadmap task fails with ``misdirected_write_conflict`` | Open both the worktree diff and the source diff. Reconcile. The quarantine zip holds the source-side bytes. |
 | Roadmap task fails with ``misdirected_write_quarantined`` | The orchestrator could not bring the source back to clean. Inspect the source repo manually, then resume the roadmap. |
 | ``/api/run`` returns HTTP 409 with ``agentops_server_stale`` | Restart the ``agentops serve`` process. The start-up SHA is now in sync with the current checkout. |
