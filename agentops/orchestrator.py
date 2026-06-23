@@ -33,12 +33,21 @@ from .git_ops import (
     copy_allowed_files_back,
     create_gitless_mirror,
     create_worktree,
+    default_workspaces_root,
     is_git_repo,
     is_protected_branch,
     merge_integration,
     push,
     rev_parse,
     worktree_is_clean,
+)
+from .misdirected_writes import (
+    MisdirectedWriteDecision,
+    SourceMutationSnapshot,
+    adopt_misdirected_writes,
+    capture_source_mutation_snapshot,
+    detect_misdirected_writes,
+    quarantine_source_mutations,
 )
 from .models import (
     EXECUTOR_IDLE_TIMEOUT,
@@ -58,6 +67,10 @@ from .models import (
 )
 from .policy import PolicyEngine
 from .prompting import PromptCompiler
+from .provider_failures import (
+    classify_provider_failure,
+    is_non_retryable_provider,
+)
 from .repo_lock import acquire_run_lock
 from .review import (
     CodexReviewService,
@@ -734,7 +747,14 @@ class Orchestrator:
             self._record_roadmap_event(roadmap, "task.preflight_blocked", task.id)
             return
 
-        workspace_root = self.options.workspaces_root or (roadmap.repo.path / ".agentops" / "workspaces")
+        # PR #59: default workspace root is now external (not inside the source repo)
+        # unless the operator explicitly passes --workspaces-root or sets
+        # AGENTOPS_WORKSPACES_ROOT. Keeps the source checkout path out of executor
+        # prompts and out of common shell discovery.
+        if self.options.workspaces_root is not None:
+            workspace_root = self.options.workspaces_root
+        else:
+            workspace_root = default_workspaces_root(roadmap.repo.path)
         artifact_root = self.options.artifacts_root or (roadmap.repo.path / ".agentops")
         artifact_store = ArtifactStore(artifact_root)
         target_worktree = create_worktree(
@@ -1244,6 +1264,128 @@ class Orchestrator:
                     )
                     runtime.worktree_leak_blocked = True
                     return
+
+            # PR #59: classify the executor result as a provider failure
+            # BEFORE the misdirected-write / empty-diff checks. A
+            # non-retryable provider failure (missing env, 402
+            # balance, 401 key) must not enter the validation /
+            # self-fix / executor-repair loops. The attempt is parked
+            # with the right failure_category so the operator sees
+            # what to fix.
+            provider_failure = None
+            try:
+                stdout_text = ""
+                stderr_text = ""
+                combined_text = None
+                if getattr(result, "stdout_path", None):
+                    try:
+                        stdout_text = result.stdout_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    except OSError:
+                        stdout_text = ""
+                if getattr(result, "stderr_path", None):
+                    try:
+                        stderr_text = result.stderr_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    except OSError:
+                        stderr_text = ""
+                provider_failure = classify_provider_failure(
+                    result, stdout_text, stderr_text, combined_text
+                )
+            except Exception:  # noqa: BLE001 - defensive
+                provider_failure = None
+
+            if (
+                provider_failure is not None
+                and provider_failure.detected
+                and is_non_retryable_provider(provider_failure.category)
+            ):
+                # Park with the canonical provider category. Use
+                    # AWAITING_HUMAN because the operator must fix
+                    # the env / key / balance; the executor cannot
+                    # solve this on its own.
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.provider_failure",
+                        {
+                            "category": provider_failure.category,
+                            "retryable": provider_failure.retryable,
+                            "reason": provider_failure.reason,
+                            "evidence": provider_failure.evidence,
+                            "attempt": attempt_no,
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.provider_failure",
+                        task.id,
+                        extra={
+                            "category": provider_failure.category,
+                            "retryable": provider_failure.retryable,
+                            "reason": provider_failure.reason,
+                            "attempt": attempt_no,
+                        },
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.AWAITING_HUMAN,
+                        {
+                            "reason": provider_failure.reason,
+                            "failure_category": provider_failure.category,
+                            "evidence": provider_failure.evidence,
+                            "attempt": attempt_no,
+                            "hint": (
+                                "Provider / environment failure is not a code "
+                                "defect. Fix the env, key, balance, or endpoint "
+                                "shown above and re-run the roadmap."
+                            ),
+                        },
+                    )
+                    return
+
+            # PR #59: misdirected-write detection. If the executor
+            # wrote to the source repo instead of the worktree,
+            # quarantine the work, adopt the safe parts (regular
+            # add/modify inside ``allowed_files``), restore the
+            # source repo, and continue. Unsafe / conflicting
+            # mutations block the attempt with a clear
+            # ``misdirected_write_*`` failure_category.
+            if runtime.worktree_discipline_context is not None:
+                source_after = capture_source_mutation_snapshot(roadmap.repo.path)
+                source_before = (
+                    capture_source_mutation_snapshot(roadmap.repo.path)
+                    if repo_before_snapshot is None
+                    else _git_snapshot_to_source_mutation(repo_before_snapshot, roadmap.repo.path)
+                )
+                misdirected = detect_misdirected_writes(
+                    source_before,
+                    source_after,
+                    allowed_files=effective_task.allowed_files,
+                    worktree_root=target_worktree,
+                    repo_root=roadmap.repo.path,
+                )
+                if misdirected.detected:
+                    _handle_misdirected_write(
+                        self,
+                        roadmap=roadmap,
+                        task=effective_task,
+                        attempt_id=attempt_id,
+                        attempt_no=attempt_no,
+                        attempt_dir=attempt_dir,
+                        source_before=source_before,
+                        source_after=source_after,
+                        decision=misdirected,
+                        target_worktree=target_worktree,
+                        artifact_store=artifact_store,
+                    )
+                    if not misdirected.adoptable:
+                        # Quarantine already wrote; park the task.
+                        return
 
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.DIFF_COLLECTED)
             # Compute the diff against the task base SHA so the result is
@@ -3558,3 +3700,229 @@ class Orchestrator:
                 "run_verdict": run_verdict,
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# PR #59: helper functions for misdirected-write adoption / quarantine.
+# Kept at module level so they can be unit-tested in isolation.
+# ---------------------------------------------------------------------------
+
+
+def _git_snapshot_to_source_mutation(snapshot: Any, root: Path) -> SourceMutationSnapshot:
+    """Convert a PR #58 :class:`GitSnapshot` to a :class:`SourceMutationSnapshot`.
+
+    The conversion is best-effort: PR #58 stores the untracked set
+    and a porcelain status string; we do not have the per-file
+    hash / status detail for those. The diff is approximate; the
+    orchestrator uses it only for the "did anything change?"
+    question, not for adoption decisions.
+    """
+    from .misdirected_writes import SourceMutationFile
+    files: list[SourceMutationFile] = []
+    for line in (snapshot.status_short or "").splitlines():
+        if not line or len(line) < 4:
+            continue
+        status_raw = line[:2]
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        first = status_raw.strip() or "M"
+        if first in ("A", "??"):
+            status = "added"
+        elif first == "D":
+            status = "deleted"
+        elif first in ("R", "C"):
+            status = "renamed" if first == "R" else "unknown"
+        else:
+            status = "modified"
+        files.append(
+            SourceMutationFile(
+                relpath=path,
+                status=status,
+                before_sha256=None,
+                after_sha256=None,
+                before_exists=status not in ("added",),
+                after_exists=status not in ("deleted",),
+                after_size=None,
+                binary=None,
+            )
+        )
+    return SourceMutationSnapshot(
+        root=Path(snapshot.root) if snapshot.root else root,
+        head_sha=getattr(snapshot, "head_sha", None),
+        status_short=snapshot.status_short or "",
+        diff_name_status=getattr(snapshot, "diff_name_status", ""),
+        diff_patch=getattr(snapshot, "diff_patch", ""),
+        untracked=tuple(getattr(snapshot, "untracked", ()) or ()),
+        files=tuple(files),
+        error=getattr(snapshot, "error", None),
+    )
+
+
+def _handle_misdirected_write(
+    orchestrator: Any,
+    *,
+    roadmap: Any,
+    task: Any,
+    attempt_id: str,
+    attempt_no: int,
+    attempt_dir: Path,
+    source_before: SourceMutationSnapshot,
+    source_after: SourceMutationSnapshot,
+    decision: MisdirectedWriteDecision,
+    target_worktree: Path,
+    artifact_store: Any,
+) -> None:
+    """Quarantine / adopt / block the task for a misdirected write.
+
+    Always writes quarantine artifacts FIRST (even on the adoption
+    path) so an operator can recover the work if the adoption
+    step itself fails. When ``decision.adoptable`` is True the
+    function copies the safe files into the worktree, restores
+    the source repo, and lets the orchestrator continue with
+    validation / review. When ``decision.adoptable`` is False the
+    function records events and parks the task.
+    """
+    from .misdirected_writes import (
+        MISDIRECTED_WRITE_ADOPTION_FAILED,
+        MISDIRECTED_WRITE_CONFLICT,
+        MISDIRECTED_WRITE_QUARANTINED,
+        MISDIRECTED_WRITE_UNSAFE,
+    )
+
+    # 1) Quarantine (always).
+    quarantine_names = quarantine_source_mutations(
+        attempt_dir,
+        source_before,
+        source_after,
+        decision,
+        roadmap_id=roadmap.roadmap_id,
+        task_id=task.id,
+    )
+    for name in quarantine_names:
+        try:
+            path = attempt_dir / name
+            orchestrator.state.record_artifact(
+                roadmap.roadmap_id,
+                task.id,
+                attempt_id,
+                f"misdirected_write:{Path(name).name}",
+                path,
+                artifact_store.sha256(path),
+            )
+        except OSError:
+            pass
+
+    orchestrator.state.event(
+        roadmap.roadmap_id,
+        task.id,
+        attempt_id,
+        "task.misdirected_write_detected",
+        {
+            "decision": decision.to_dict(),
+            "source_paths": list(decision.source_paths),
+            "failure_category": decision.failure_category,
+            "reason": decision.reason,
+        },
+    )
+
+    if not decision.adoptable:
+        # Park the task with the right failure category.
+        category = decision.failure_category or MISDIRECTED_WRITE_QUARANTINED
+        target_state = (
+            orchestrator.state.TaskState.BLOCKED
+            if category in (
+                MISDIRECTED_WRITE_UNSAFE,
+                MISDIRECTED_WRITE_CONFLICT,
+                MISDIRECTED_WRITE_QUARANTINED,
+                MISDIRECTED_WRITE_ADOPTION_FAILED,
+            )
+            else orchestrator.state.TaskState.AWAITING_HUMAN
+        )
+        orchestrator._record_roadmap_event(
+            roadmap,
+            "task.misdirected_write_blocked",
+            task.id,
+            extra={
+                "failure_category": category,
+                "reason": decision.reason,
+                "attempt": attempt_no,
+            },
+        )
+        orchestrator.state.transition_task(
+            roadmap.roadmap_id,
+            task.id,
+            target_state,
+            {
+                "reason": decision.reason,
+                "failure_category": category,
+                "source_paths": list(decision.source_paths),
+                "unsafe_paths": list(decision.unsafe_paths),
+                "conflict_paths": list(decision.conflict_paths),
+                "adoptable_paths": list(decision.adoptable_paths),
+                "artifacts": [str(attempt_dir / n) for n in quarantine_names],
+                "hint": (
+                    "Executor wrote to the source checkout instead of the "
+                    "AgentOps worktree. Work is preserved in the misdirected-write "
+                    "artifacts. Operator must decide whether to retry, settle, or "
+                    "manually reconcile the source checkout."
+                ),
+                "attempt": attempt_no,
+            },
+        )
+        return
+
+    # 2) Adopt the safe parts.
+    adoption = adopt_misdirected_writes(
+        roadmap.repo.path,
+        target_worktree,
+        decision,
+        attempt_dir=attempt_dir,
+        allowed_files=task.allowed_files,
+        restore_source=True,
+    )
+
+    orchestrator.state.event(
+        roadmap.roadmap_id,
+        task.id,
+        attempt_id,
+        "task.misdirected_write_adopted",
+        {
+            "decision": decision.to_dict(),
+            "adoption": adoption.to_dict(),
+        },
+    )
+
+    if not adoption.success:
+        # Adoption failed: park with the appropriate category.
+        category = adoption.failure_category or MISDIRECTED_WRITE_ADOPTION_FAILED
+        orchestrator._record_roadmap_event(
+            roadmap,
+            "task.misdirected_write_quarantined",
+            task.id,
+            extra={
+                "failure_category": category,
+                "reason": adoption.reason,
+                "copied_paths": list(adoption.copied_paths),
+                "remaining_source_dirty": list(adoption.remaining_source_dirty),
+                "attempt": attempt_no,
+            },
+        )
+        orchestrator.state.transition_task(
+            roadmap.roadmap_id,
+            task.id,
+            orchestrator.state.TaskState.BLOCKED,
+            {
+                "reason": adoption.reason,
+                "failure_category": category,
+                "copied_paths": list(adoption.copied_paths),
+                "remaining_source_dirty": list(adoption.remaining_source_dirty),
+                "artifacts": [str(attempt_dir / n) for n in quarantine_names],
+                "attempt": attempt_no,
+            },
+        )
+        return
+
+    # Successful adoption; orchestrator continues to DIFF_COLLECTED
+    # with the freshly-copied files in the worktree. The next
+    # collect_diff will see them.

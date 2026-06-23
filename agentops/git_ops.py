@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import os
 import shutil
 import subprocess
 import tempfile
@@ -66,6 +68,77 @@ def create_worktree(repo: Path, workspaces_root: Path, branch: str, base_ref: st
     run_git(repo, ["worktree", "prune"], check=False)
     run_git(repo, ["worktree", "add", "-B", branch, str(workspace), base_ref])
     return workspace
+
+
+def default_workspaces_root(repo_path: Path) -> Path:
+    """Return the default external workspaces root for ``repo_path``.
+
+    PR #59 (runtime containment) moves the default workspace tree
+    OUT of the source repo. The executor no longer sees the source
+    checkout path; if the worktree lived at
+    ``<repo>/.agentops/workspaces/...`` the executor could infer the
+    source path from ``..`` and ``pwd`` and write there.
+
+    Resolution order (first wins):
+
+    1. ``AGENTOPS_WORKSPACES_ROOT`` environment variable (explicit
+       operator override; the operator may still point inside the
+       repo, by choice).
+    2. ``$XDG_CACHE_HOME/agentops/workspaces/<slug>-<hash>/`` if
+       ``XDG_CACHE_HOME`` is set and non-empty.
+    3. ``~/.cache/agentops/workspaces/<slug>-<hash>/`` as the
+       portable fallback.
+    4. A ``/tmp/agentops-workspaces/<slug>-<hash>/`` last-resort
+       fallback when no home / cache dir is available (e.g. inside
+       a minimal container).
+
+    The result is always outside ``repo_path``; an explicit
+    override (env var) is returned unchanged and the operator is
+    responsible if they point it inside the repo.
+
+    The trailing ``<slug>-<hash>`` directory keeps different repos
+    separated without leaking the absolute source path into the
+    workspace name.
+    """
+    env_override = os.environ.get("AGENTOPS_WORKSPACES_ROOT", "").strip()
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+
+    try:
+        resolved_repo = Path(repo_path).expanduser().resolve()
+    except OSError:
+        resolved_repo = Path(repo_path)
+
+    slug_source = str(resolved_repo).rstrip("/").replace("\\", "/")
+    digest = hashlib.sha256(slug_source.encode("utf-8")).hexdigest()[:12]
+    slug = safe_name(slug_source.rsplit("/", 1)[-1] or "repo")
+    leaf = f"{slug}-{digest}"
+
+    candidates: list[Path] = []
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg:
+        candidates.append(Path(xdg).expanduser() / "agentops" / "workspaces" / leaf)
+    home = Path.home() if hasattr(Path, "home") else None
+    if home is not None:
+        with contextlib.suppress(OSError):
+            candidates.append(home / ".cache" / "agentops" / "workspaces" / leaf)
+    candidates.append(Path("/tmp/agentops-workspaces") / leaf)
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        try:
+            candidate_resolved = candidate.resolve()
+            if resolved_repo not in candidate_resolved.parents and candidate_resolved != resolved_repo:
+                return candidate_resolved
+        except OSError:
+            continue
+
+    return candidates[-1].resolve() if candidates else Path("/tmp/agentops-workspaces").resolve()
+
+
 
 
 def worktree_is_clean(worktree: Path) -> bool:

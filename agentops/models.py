@@ -349,6 +349,51 @@ NON_WATCHDOG_BLOCKING_CATEGORIES = frozenset(
     }
 )
 
+# PR #59: misdirected write failure categories. Distinct from
+# ``worktree_leak`` (worktree top-level wrong) and ``source_repo_dirty``
+# (source was already dirty before the attempt). These describe the
+# executor's own writes landing in the source repo.
+MISDIRECTED_WRITE_ADOPTED = "misdirected_write_adopted"
+MISDIRECTED_WRITE_UNSAFE = "misdirected_write_unsafe"
+MISDIRECTED_WRITE_CONFLICT = "misdirected_write_conflict"
+MISDIRECTED_WRITE_QUARANTINED = "misdirected_write_quarantined"
+MISDIRECTED_WRITE_ADOPTION_FAILED = "misdirected_write_adoption_failed"
+
+# PR #59: provider/environment failure categories. Non-retryable
+# (operator must fix balance / env / key / endpoint). The orchestrator
+# parks the task with one of these instead of entering validation
+# repair or self-fix loops.
+PROVIDER_MISSING_ENV = "provider_missing_env"
+PROVIDER_AUTH_FAILED = "provider_auth_failed"
+PROVIDER_INSUFFICIENT_BALANCE = "provider_insufficient_balance"
+PROVIDER_ENDPOINT_MISMATCH = "provider_endpoint_mismatch"
+PROVIDER_RATE_LIMITED = "provider_rate_limited"
+PROVIDER_NETWORK_TRANSIENT = "provider_network_transient"
+
+# PR #59: web server staleness guard category.
+AGENTOPS_SERVER_STALE = "agentops_server_stale"
+
+PROVIDER_FAILURE_CATEGORIES = frozenset(
+    {
+        PROVIDER_MISSING_ENV,
+        PROVIDER_AUTH_FAILED,
+        PROVIDER_INSUFFICIENT_BALANCE,
+        PROVIDER_ENDPOINT_MISMATCH,
+        PROVIDER_RATE_LIMITED,
+        PROVIDER_NETWORK_TRANSIENT,
+    }
+)
+
+MISDIRECTED_FAILURE_CATEGORIES = frozenset(
+    {
+        MISDIRECTED_WRITE_ADOPTED,
+        MISDIRECTED_WRITE_UNSAFE,
+        MISDIRECTED_WRITE_CONFLICT,
+        MISDIRECTED_WRITE_QUARANTINED,
+        MISDIRECTED_WRITE_ADOPTION_FAILED,
+    }
+)
+
 # Canonical v1 default for ``ReviewConfig.max_executor_review_repairs``.
 # Codex owns repair reasoning; MiniMax / opencode may do at most one
 # large mechanical repair per task. After the budget is exhausted the

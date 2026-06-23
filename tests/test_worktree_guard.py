@@ -109,11 +109,15 @@ class PromptPrefixTests(unittest.TestCase):
             text = render_worktree_discipline_prefix(ctx)
             self.assertIn(str(ctx.worktree_root), text)
 
-    def test_prefix_contains_source_repo_root(self) -> None:
+    def test_prefix_does_not_contain_source_repo_root(self) -> None:
+        # PR #59: the source repo path is intentionally redacted from
+        # the executor prompt. The model should NOT see the source
+        # checkout path; AgentOps only ever surfaces the worktree root.
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self._ctx(Path(tmp))
             text = render_worktree_discipline_prefix(ctx)
-            self.assertIn(str(ctx.repo_root), text)
+            self.assertNotIn(str(ctx.repo_root), text)
+            self.assertIn("Source repo (read-only; path intentionally redacted)", text)
 
     def test_prefix_contains_git_instructions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -122,6 +126,16 @@ class PromptPrefixTests(unittest.TestCase):
             self.assertIn("pwd", text)
             self.assertIn("git rev-parse --show-toplevel", text)
             self.assertIn("git status --short", text)
+
+    def test_prefix_contains_final_verification_section(self) -> None:
+        # PR #59: the prefix must carry the final verification
+        # section so the executor can self-check before claiming done.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            text = render_worktree_discipline_prefix(ctx)
+            self.assertIn("Final verification before emitting AGENTOPS_RESULT_JSON", text)
+            self.assertIn("EXPECTED=", text)
+            self.assertIn("status: failed", text)
 
     def test_prefix_contains_never_edit_source_repo_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

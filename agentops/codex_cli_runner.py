@@ -40,6 +40,7 @@ from .profiles import (
     redact_command_template,
     render_command_template,
 )
+from .provider_failures import PROVIDER_MISSING_ENV
 from .runners import run_argv_streaming, utc_now
 
 # Disallow obvious shell-injection patterns in the rendered argv. The
@@ -308,6 +309,27 @@ def run_codex_cli_executor(request: CodexCliRunRequest) -> RunnerResult:
         argv = (*argv, *request.extra_args)
     _check_unsafe_argv(argv)
     redacted = _redact_argv_for_logs(argv)
+    # PR #59: check required_env before spawning. If the profile
+    # declares required env-var names and any are missing, do NOT
+    # launch codex. Return a synthetic RunnerResult with
+    # ``failure_category=provider_missing_env`` so the orchestrator
+    # parks the task with the right category instead of entering
+    # the validation / self-fix / executor-repair loops.
+    missing = [name for name in request.profile.required_env if not os.environ.get(name)]
+    if missing:
+        synthetic = _missing_env_result(
+            request, missing, artifact_dir=request.artifact_dir
+        )
+        _write_profile_metadata(
+            request.artifact_dir,
+            profile=request.profile,
+            argv=argv,
+            redacted=redacted,
+            started=utc_now(),
+            ended=utc_now(),
+            exit_code=synthetic.exit_code,
+        )
+        return synthetic
     started = utc_now()
     timeout = request.timeout_seconds or request.profile.timeout_seconds or 5400
     if not isinstance(timeout, int) or timeout <= 0:
@@ -323,7 +345,7 @@ def run_codex_cli_executor(request: CodexCliRunRequest) -> RunnerResult:
             stderr_name="executor.stderr.log",
             combined_name="executor.combined.log",
             timeout_seconds=timeout,
-            env=_executor_env(),
+            env=_executor_env(request.profile.env_passthrough),
             startup_timeout=request.startup_timeout,
             idle_timeout=request.idle_timeout,
         )
@@ -348,7 +370,41 @@ def run_codex_cli_executor(request: CodexCliRunRequest) -> RunnerResult:
     return result
 
 
-def _executor_env() -> dict[str, str]:
+def _missing_env_result(
+    request: CodexCliRunRequest,
+    missing: list[str],
+    *,
+    artifact_dir: Path,
+) -> RunnerResult:
+    """Return a synthetic RunnerResult that signals missing-env.
+
+    The runner did NOT spawn codex because the profile declared env
+    variables that are not set in this process. We still write
+    stderr / combined logs so the orchestrator can see what was
+    missing without leaking the secret value.
+    """
+    stderr_path = artifact_dir / "executor.stderr.log"
+    combined_path = artifact_dir / "executor.combined.log"
+    message = (
+        "AGENTOPS refused to launch the executor: required environment "
+        f"variable(s) missing: {missing!r}. Set them in the operator's "
+        "shell (or in the systemd / docker unit) and re-run; this is "
+        "a configuration issue, not a code defect."
+    )
+    stderr_path.write_text(message + "\n", encoding="utf-8")
+    combined_path.write_text(message + "\n", encoding="utf-8")
+    return RunnerResult(
+        exit_code=2,
+        stdout_path=artifact_dir / "executor.stdout.log",
+        stderr_path=stderr_path,
+        started_at=utc_now(),
+        ended_at=utc_now(),
+        combined_log_path=combined_path,
+        failure_category=PROVIDER_MISSING_ENV,
+    )
+
+
+def _executor_env(passthrough: tuple[str, ...] = ()) -> dict[str, str]:
     """Build a safe env for the codex CLI executor.
 
     Strips Git write tokens and provider API keys the same way
@@ -370,11 +426,20 @@ def _executor_env() -> dict[str, str]:
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
     }
-    env = {key: value for key, value in os.environ.items() if key not in drop}
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_ASKPASS"] = "/bin/false"
-    env["AGENTOPS_EXECUTOR"] = "1"
-    return env
+    base = {key: value for key, value in os.environ.items() if key not in drop}
+    # PR #59: explicit env_passthrough allow-list. When the profile
+    # declares which env-var names it needs, we copy ONLY those names
+    # from the parent process (overriding the drop list when present).
+    # Names not in the allow-list are NOT added back.
+    if passthrough:
+        for name in passthrough:
+            value = os.environ.get(name)
+            if value is not None:
+                base[name] = value
+    base["GIT_TERMINAL_PROMPT"] = "0"
+    base["GIT_ASKPASS"] = "/bin/false"
+    base["AGENTOPS_EXECUTOR"] = "1"
+    return base
 
 
 __all__ = [
