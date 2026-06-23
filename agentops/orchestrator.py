@@ -43,6 +43,9 @@ from .git_ops import (
 from .models import (
     EXECUTOR_IDLE_TIMEOUT,
     EXECUTOR_NO_OUTPUT_STARTUP,
+    EXECUTOR_REPAIR_BUDGET_EXCEEDED,
+    EXECUTOR_WORKTREE_LEAK,
+    REVIEW_CHURN_LIMIT,
     DiffSnapshot,
     ReviewVerdict,
     RoadmapConfig,
@@ -69,6 +72,15 @@ from .self_fix import (
 from .state import StateStore, utc_now
 from .usage import extract_usage_marker, normalize_usage
 from .validation import ValidationEngine
+from .worktree_guard import (
+    GitSnapshot,
+    WorktreeDisciplineContext,
+    capture_git_snapshot,
+    default_ignored_source_repo_patterns,
+    detect_worktree_leak,
+    prepend_worktree_discipline,
+    write_worktree_leak_artifacts,
+)
 
 log = logging.getLogger("agentops.orchestrator")
 
@@ -362,6 +374,22 @@ class _TaskRuntime:
     review_verdict: ReviewVerdict | None = None
     codex_takeover_active: bool = False
     codex_takeover_used: bool = False
+    # Worktree discipline guard (PR #58).
+    # ``worktree_discipline_context`` is built once per task and
+    # used to (a) prepend the mandatory prompt prefix and (b) run
+    # the runtime leak detector around every executor attempt.
+    worktree_discipline_context: WorktreeDisciplineContext | None = None
+    worktree_leak_blocked: bool = False
+    # Repair routing churn counters (PR #58).
+    # Codex owns repair reasoning. The orchestrator only counts
+    # cycles and refuses to rerun the executor past the policy
+    # budget; the rest is delegated to ``_try_self_fix`` and the
+    # executor repair prompt compiler.
+    codex_self_fix_cycles_used: int = 0
+    executor_review_repairs_used: int = 0
+    request_changes_cycles: int = 0
+    self_fix_size_exceeded_count: int = 0
+    self_fix_hard_budget_exceeded_count: int = 0
 
 
 class Orchestrator:
@@ -680,6 +708,23 @@ class Orchestrator:
             )
             self._record_roadmap_event(roadmap, "task.stale_worktree", task.id)
             return
+
+        # PR #58: build the worktree discipline context once per task
+        # and reuse it for every executor attempt. The executor prompt
+        # prefix is prepended at prompt-assembly time; the runtime leak
+        # detector reads the same context to decide whether the source
+        # repo was contaminated.
+        runtime.worktree_discipline_context = WorktreeDisciplineContext(
+            roadmap_id=roadmap.roadmap_id,
+            task_id=task.id,
+            repo_root=roadmap.repo.path,
+            worktree_root=target_worktree,
+            branch_name=runtime.branch,
+            allowed_files=tuple(task.allowed_files),
+            execution_mode=task.execution_mode,
+            executor=task.executor,
+            executor_profile=getattr(task, "executor_profile", None),
+        )
         execution_cwd = target_worktree
         if task.execution_mode == "gitless_mirror":
             mirror_path = artifact_root / "mirrors" / runtime.branch.replace("/", "-")
@@ -750,6 +795,14 @@ class Orchestrator:
                 roadmap.roadmap_id, effective_task, attempt_no, execution_cwd, runtime.branch, runtime.base_sha
             )
             prompt = runtime.repair_prompt or compiler.executor_prompt(task)
+            # PR #58: prepend the mandatory worktree discipline prefix
+            # for worktree-backed executor attempts. Pure review,
+            # settlement, and self-fix prompts are untouched. The
+            # discipline context was built once per task; if it is
+            # missing the task is not a worktree task and no prefix
+            # is prepended (legacy behaviour preserved).
+            if runtime.worktree_discipline_context is not None and not runtime.repair_prompt:
+                prompt = prepend_worktree_discipline(prompt, runtime.worktree_discipline_context)
             prompt_path = artifact_store.write_text(attempt_dir, "executor.prompt.md", prompt)
             self.state.record_artifact(
                 roadmap.roadmap_id, task.id, attempt_id, "executor_prompt", prompt_path, artifact_store.sha256(prompt_path)
@@ -757,6 +810,16 @@ class Orchestrator:
             self.state.transition_task(
                 roadmap.roadmap_id, task.id, TaskState.EXECUTOR_RUNNING, {"attempt": attempt_no}
             )
+
+            # PR #58: capture a snapshot of the source repo before the
+            # executor attempt so the post-attempt leak detector can
+            # prove the source checkout was not contaminated. A failed
+            # snapshot is recorded as ``error`` and the orchestrator
+            # treats the run as "leak status unknown"; it does not
+            # classify a snapshot failure as a leak.
+            repo_before_snapshot: GitSnapshot | None = None
+            if runtime.worktree_discipline_context is not None:
+                repo_before_snapshot = capture_git_snapshot(roadmap.repo.path)
 
             result = self._runner_for(effective_task).run(
                 effective_task,
@@ -941,6 +1004,94 @@ class Orchestrator:
 
             if task.execution_mode == "gitless_mirror" and runtime.mirror is not None:
                 copy_allowed_files_back(runtime.mirror, target_worktree, task.allowed_files)
+
+            # PR #58: runtime worktree leak detection. Runs *after*
+            # the watchdog checks (a watchdog hit must surface the
+            # watchdog category, not a leak) and *before* the diff /
+            # policy / review stages. A leak blocks the task with
+            # ``failure_category=worktree_leak`` so the runbook and
+            # the morning checklist can grep for the real cause
+            # instead of the misleading ``empty_diff``.
+            if runtime.worktree_discipline_context is not None:
+                repo_after_snapshot = capture_git_snapshot(roadmap.repo.path)
+                worktree_after_snapshot = capture_git_snapshot(target_worktree)
+                leak_decision = detect_worktree_leak(
+                    repo_before_snapshot,
+                    repo_after_snapshot,
+                    worktree_after_snapshot,
+                    runtime.worktree_discipline_context,
+                    ignore_paths=default_ignored_source_repo_patterns(),
+                )
+                if leak_decision.leaked:
+                    artifact_paths = write_worktree_leak_artifacts(
+                        attempt_dir,
+                        runtime.worktree_discipline_context,
+                        repo_before_snapshot,
+                        repo_after_snapshot,
+                        worktree_after_snapshot,
+                        leak_decision,
+                    )
+                    for path in artifact_paths:
+                        self.state.record_artifact(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            f"worktree_leak:{path.name}",
+                            path,
+                            artifact_store.sha256(path),
+                        )
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.worktree_leak_detected",
+                        {
+                            "reason": leak_decision.reason,
+                            "failure_category": leak_decision.failure_category,
+                            "repo_changed": leak_decision.repo_changed,
+                            "worktree_changed": leak_decision.worktree_changed,
+                            "top_level_mismatch": leak_decision.top_level_mismatch,
+                            "expected_worktree_root": leak_decision.expected_worktree_root,
+                            "actual_worktree_root": leak_decision.actual_worktree_root,
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.worktree_leak_detected",
+                        task.id,
+                        extra={
+                            "failure_category": leak_decision.failure_category,
+                            "reason": leak_decision.reason,
+                            "attempt": attempt_no,
+                        },
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.BLOCKED,
+                        {
+                            "reason": "executor wrote outside assigned worktree",
+                            "failure_category": EXECUTOR_WORKTREE_LEAK,
+                            "worktree_leak_reason": leak_decision.reason,
+                            "expected_worktree_root": leak_decision.expected_worktree_root,
+                            "actual_worktree_root": leak_decision.actual_worktree_root,
+                            "repo_changed": leak_decision.repo_changed,
+                            "worktree_changed": leak_decision.worktree_changed,
+                            "top_level_mismatch": leak_decision.top_level_mismatch,
+                            "artifacts": [str(p) for p in artifact_paths],
+                            "hint": (
+                                "Executor wrote outside assigned worktree. "
+                                "Inspect worktree-leak artifacts. Do not accept "
+                                "empty diff. Manually recover or rerun after "
+                                "cleaning the source checkout. AgentOps does not "
+                                "auto-revert leaked changes; evidence is preserved "
+                                "in the attempt directory."
+                            ),
+                            "attempt": attempt_no,
+                        },
+                    )
+                    runtime.worktree_leak_blocked = True
+                    return
 
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.DIFF_COLLECTED)
             # Compute the diff against the task base SHA so the result is
@@ -1400,17 +1551,102 @@ class Orchestrator:
 
             if verdict.verdict == "REQUEST_CHANGES":
                 self._record_roadmap_event(roadmap, "task.request_changes", task.id)
-                # Self-fix: give the reviewer ONE bounded write-pass to
-                # apply a SMALL fix directly, instead of re-running the
-                # executor. The prompt carries the line budget upstream so
-                # the reviewer self-limits (or skips with a marker); the
-                # size cap here is a backstop. Falls back to executor
-                # repair on any gate failure or reviewer skip.
-                if (
+                # PR #58: repair routing v1. Codex owns repair reasoning
+                # and self-fixes small/medium bounded repairs directly.
+                # MiniMax may run at most one large mechanical repair
+                # per task, and only after Codex has had a chance to
+                # self-fix. The orchestrator enforces the churn guard;
+                # the actual repair classification is the reviewer's
+                # decision (see ``PromptCompiler.self_fix_prompt``).
+                runtime.request_changes_cycles += 1
+                max_self_fix_cycles = int(
+                    getattr(task.review, "max_codex_self_fix_cycles", 2)
+                )
+                max_executor_repairs = int(
+                    getattr(task.review, "max_executor_review_repairs", 1)
+                )
+                self.state.event(
+                    roadmap.roadmap_id,
+                    task.id,
+                    attempt_id,
+                    "task.repair_classified",
+                    {
+                        "request_changes_cycle": runtime.request_changes_cycles,
+                        "codex_self_fix_cycles_used": runtime.codex_self_fix_cycles_used,
+                        "max_codex_self_fix_cycles": max_self_fix_cycles,
+                        "executor_review_repairs_used": runtime.executor_review_repairs_used,
+                        "max_executor_review_repairs": max_executor_repairs,
+                    },
+                )
+                # Churn guard: if the task has bounced through too many
+                # REQUEST_CHANGES cycles, block with a canonical
+                # failure category instead of running the executor
+                # again. The default cap is 2 cycles; once exceeded,
+                # Codex must self-fix the remaining issues or an
+                # operator must decide.
+                if runtime.request_changes_cycles > max(2, max_self_fix_cycles + max_executor_repairs):
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.review_churn_limit_reached",
+                        {
+                            "request_changes_cycles": runtime.request_changes_cycles,
+                            "codex_self_fix_cycles_used": runtime.codex_self_fix_cycles_used,
+                            "executor_review_repairs_used": runtime.executor_review_repairs_used,
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.review_churn_limit_reached",
+                        task.id,
+                        extra={"request_changes_cycles": runtime.request_changes_cycles},
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.BLOCKED,
+                        {
+                            "reason": "review churn limit reached; Codex must self-fix or operator must decide",
+                            "failure_category": REVIEW_CHURN_LIMIT,
+                            "request_changes_cycles": runtime.request_changes_cycles,
+                            "codex_self_fix_cycles_used": runtime.codex_self_fix_cycles_used,
+                            "executor_review_repairs_used": runtime.executor_review_repairs_used,
+                            "hint": (
+                                "The task bounced through too many REQUEST_CHANGES "
+                                "cycles. Codex self-fix is the v1 default; if it has "
+                                "been exhausted, the operator must decide whether to "
+                                "merge as-is, revert, or relax a contract."
+                            ),
+                            "attempt": attempt_no,
+                        },
+                    )
+                    return
+                # Codex self-fix pass. Allowed when:
+                #  * self-fix is enabled for this task,
+                #  * the codex service is available,
+                #  * the codex self-fix cycle budget has not been
+                #    exhausted, and
+                #  * there is still attempt budget (the legacy gate
+                #    kept here for backwards compatibility with the
+                #    pre-#58 attempt counter).
+                self_fix_allowed = (
                     attempt_no < max_attempts
                     and task.review.self_fix
                     and codex_service.is_available()
-                ):
+                    and runtime.codex_self_fix_cycles_used < max_self_fix_cycles
+                )
+                if self_fix_allowed:
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.codex_self_fix_started",
+                        {
+                            "self_fix_cycle": runtime.codex_self_fix_cycles_used + 1,
+                            "max_codex_self_fix_cycles": max_self_fix_cycles,
+                        },
+                    )
                     sf = self._try_self_fix(
                         roadmap=roadmap,
                         task=task,
@@ -1428,10 +1664,41 @@ class Orchestrator:
                         attempt_no=attempt_no,
                         max_attempts=max_attempts,
                     )
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.codex_self_fix_completed",
+                        {
+                            "accepted": sf.accepted,
+                            "reason": sf.reason,
+                            "skipped": sf.skipped,
+                            "self_fix_cycle": runtime.codex_self_fix_cycles_used,
+                            "max_codex_self_fix_cycles": max_self_fix_cycles,
+                        },
+                    )
                     if sf.accepted:
                         accepted_outcome = True
                         return
-                if attempt_no < max_attempts:
+                # Self-fix is exhausted or unavailable. Decide
+                # whether the executor may be re-run for a large
+                # mechanical repair.
+                executor_repair_allowed = (
+                    attempt_no < max_attempts
+                    and runtime.executor_review_repairs_used < max_executor_repairs
+                )
+                if attempt_no < max_attempts and executor_repair_allowed:
+                    runtime.executor_review_repairs_used += 1
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.executor_repair_queued",
+                        {
+                            "executor_review_repairs_used": runtime.executor_review_repairs_used,
+                            "max_executor_review_repairs": max_executor_repairs,
+                        },
+                    )
                     # REQUEST_CHANGES is repairable. Build a bounded
                     # repair prompt for the next executor attempt. The
                     # compiler always includes the reviewer's
@@ -1456,6 +1723,58 @@ class Orchestrator:
                         roadmap.roadmap_id, task.id, TaskState.REPAIR_PROMPT_READY
                     )
                     continue
+                if attempt_no < max_attempts and not executor_repair_allowed:
+                    # Attempt budget remains but the executor repair
+                    # budget is exhausted: do not silently rerun
+                    # MiniMax. Block with the canonical
+                    # ``executor_repair_budget_exceeded`` category so
+                    # the runbook and the morning checklist can grep
+                    # for it.
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.executor_repair_budget_exceeded",
+                        {
+                            "executor_review_repairs_used": runtime.executor_review_repairs_used,
+                            "max_executor_review_repairs": max_executor_repairs,
+                            "codex_self_fix_cycles_used": runtime.codex_self_fix_cycles_used,
+                            "max_codex_self_fix_cycles": max_self_fix_cycles,
+                        },
+                    )
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.executor_repair_budget_exceeded",
+                        task.id,
+                        extra={
+                            "executor_review_repairs_used": runtime.executor_review_repairs_used,
+                            "max_executor_review_repairs": max_executor_repairs,
+                        },
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.BLOCKED,
+                        {
+                            "reason": (
+                                "executor repair budget exhausted; Codex must "
+                                "self-fix or operator must decide"
+                            ),
+                            "failure_category": EXECUTOR_REPAIR_BUDGET_EXCEEDED,
+                            "executor_review_repairs_used": runtime.executor_review_repairs_used,
+                            "max_executor_review_repairs": max_executor_repairs,
+                            "codex_self_fix_cycles_used": runtime.codex_self_fix_cycles_used,
+                            "max_codex_self_fix_cycles": max_self_fix_cycles,
+                            "hint": (
+                                "MiniMax has already been rerun once for this task. "
+                                "Codex self-fix is the v1 default; the operator must "
+                                "decide whether to merge as-is, revert, or relax a "
+                                "contract."
+                            ),
+                            "attempt": attempt_no,
+                        },
+                    )
+                    return
                 if (
                     attempt_no == max_attempts
                     and self.options.autonomous
@@ -1912,12 +2231,34 @@ class Orchestrator:
         the executor repair, so self-fix never blocks a task.
         """
         del max_attempts  # budget is enforced by the attempt loop caller
-        max_lines = int(task.review.self_fix_max_lines)
+        # PR #58: soft and hard self-fix budgets. ``self_fix_max_lines``
+        # is the soft target carried in the reviewer prompt; the
+        # reviewer may still apply a fix that exceeds it when the fix
+        # is clearly scoped. ``self_fix_hard_max_lines`` is the
+        # safety cap: exceeding it stops the task and requests
+        # operator input rather than silently letting the fix through
+        # or silently rerunning the executor. The old 30-line hard
+        # stop is replaced by 300/800 defaults; see ``ReviewConfig``.
+        soft_max = int(task.review.self_fix_max_lines)
+        hard_max = int(
+            getattr(task.review, "self_fix_hard_max_lines", 800)
+        )
+        max_lines = soft_max  # backwards-compatible local name
         self.state.event(
-            roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_started", {"max_lines": max_lines}
+            roadmap.roadmap_id,
+            task.id,
+            attempt_id,
+            "task.self_fix_started",
+            {
+                "soft_max_lines": soft_max,
+                "hard_max_lines": hard_max,
+                "self_fix_cycle": runtime.codex_self_fix_cycles_used + 1,
+            },
         )
 
-        sf_prompt = compiler.self_fix_prompt(task, verdict, max_lines=max_lines)
+        sf_prompt = compiler.self_fix_prompt(
+            task, verdict, max_lines=soft_max, hard_max_lines=hard_max
+        )
         sf_prompt_path = artifact_store.write_text(attempt_dir, "self_fix.prompt.md", sf_prompt)
         self.state.record_artifact(
             roadmap.roadmap_id, task.id, attempt_id, "self_fix_prompt", sf_prompt_path,
@@ -2025,12 +2366,48 @@ class Orchestrator:
             )
             return _fallback("self_fix_out_of_scope")
 
-        # 3. Size telemetry. The reviewer decides whether the repair is too
-        # broad and can opt out with SELF_FIX_SKIP before editing. Once the
-        # work has been paid for, line count alone should not discard an
-        # in-scope fix that still passes validation and re-review.
+        # 3. Size budget (PR #58: soft + hard). The reviewer decides
+        # whether the repair is too broad and can opt out with
+        # ``SELF_FIX_SKIP`` before editing. Once the work has been
+        # paid for, the soft budget is just telemetry: a bounded
+        # fix that is slightly over the soft budget is still
+        # accepted when validations + re-review pass. The hard
+        # budget is the safety stop: exceeding it means the fix
+        # has grown beyond a reasonable reviewer's write-pass and
+        # the operator must decide.
         delta = changed_line_count(post_diff.patch) - pre_lines
+        if delta > soft_max:
+            self.state.event(
+                roadmap.roadmap_id,
+                task.id,
+                attempt_id,
+                "task.self_fix_soft_budget_exceeded",
+                {
+                    "delta": delta,
+                    "soft_max_lines": soft_max,
+                    "hard_max_lines": hard_max,
+                },
+            )
+        if delta > hard_max:
+            runtime.self_fix_hard_budget_exceeded_count += 1
+            self.state.event(
+                roadmap.roadmap_id,
+                task.id,
+                attempt_id,
+                "task.self_fix_hard_budget_exceeded",
+                {
+                    "delta": delta,
+                    "hard_max_lines": hard_max,
+                    "consecutive": runtime.self_fix_hard_budget_exceeded_count,
+                },
+            )
+            return _fallback("self_fix_hard_budget_exceeded")
         if delta > max_lines:
+            # Backwards-compatible event name kept for downstream
+            # consumers that already grep for ``self_fix_size_exceeded``
+            # (the v0 telemetry contract). The hard stop is the
+            # ``self_fix_hard_budget_exceeded`` event above; this
+            # event is now a soft warning, not a gate.
             self.state.event(
                 roadmap.roadmap_id, task.id, attempt_id, "task.self_fix_size_exceeded",
                 {"delta": delta, "max_lines": max_lines},
@@ -2083,7 +2460,13 @@ class Orchestrator:
                 runtime=runtime,
             )
             if finalized:
-                self._record_roadmap_event(roadmap, "task.self_fix_accepted", task.id)
+                runtime.codex_self_fix_cycles_used += 1
+                self._record_roadmap_event(
+                    roadmap,
+                    "task.self_fix_accepted",
+                    task.id,
+                    extra={"self_fix_cycle": runtime.codex_self_fix_cycles_used},
+                )
                 return SelfFixOutcome(accepted=True, reason="self_fix_accepted")
             return _fallback("self_fix_finalize_failed")
         self.state.event(

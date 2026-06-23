@@ -1339,6 +1339,9 @@ def _review_def() -> dict[str, Any]:
                     "schema": {"type": "string"},
                     "self_fix": {"type": "boolean"},
                     "self_fix_max_lines": {"type": "integer"},
+                    "self_fix_hard_max_lines": {"type": "integer"},
+                    "max_codex_self_fix_cycles": {"type": "integer"},
+                    "max_executor_review_repairs": {"type": "integer"},
                 },
             },
         ]

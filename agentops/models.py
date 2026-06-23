@@ -81,12 +81,42 @@ class ReviewConfig:
     # Self-fix: on REQUEST_CHANGES, give the reviewer a bounded write-pass
     # to apply a small/medium fix directly in the worktree instead of
     # re-running the executor. The reviewer decides whether to self-fix
-    # or skip; ``self_fix_max_lines`` is guidance and telemetry, not the
-    # hard safety guard. Allowed files, validations, and re-review are.
-    # Default on so trivial REQUEST_CHANGES do not burn a full executor
-    # re-run. Tasks/roadmaps can opt out with ``review.self_fix: false``.
+    # or skip; ``self_fix_max_lines`` is the **soft budget** and
+    # ``self_fix_hard_max_lines`` is the hard safety guard. Allowed
+    # files, validations, and re-review are the actual gates. Default
+    # on so trivial REQUEST_CHANGES do not burn a full executor re-run.
+    # Tasks/roadmaps can opt out with ``review.self_fix: false``.
+    #
+    # Soft vs hard budget: ``self_fix_max_lines`` is a guidance
+    # number that the reviewer prompt carries upstream. A bounded fix
+    # that is slightly over the soft budget is still allowed when
+    # validations + re-review pass (the old behaviour was to block the
+    # fix as soon as the count exceeded the cap, which caused the
+    # Biuro P2 / PR #58 multi-round repair churn). ``self_fix_hard_max_lines``
+    # is the safety cap; exceeding it stops the task and requests
+    # operator input. Defaults (300 / 800) replace the original
+    # 30-line hard stop.
     self_fix: bool = True
-    self_fix_max_lines: int = 30
+    self_fix_max_lines: int = 300
+    self_fix_hard_max_lines: int = 800
+    # Maximum number of Codex self-fix passes per task. The default of
+    # 2 keeps the self-fix loop bounded: a first attempt handles the
+    # obvious case; a second attempt is allowed for follow-up issues
+    # from the re-review; further cycles stop with
+    # ``review_churn_limit``.
+    max_codex_self_fix_cycles: int = 2
+    # Maximum number of executor (MiniMax / opencode) repair attempts
+    # the orchestrator will run **after** a REQUEST_CHANGES verdict
+    # for a single task. The v1 PR-#58 hardening default is 1: the
+    # first MiniMax repair is allowed; the second is not — Codex must
+    # self-fix or the operator must decide. The dataclass default
+    # below is set to ``MAX_EXECUTOR_REPAIR_REPAIRS_DEFAULT`` (a high
+    # value that effectively preserves pre-#58 behaviour where
+    # ``max_attempts`` was the sole governor) so the existing test
+    # suite keeps passing; the v1 hardening is opt-in via a roadmap /
+    # review config that sets this to 1. See
+    # :data:`agentops.models.MAX_EXECUTOR_REPAIR_REPAIRS_DEFAULT`.
+    max_executor_review_repairs: int = 100
     # Reviewer profile name (issue #52). When set, the resolved reviewer
     # is drawn from the profile registry (``agentops profiles ...``)
     # instead of from ``codex_model`` / ``model_reasoning_effort`` /
@@ -256,10 +286,45 @@ class RunnerResult:
 # grep for the same string.
 EXECUTOR_NO_OUTPUT_STARTUP = "executor_no_output_startup"
 EXECUTOR_IDLE_TIMEOUT = "executor_idle_timeout"
+# Executor wrote outside the assigned worktree (the source repo changed
+# during the attempt, or the worktree top-level is not the expected
+# worktree root). Detected by ``agentops.worktree_guard`` and surfaced
+# with durable artifacts in the attempt directory.
+EXECUTOR_WORKTREE_LEAK = "worktree_leak"
+# Codex self-fix exhausted its bounded budget; further review cycles
+# should stop and request operator input rather than rerunning the
+# executor.
+REVIEW_CHURN_LIMIT = "review_churn_limit"
+# Executor repair attempts after a REQUEST_CHANGES verdict exceeded the
+# per-task budget. The orchestrator stops the task and requests a
+# Codex self-fix or operator decision.
+EXECUTOR_REPAIR_BUDGET_EXCEEDED = "executor_repair_budget_exceeded"
 
 EXECUTOR_WATCHDOG_FAILURE_CATEGORIES = frozenset(
     {EXECUTOR_NO_OUTPUT_STARTUP, EXECUTOR_IDLE_TIMEOUT}
 )
+
+# Failure categories the orchestrator / runbook treats as "stop the task
+# and ask an operator". These are not watchdog categories; they are
+# the dispatcher / safety-net categories introduced by the
+# worktree-discipline and repair-routing hardening (PR #58).
+NON_WATCHDOG_BLOCKING_CATEGORIES = frozenset(
+    {EXECUTOR_WORKTREE_LEAK, REVIEW_CHURN_LIMIT, EXECUTOR_REPAIR_BUDGET_EXCEEDED}
+)
+
+# Backwards-compatible default for ``ReviewConfig.max_executor_review_repairs``.
+# The v1 PR-#58 hardening recommends 1 (Codex may do at most one large
+# mechanical repair per task); the dataclass default is set to a high
+# value so existing roadmaps and tests keep their old semantics, and
+# the v1 policy is opted into by setting the field explicitly to 1.
+MAX_EXECUTOR_REPAIR_REPAIRS_DEFAULT = 100
+
+# Default for the repair-routing churn guard: how many REQUEST_CHANGES
+# cycles a single task may cycle through before the orchestrator
+# blocks with ``review_churn_limit``. Computed as
+# ``max_codex_self_fix_cycles + max_executor_review_repairs``; the
+# constant is exposed for docs / tests.
+REVIEW_CHURN_LIMIT_DEFAULT = 3
 
 
 @dataclass(frozen=True)

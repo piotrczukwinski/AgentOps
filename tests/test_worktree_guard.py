@@ -1,0 +1,584 @@
+"""Tests for the worktree discipline guard (PR #58).
+
+Covers:
+
+* the prompt prefix renderer (deterministic, mentions the worktree
+  root, the source repo root, allowed files, the explicit rules,
+  and ``worktree_leak`` as the failure category);
+* :func:`prepend_worktree_discipline` (prefix is prepended, comes
+  before the task body, is idempotent);
+* :func:`capture_git_snapshot` against a real temporary git repo;
+* :func:`diff_snapshot_changed` and :func:`detect_worktree_leak`
+  on the four canonical scenarios:
+    - source repo unchanged + worktree changed → no leak;
+    - source repo changed + worktree unchanged → leak (the Biuro
+      P2 "empty diff" failure mode);
+    - both changed → leak;
+    - top-level mismatch → leak;
+    - ``.agentops/`` change in the source repo is ignored (it is
+      legitimate AgentOps runtime metadata, not a leak);
+* :func:`write_worktree_leak_artifacts` (six artifact files plus
+  a JSON diagnosis that includes the failure category and the
+  expected / actual worktree roots);
+* a single orchestrator integration smoke test that does NOT call
+  real Codex / MiniMax / opencode: it uses a fake executor runner
+  that writes to the source checkout, asserts the task transitions
+  to ``BLOCKED`` with ``failure_category=worktree_leak`` and the
+  diagnostic artifacts are present.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from agentops.config import load_roadmap
+from agentops.orchestrator import Orchestrator, RunOptions
+from agentops.review import HeuristicReviewer
+from agentops.runners import RunnerResult, utc_now
+from agentops.state import StateStore
+from agentops.worktree_guard import (
+    EXECUTOR_WORKTREE_LEAK,
+    WorktreeDisciplineContext,
+    capture_git_snapshot,
+    default_ignored_source_repo_patterns,
+    detect_worktree_leak,
+    diff_snapshot_changed,
+    path_under,
+    prepend_worktree_discipline,
+    render_worktree_discipline_prefix,
+    write_worktree_leak_artifacts,
+)
+
+
+def _git(path: Path, *args: str, check: bool = True) -> str:
+    """Run a git command in ``path`` and return stdout."""
+    proc = subprocess.run(
+        ["git", "-C", str(path), *args], capture_output=True, text=True, check=False
+    )
+    if check and proc.returncode != 0:
+        raise AssertionError(f"git {args} failed: {proc.stderr}")
+    return proc.stdout
+
+
+def _init_repo(parent: Path) -> Path:
+    """Create a tiny git repo under ``parent`` with one seed commit."""
+    repo = parent / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "agentops@example.invalid")
+    _git(repo, "config", "user.name", "AgentOps Test")
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "initial")
+    return repo
+
+
+def _make_context(
+    *,
+    repo_root: Path,
+    worktree_root: Path,
+    branch_name: str = "agent/t1",
+    allowed_files: tuple[str, ...] = ("out.txt",),
+    executor: str = "shell",
+    executor_profile: str | None = None,
+    execution_mode: str = "worktree_branch",
+) -> WorktreeDisciplineContext:
+    return WorktreeDisciplineContext(
+        roadmap_id="r",
+        task_id="T1",
+        repo_root=repo_root,
+        worktree_root=worktree_root,
+        branch_name=branch_name,
+        allowed_files=allowed_files,
+        execution_mode=execution_mode,
+        executor=executor,
+        executor_profile=executor_profile,
+    )
+
+
+class PromptPrefixTests(unittest.TestCase):
+    """The worktree discipline prompt prefix is mandatory and deterministic."""
+
+    def _ctx(self, tmp: Path) -> WorktreeDisciplineContext:
+        return _make_context(
+            repo_root=tmp / "repo",
+            worktree_root=tmp / "wt",
+        )
+
+    def test_prefix_contains_expected_worktree_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            text = render_worktree_discipline_prefix(ctx)
+            self.assertIn(str(ctx.worktree_root), text)
+
+    def test_prefix_contains_source_repo_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            text = render_worktree_discipline_prefix(ctx)
+            self.assertIn(str(ctx.repo_root), text)
+
+    def test_prefix_contains_git_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            text = render_worktree_discipline_prefix(ctx)
+            self.assertIn("pwd", text)
+            self.assertIn("git rev-parse --show-toplevel", text)
+            self.assertIn("git status --short", text)
+
+    def test_prefix_contains_never_edit_source_repo_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            text = render_worktree_discipline_prefix(ctx)
+            self.assertIn("Never edit the source repo root", text)
+
+    def test_prefix_contains_allowed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _make_context(
+                repo_root=Path(tmp) / "repo",
+                worktree_root=Path(tmp) / "wt",
+                allowed_files=("a.py", "b/c.md"),
+            )
+            text = render_worktree_discipline_prefix(ctx)
+            self.assertIn("a.py", text)
+            self.assertIn("b/c.md", text)
+
+    def test_prefix_mentions_worktree_leak_failure_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            text = render_worktree_discipline_prefix(ctx)
+            self.assertIn("worktree_leak", text)
+            self.assertIn(EXECUTOR_WORKTREE_LEAK, text)
+
+    def test_prefix_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            a = render_worktree_discipline_prefix(ctx)
+            b = render_worktree_discipline_prefix(ctx)
+            self.assertEqual(a, b)
+
+    def test_prefix_has_no_committed_private_paths(self) -> None:
+        # Tests / docs MUST NOT contain private absolute paths. The
+        # prefix only embeds the values that the caller passes in;
+        # this test confirms the *static* structure of the prefix
+        # does not embed a hardcoded absolute path.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            text = render_worktree_discipline_prefix(ctx)
+            for forbidden in ("/home/czuki", "BusinessAgent", "Biuro", "antidetect", "STAB"):
+                self.assertNotIn(forbidden, text)
+
+
+class PrependWorktreeDisciplineTests(unittest.TestCase):
+    def test_prepend_comes_before_task_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _make_context(
+                repo_root=Path(tmp) / "repo",
+                worktree_root=Path(tmp) / "wt",
+            )
+            task_body = "do the thing"
+            full = prepend_worktree_discipline(task_body, ctx)
+            self.assertTrue(full.startswith("# WORKTREE DISCIPLINE"))
+            self.assertIn(task_body, full)
+            self.assertLess(
+                full.index("# WORKTREE DISCIPLINE"),
+                full.index(task_body),
+            )
+
+    def test_prepend_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _make_context(
+                repo_root=Path(tmp) / "repo",
+                worktree_root=Path(tmp) / "wt",
+            )
+            once = prepend_worktree_discipline("body", ctx)
+            twice = prepend_worktree_discipline(once, ctx)
+            self.assertEqual(once, twice)
+
+    def test_prepend_handles_empty_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _make_context(
+                repo_root=Path(tmp) / "repo",
+                worktree_root=Path(tmp) / "wt",
+            )
+            text = prepend_worktree_discipline("", ctx)
+            self.assertTrue(text.startswith("# WORKTREE DISCIPLINE"))
+
+
+class GitSnapshotTests(unittest.TestCase):
+    def test_capture_on_temporary_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _init_repo(Path(tmp))
+            snap = capture_git_snapshot(repo)
+            self.assertTrue(snap.is_git_repo)
+            self.assertIsNone(snap.error)
+            self.assertIsNotNone(snap.top_level)
+            self.assertEqual(
+                Path(snap.top_level).resolve(), repo.resolve()
+            )
+            # No changes yet.
+            self.assertFalse(snap.has_changes)
+
+    def test_capture_on_non_git_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "not-a-repo"
+            d.mkdir()
+            snap = capture_git_snapshot(d)
+            self.assertFalse(snap.is_git_repo)
+            self.assertEqual(snap.error, "not a git working tree")
+
+    def test_capture_detects_uncommitted_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _init_repo(Path(tmp))
+            (repo / "README.md").write_text("seed + leak\n", encoding="utf-8")
+            snap = capture_git_snapshot(repo)
+            self.assertTrue(snap.has_changes)
+            self.assertIn("README.md", snap.diff_name_status)
+
+
+class DiffSnapshotChangedTests(unittest.TestCase):
+    def test_returns_false_when_no_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _init_repo(Path(tmp))
+            before = capture_git_snapshot(repo)
+            after = capture_git_snapshot(repo)
+            self.assertFalse(diff_snapshot_changed(before, after))
+
+    def test_returns_true_when_new_file_added(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _init_repo(Path(tmp))
+            before = capture_git_snapshot(repo)
+            (repo / "new.txt").write_text("leak\n", encoding="utf-8")
+            after = capture_git_snapshot(repo)
+            self.assertTrue(diff_snapshot_changed(before, after))
+
+    def test_agentops_path_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _init_repo(Path(tmp))
+            before = capture_git_snapshot(repo)
+            (repo / ".agentops").mkdir()
+            (repo / ".agentops" / "summary.json").write_text("{}", encoding="utf-8")
+            after = capture_git_snapshot(repo)
+            # No non-ignored changes → not changed.
+            self.assertFalse(
+                diff_snapshot_changed(
+                    before, after, ignore_paths=default_ignored_source_repo_patterns()
+                )
+            )
+
+    def test_normal_source_change_is_NOT_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _init_repo(Path(tmp))
+            before = capture_git_snapshot(repo)
+            (repo / "leaked.txt").write_text("oops\n", encoding="utf-8")
+            after = capture_git_snapshot(repo)
+            self.assertTrue(
+                diff_snapshot_changed(
+                    before, after, ignore_paths=default_ignored_source_repo_patterns()
+                )
+            )
+
+
+class DetectWorktreeLeakTests(unittest.TestCase):
+    def _build(self, tmp: Path) -> tuple[Path, Path, WorktreeDisciplineContext]:
+        repo = _init_repo(tmp)
+        # Worktree is a real git worktree of the repo.
+        wt = tmp / "wt"
+        _git(repo, "worktree", "add", "-B", "agent/t1", str(wt), "HEAD")
+        ctx = _make_context(repo_root=repo, worktree_root=wt)
+        return repo, wt, ctx
+
+    def test_no_leak_when_source_unchanged_worktree_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt, ctx = self._build(Path(tmp))
+            repo_before = capture_git_snapshot(repo)
+            (wt / "out.txt").write_text("ok\n", encoding="utf-8")
+            repo_after = capture_git_snapshot(repo)
+            worktree_after = capture_git_snapshot(wt)
+            decision = detect_worktree_leak(repo_before, repo_after, worktree_after, ctx)
+            self.assertFalse(decision.leaked)
+            self.assertIsNone(decision.failure_category)
+
+    def test_leak_when_source_changed_worktree_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt, ctx = self._build(Path(tmp))
+            repo_before = capture_git_snapshot(repo)
+            # Executor writes to source repo absolute path — the
+            # original Biuro P2 symptom.
+            (repo / "README.md").write_text("contaminated\n", encoding="utf-8")
+            repo_after = capture_git_snapshot(repo)
+            worktree_after = capture_git_snapshot(wt)
+            decision = detect_worktree_leak(repo_before, repo_after, worktree_after, ctx)
+            self.assertTrue(decision.leaked)
+            self.assertEqual(decision.failure_category, EXECUTOR_WORKTREE_LEAK)
+            self.assertTrue(decision.repo_changed)
+            self.assertIn("source repo working tree changed", decision.reason)
+            self.assertIn("source repo changed while worktree diff was empty", decision.reason)
+
+    def test_leak_when_both_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt, ctx = self._build(Path(tmp))
+            repo_before = capture_git_snapshot(repo)
+            (wt / "out.txt").write_text("ok\n", encoding="utf-8")
+            (repo / "README.md").write_text("leak\n", encoding="utf-8")
+            repo_after = capture_git_snapshot(repo)
+            worktree_after = capture_git_snapshot(wt)
+            decision = detect_worktree_leak(repo_before, repo_after, worktree_after, ctx)
+            self.assertTrue(decision.leaked)
+            self.assertEqual(decision.failure_category, EXECUTOR_WORKTREE_LEAK)
+            self.assertTrue(decision.repo_changed)
+            self.assertTrue(decision.worktree_changed)
+
+    def test_leak_on_top_level_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo, wt, ctx = self._build(tmp_path)
+            # Build a *different* worktree so its top-level is not
+            # the expected one.
+            other = tmp_path / "other"
+            _git(repo, "worktree", "add", "-B", "agent/other", str(other), "HEAD")
+            repo_before = capture_git_snapshot(repo)
+            (other / "out.txt").write_text("ok\n", encoding="utf-8")
+            repo_after = capture_git_snapshot(repo)
+            worktree_after = capture_git_snapshot(other)
+            decision = detect_worktree_leak(repo_before, repo_after, worktree_after, ctx)
+            self.assertTrue(decision.leaked)
+            self.assertTrue(decision.top_level_mismatch)
+            self.assertEqual(decision.failure_category, EXECUTOR_WORKTREE_LEAK)
+
+    def test_agentops_path_in_source_is_not_a_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt, ctx = self._build(Path(tmp))
+            repo_before = capture_git_snapshot(repo)
+            (repo / ".agentops").mkdir()
+            (repo / ".agentops" / "summary.json").write_text("{}", encoding="utf-8")
+            repo_after = capture_git_snapshot(repo)
+            worktree_after = capture_git_snapshot(wt)
+            decision = detect_worktree_leak(repo_before, repo_after, worktree_after, ctx)
+            self.assertFalse(decision.leaked)
+
+
+class WriteLeakArtifactsTests(unittest.TestCase):
+    def test_writes_six_artifact_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt, ctx = self._build(Path(tmp))
+            repo_before = capture_git_snapshot(repo)
+            (repo / "README.md").write_text("leak\n", encoding="utf-8")
+            repo_after = capture_git_snapshot(repo)
+            worktree_after = capture_git_snapshot(wt)
+            decision = detect_worktree_leak(repo_before, repo_after, worktree_after, ctx)
+            out_dir = Path(tmp) / "artifacts"
+            paths = write_worktree_leak_artifacts(
+                out_dir, ctx, repo_before, repo_after, worktree_after, decision
+            )
+            names = sorted(p.name for p in paths)
+            self.assertEqual(
+                names,
+                sorted(
+                    [
+                        "worktree-leak.repo-before-status.txt",
+                        "worktree-leak.repo-after-status.txt",
+                        "worktree-leak.repo-after-diff.patch",
+                        "worktree-leak.worktree-status.txt",
+                        "worktree-leak.worktree-diff.patch",
+                        "worktree-leak.diagnosis.json",
+                    ]
+                ),
+            )
+            diagnosis = json.loads((out_dir / "worktree-leak.diagnosis.json").read_text())
+            self.assertEqual(diagnosis["failure_category"], EXECUTOR_WORKTREE_LEAK)
+            self.assertEqual(diagnosis["roadmap_id"], "r")
+            self.assertEqual(diagnosis["task_id"], "T1")
+            self.assertIn("operator_hint", diagnosis)
+
+    def _build(self, tmp: Path) -> tuple[Path, Path, WorktreeDisciplineContext]:
+        return DetectWorktreeLeakTests()._build(tmp)
+
+
+class PathUnderTests(unittest.TestCase):
+    def test_exact_match(self) -> None:
+        self.assertTrue(path_under("/a/b", "/a/b"))
+
+    def test_subpath_match(self) -> None:
+        self.assertTrue(path_under("/a/b/c", "/a/b"))
+
+    def test_sibling_does_not_match(self) -> None:
+        self.assertFalse(path_under("/a/bc", "/a/b"))
+
+    def test_parent_does_not_match(self) -> None:
+        self.assertFalse(path_under("/a", "/a/b"))
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator integration: fake executor writes to source repo,
+# AgentOps blocks with worktree_leak, no real Codex/MiniMax/opencode.
+# ---------------------------------------------------------------------------
+
+
+class _LeakyFakeRunner:
+    """Fake executor that writes to the *source* repo instead of the worktree.
+
+    Mirrors the Biuro P2 failure: the executor resolves an absolute
+    path from the source checkout and edits the wrong file.
+    """
+
+    def __init__(self, repo_path: Path, target: str = "README.md"):
+        self.repo_path = repo_path
+        self.target = target
+        self.calls: list[dict] = []
+
+    def run(self, task, prompt, cwd, artifact_dir, **kwargs):  # type: ignore[override]
+        self.calls.append({"cwd": str(cwd), "prompt_path": "<prompt>"})
+        # Write to the source repo's absolute path instead of cwd.
+        (self.repo_path / self.target).write_text(
+            "leaked by fake executor\n", encoding="utf-8"
+        )
+        out = artifact_dir / "executor.stdout.log"
+        err = artifact_dir / "executor.stderr.log"
+        out.write_text("AGENTOPS_RESULT_JSON: {\"status\": \"done\"}\n", encoding="utf-8")
+        err.write_text("", encoding="utf-8")
+        return RunnerResult(0, out, err, utc_now(), utc_now())
+
+
+class WorktreeLeakOrchestratorTests(unittest.TestCase):
+    def test_blocked_with_worktree_leak_when_executor_writes_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = _init_repo(tmp_path)
+            prompt = tmp_path / "prompt.md"
+            prompt.write_text("do something", encoding="utf-8")
+            roadmap_path = tmp_path / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "leak-orch",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": "true",
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": ["true"],
+                                "review": {"codex": "never"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(tmp_path / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            leaky = _LeakyFakeRunner(repo_path=repo)
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="heuristic",
+                    artifacts_root=tmp_path / "artifacts",
+                    workspaces_root=tmp_path / "workspaces",
+                    no_codex=True,
+                ),
+                shell_runner=leaky,
+                heuristic_reviewer=HeuristicReviewer(),
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("leak-orch")[0]
+            self.assertEqual(row["state"], "blocked")
+            # The executor ran exactly once before the leak block.
+            self.assertEqual(len(leaky.calls), 1)
+            # The primary failure category is worktree_leak, NOT
+            # empty_diff. The fix to the Biuro P2 misclassification.
+            events = state.timeline_event_rows(
+                task_id="T1", limit=200
+            )
+            blocked_events = [
+                json.loads(e["payload_json"])
+                for e in events
+                if e["type"] == "task.blocked"
+            ]
+            self.assertTrue(blocked_events, "expected a task.blocked event")
+            failure_category = blocked_events[-1].get("failure_category")
+            self.assertEqual(failure_category, EXECUTOR_WORKTREE_LEAK)
+            # Artifacts on disk.
+            artifacts = state.artifacts_for_task("T1")
+            kinds = {a["kind"] for a in artifacts}
+            self.assertTrue(
+                any(k.startswith("worktree_leak:") for k in kinds),
+                f"expected worktree_leak artifacts, got kinds={sorted(kinds)}",
+            )
+            # The leaked source file is still on disk (no auto-revert).
+            self.assertEqual(
+                (repo / "README.md").read_text(encoding="utf-8"),
+                "leaked by fake executor\n",
+            )
+            # The "task.worktree_leak_detected" event is on the timeline.
+            events = [
+                e["type"]
+                for e in state.latest_events(50)
+                if e["task_id"] == "T1"
+            ]
+            self.assertIn("task.worktree_leak_detected", events)
+
+    def test_no_leak_when_executor_writes_only_in_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = _init_repo(tmp_path)
+            prompt = tmp_path / "prompt.md"
+            prompt.write_text("create out.txt", encoding="utf-8")
+            roadmap_path = tmp_path / "r.json"
+            roadmap_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roadmap_id": "no-leak-orch",
+                        "repo": {"id": "repo", "path": str(repo), "base_branch": "HEAD"},
+                        "tasks": [
+                            {
+                                "id": "T1",
+                                "kind": "implementation",
+                                "executor": "shell",
+                                "executor_command": (
+                                    "python3 -c \"from pathlib import Path; "
+                                    "Path('out.txt').write_text('ok\\n', encoding='utf-8')\""
+                                ),
+                                "prompt": str(prompt),
+                                "allowed_files": ["out.txt"],
+                                "validations": [
+                                    "python3 -c \"from pathlib import Path; "
+                                    "assert Path('out.txt').read_text(encoding='utf-8') == 'ok\\n'\""
+                                ],
+                                "review": {"codex": "never"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = StateStore(tmp_path / "state.sqlite")
+            roadmap = load_roadmap(roadmap_path)
+            orch = Orchestrator(
+                state,
+                RunOptions(
+                    force_reviewer="heuristic",
+                    artifacts_root=tmp_path / "artifacts",
+                    workspaces_root=tmp_path / "workspaces",
+                    no_codex=True,
+                ),
+                heuristic_reviewer=HeuristicReviewer(),
+            )
+            orch.run_roadmap(roadmap)
+            row = state.task_rows("no-leak-orch")[0]
+            self.assertEqual(row["state"], "accepted")
+            # No worktree_leak artifacts.
+            artifacts = state.artifacts_for_task("T1")
+            kinds = {a["kind"] for a in artifacts}
+            self.assertFalse(any(k.startswith("worktree_leak:") for k in kinds))
+
+
+if __name__ == "__main__":
+    unittest.main()

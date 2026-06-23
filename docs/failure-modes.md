@@ -264,3 +264,107 @@ pane; no command execution happens server-side.
 
 See `docs/night-run-report.md` for the overnight runbook
 that walks through all of these failure modes end-to-end.
+
+## Worktree leak
+
+* **Category:** `worktree_leak`
+* **Detected by:** `agentops.worktree_guard.detect_worktree_leak`
+  (a runtime guard that captures a `GitSnapshot` of the source
+  repo *before* and *after* every executor attempt, and blocks
+  the task when the source repo changed unexpectedly or the
+  worktree top-level is not the expected worktree root).
+* **When:** the executor process writes outside the assigned
+  worktree (typically because it resolved an absolute path from
+  the source checkout, since `codex exec -C <worktree>` is *not*
+  a hard lock). The previous symptom was an empty worktree diff
+  misclassified as `empty_diff`; the v1 hardening surfaces the
+  real cause. ``.agentops/`` and ``.operator-runs/`` writes to
+  the source repo are legitimate AgentOps runtime metadata and
+  do *not* trigger the guard.
+* **First-line behaviour:** the task transitions to `BLOCKED`
+  with `failure_category=worktree_leak` and a `task.worktree_leak_detected`
+  event. The orchestrator writes durable evidence into the
+  attempt directory:
+
+    * `worktree-leak.repo-before-status.txt` — source repo
+      status before the attempt.
+    * `worktree-leak.repo-after-status.txt` — source repo
+      status after the attempt (the primary "what leaked" view).
+    * `worktree-leak.repo-after-diff.patch` — full source-repo
+      diff (evidence; do NOT auto-revert).
+    * `worktree-leak.worktree-status.txt` and
+      `worktree-leak.worktree-diff.patch` — worktree state
+      (empty when the executor wrote only to the source
+      checkout — the original Biuro P2 symptom).
+    * `worktree-leak.diagnosis.json` — machine-readable
+      decision + context, with the operator hint.
+
+  AgentOps does **not** auto-revert the leaked changes; the
+  evidence must be preserved for the operator.
+
+* **Operator playbook:**
+  1. Inspect the `worktree-leak.*` artifacts in the attempt
+     directory. The `operator_hint` field in
+     `worktree-leak.diagnosis.json` is the canonical string to
+     grep for.
+  2. Decide whether the leaked source-repo edits are
+     intentional, a partial fix, or pure contamination. Do not
+     `git checkout --` blindly; partial fixes must be rescued
+     into the worktree first.
+  3. Once the source checkout is clean, re-run the task. The
+     v1 worktree discipline prompt guard (a mandatory prefix
+     prepended to every executor prompt) makes the worktree
+     rules impossible to miss on the next attempt.
+
+## Repair-routing churn limit
+
+* **Category:** `review_churn_limit`
+* **Detected by:** the orchestrator's repair-routing churn
+  guard in `agentops/orchestrator.py` (the
+  ``REQUEST_CHANGES`` branch).
+* **When:** the task has bounced through more than
+  ``max(2, max_codex_self_fix_cycles + max_executor_review_repairs)``
+  `REQUEST_CHANGES` cycles. The defaults are 2 + 1 = 3
+  cycles; on the 4th cycle the orchestrator refuses to run
+  another executor repair and blocks with
+  `failure_category=review_churn_limit`.
+* **First-line behaviour:** the task transitions to `BLOCKED`
+  with `failure_category=review_churn_limit` and a
+  `task.review_churn_limit_reached` event. The hint reminds the
+  operator that Codex self-fix is the v1 default; if it has
+  been exhausted, the operator must decide whether to merge
+  as-is, revert, or relax a contract.
+* **Operator playbook:**
+  1. `agentops timeline --task <task-id>` to inspect the
+     request-changes / repair-classified events.
+  2. If the reviewer keeps finding new findings on every
+     cycle, the contract is too tight: relax a constraint or
+     split the task.
+  3. If the executor keeps producing a fix that the reviewer
+     rejects, Codex self-fix is the v1 path — re-run the task
+     with `review.self_fix: true` (the default) and let Codex
+     apply the fix directly.
+
+## Executor repair budget exceeded
+
+* **Category:** `executor_repair_budget_exceeded`
+* **Detected by:** the orchestrator's repair-routing
+  ``REQUEST_CHANGES`` branch when the per-task executor repair
+  budget is exhausted (the v1 default is 1 MiniMax repair per
+  task; the v0 default is `max_attempts - 1` for backwards
+  compatibility).
+* **When:** the executor has already been re-run once for this
+  task; a second ``REQUEST_CHANGES`` is received. Per the
+  Codex-owns-repair-reasoning principle, MiniMax is not allowed
+  to re-run indefinitely. The orchestrator refuses to invoke
+  the executor again, and the task transitions to `BLOCKED`
+  with the canonical failure category.
+* **First-line behaviour:** the task transitions to `BLOCKED`
+  with `failure_category=executor_repair_budget_exceeded` and
+  a `task.executor_repair_budget_exceeded` event.
+* **Operator playbook:**
+  1. The task was not accepted because the executor repair
+     budget was exhausted. Either Codex self-fix should have
+     handled it (set `review.self_fix: true`) or the operator
+     must decide whether to merge as-is, revert, or relax a
+     contract.

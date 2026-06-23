@@ -226,3 +226,52 @@ for the full precedence, the validation rules, and the migration
 guide. New CLI commands are `agentops profiles validate|show|resolve`;
 the admin panel exposes the same selection through the Roadmap
 launcher card.
+
+## Worktree discipline and repair routing (PR #58)
+
+`codex exec -C <worktree>` is **not** a hard lock. The
+executor can still resolve absolute paths from the source
+checkout and corrupt the main checkout silently. PR #58
+adds two guards:
+
+1. A **mandatory worktree discipline prefix** is prepended
+   to every worktree-backed executor prompt. The prefix
+   tells the executor exactly which directory is its
+   worktree and which is read-only. See
+   `agentops/worktree_guard.py`.
+2. A **runtime leak detector** captures a `GitSnapshot` of
+   the source repo before and after every executor attempt.
+   On contamination the task is blocked with
+   `failure_category=worktree_leak` and durable artifacts
+   are written to the attempt directory.
+   **AgentOps never auto-reverts the leaked changes**;
+   evidence is preserved for the operator.
+
+On the review side, the v1 repair routing v1 contract is:
+
+* **Codex owns repair reasoning.** The reviewer decides
+  the repair classification (SELF_FIX_BY_CODEX,
+  LARGE_MECHANICAL_REPAIR, OPERATOR_DECISION_REQUIRED,
+  BLOCK) and self-fixes small / medium bounded repairs
+  directly in the worktree.
+* **MiniMax may do at most one large mechanical repair per
+  task**, and only after Codex has authored a repair
+  prompt. The v1 default for
+  `review.max_executor_review_repairs` is 1.
+* **The 30-line hard cap is replaced** by a soft + hard
+  budget pair: `self_fix_max_lines` (default 300, soft) and
+  `self_fix_hard_max_lines` (default 800, hard stop).
+* A **churn guard** blocks the task with
+  `failure_category=executor_repair_budget_exceeded` or
+  `review_churn_limit` when cycles exceed the policy. Codex
+  always re-reviews after any repair.
+
+See `docs/gated-roadmap-runner.md` and
+`docs/failure-modes.md` for the full contract. The new
+events are greppable: `task.worktree_leak_detected`,
+`task.repair_classified`, `task.codex_self_fix_started`,
+`task.self_fix_soft_budget_exceeded`,
+`task.self_fix_hard_budget_exceeded`,
+`task.executor_repair_queued`,
+`task.executor_repair_budget_exceeded`,
+`task.review_churn_limit_reached`.
