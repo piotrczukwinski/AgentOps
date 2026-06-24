@@ -24,9 +24,21 @@ new categories and a bounded grace window:
 * ``missing_result_late_marker`` -- the marker line is
   present in the combined log but the previous classifier
   could not extract a parseable JSON body (e.g. it was
-  emitted just after the result-guard timeout). The
-  helper extracts the marker, accepts the result, and
-  the orchestrator continues to diff/validation.
+  emitted just after the result-guard timeout). This is
+  NEVER a real result; an unparseable marker means the
+  body is broken. The orchestrator SHOULD grant a
+  bounded grace window via
+  ``wait_for_log_growth_or_marker`` and reclassify;
+  if the marker is still unparseable past the grace
+  window, the task is parked at ``AWAITING_HUMAN``
+  with ``failure_category=missing_result_late_marker``.
+  No executor retry and no Codex takeover are
+  scheduled; the work is parked so the operator can
+  recover the marker manually. The v2 decision exposes
+  ``should_wait=True`` so the orchestrator knows to
+  grant the grace window, and
+  ``ResultGuardDecision.should_accept`` is always
+  False for this category.
 * ``missing_result_log_still_growing`` -- the combined log
   is still being written (size > last seen size) and the
   marker is not yet present. The orchestrator grants a

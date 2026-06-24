@@ -84,11 +84,15 @@ from .provider_failures import (
 )
 from .repo_lock import acquire_run_lock
 from .result_guard_v2 import (
+    DEFAULT_GRACE_SECONDS,
+    MAX_GRACE_SECONDS,
     MISSING_RESULT_LATE_MARKER,
     MISSING_RESULT_LOG_STILL_GROWING,
     MISSING_RESULT_NO_WORK,
     MISSING_RESULT_WITH_DIFF,
     classify_executor_result_v2,
+    resolve_grace_seconds,
+    wait_for_log_growth_or_marker,
 )
 from .review import (
     CodexReviewService,
@@ -516,6 +520,14 @@ class _TaskRuntime:
     # ``x_allow_review_with_baseline_failure=true`` and
     # the baseline signature matches the post signature.
     validation_baseline_warning: dict[str, Any] | None = None
+    # missing_result_with_diff_warning is the
+    # structured warning the review packet carries when
+    # the task opts in via
+    # x_allow_missing_result_with_diff=true and the
+    # executor did real work but emitted no marker. The
+    # warning is recorded on the runtime so the review
+    # prompt can surface it.
+    missing_result_with_diff_warning: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1115,17 +1127,47 @@ class Orchestrator:
                     runtime=runtime,
                     env=_pre_validation_env,
                 )
-            except Exception:  # noqa: BLE001 - never let baseline capture block the executor
-                # Baseline capture is best-effort; a
-                # failure here is logged as a soft
-                # warning, not a blocker.
+            except Exception as _exc:  # noqa: BLE001 - PR #67 fail-closed
+                # PR #67 (P3 hardening, Blocker 7): when
+                # the operator opted in to a baseline but
+                # baseline capture raised, the orchestrator
+                # MUST fail closed: park with
+                # ``validation_baseline_capture_failed`` and
+                # ``AWAITING_HUMAN`` and DO NOT run the
+                # executor as if baseline had been
+                # captured. Silently continuing would let
+                # the post-executor comparison run with no
+                # stored baseline signature, defeating the
+                # purpose of the opt-in.
                 self.state.event(
                     roadmap.roadmap_id,
                     task.id,
                     attempt_id,
                     "task.validation_baseline_capture_failed",
-                    {"attempt": attempt_no},
+                    {
+                        "attempt": attempt_no,
+                        "failure_category": "validation_baseline_capture_failed",
+                        "error_type": type(_exc).__name__,
+                    },
                 )
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.AWAITING_HUMAN,
+                    {
+                        "reason": "validation_baseline_capture_failed",
+                        "failure_category": "validation_baseline_capture_failed",
+                        "hint": (
+                            "Baseline capture raised before the executor "
+                            "could run. The task opted in to "
+                            "``x_validation_baseline``; AgentOps does "
+                            "NOT silently continue. Inspect the capture "
+                            "failure and re-run after fixing the "
+                            "underlying issue."
+                        ),
+                    },
+                )
+                return
 
             self.state.transition_task(
                 roadmap.roadmap_id, task.id, TaskState.EXECUTOR_RUNNING, {"attempt": attempt_no}
@@ -1822,6 +1864,24 @@ class Orchestrator:
                 _combined_log = getattr(result, "combined_log_path", None)
                 _stdout_log = getattr(result, "stdout_path", None)
                 _worktree_diff = diff.patch
+                # PR #67 (P3 hardening, Blocker C): compute
+                # log_still_growing from the runner's
+                # actual process state, not a hardcoded
+                # False. The v2 classifier returns
+                # MISSING_RESULT_LOG_STILL_GROWING only
+                # when the log is genuinely still being
+                # written; otherwise it returns one of the
+                # other missing categories. The runner
+                # exposes is_alive() when the process
+                # is still running; we also peek at the
+                # file mtime as a secondary signal so a
+                # process that just exited but whose log
+                # was touched within the grace window is
+                # still classified as growing.
+                _log_still_growing = self._compute_log_still_growing(
+                    result=result,
+                    combined_log_path=_combined_log,
+                )
                 try:
                     _v2 = classify_executor_result_v2(
                         combined_log=_combined_log
@@ -1829,7 +1889,7 @@ class Orchestrator:
                         else Path("/nonexistent"),
                         stdout_log=_stdout_log,
                         worktree_diff=_worktree_diff,
-                        log_still_growing=False,
+                        log_still_growing=_log_still_growing,
                     )
                 except Exception:  # noqa: BLE001 - never let the guard crash the run
                     _v2 = None
@@ -1887,6 +1947,98 @@ class Orchestrator:
                         _legacy_category = None
                         _v1_classification = "real"
                     _category = _v2.category
+                    # PR #67 (P3 hardening, Blocker C + D):
+                    # when the v2 classifier returns
+                    # ``MISSING_RESULT_LATE_MARKER`` and
+                    # the log might still be growing, grant
+                    # a bounded grace window and reclassify
+                    # at the end of the wait. After grace,
+                    # if the marker is still unparseable OR
+                    # the v2 still says ``LOG_STILL_GROWING``,
+                    # map to a fail-closed branch.
+                    if (
+                        _v2.category == MISSING_RESULT_LATE_MARKER
+                        and bool(_v2.should_wait)
+                    ):
+                        _grace = resolve_grace_seconds(
+                            task.metadata if hasattr(task, "metadata") else None
+                        )
+                        try:
+                            _wait_grew, _wait_size, _wait_marker_seen = (
+                                wait_for_log_growth_or_marker(
+                                    combined_log=_combined_log
+                                    if _combined_log is not None
+                                    else Path("/nonexistent"),
+                                    expected_size=_v2.log_size,
+                                    grace_seconds=_grace,
+                                )
+                            )
+                        except Exception:  # noqa: BLE001
+                            _wait_grew, _wait_size, _wait_marker_seen = (
+                                False,
+                                _v2.log_size,
+                                False,
+                            )
+                        if _wait_marker_seen:
+                            _log_still_growing_v2 = (
+                                self._compute_log_still_growing(
+                                    result=result,
+                                    combined_log_path=_combined_log,
+                                )
+                            )
+                            try:
+                                _v2 = classify_executor_result_v2(
+                                    combined_log=_combined_log
+                                    if _combined_log is not None
+                                    else Path("/nonexistent"),
+                                    stdout_log=_stdout_log,
+                                    worktree_diff=_worktree_diff,
+                                    log_still_growing=_log_still_growing_v2,
+                                )
+                            except Exception:  # noqa: BLE001
+                                _v2 = None
+                            if _v2 is not None:
+                                if _v2.category == "real":
+                                    _category = None
+                                    _legacy_category = None
+                                elif _v2.category == MISSING_RESULT_LATE_MARKER:
+                                    _legacy_category = MISSING_RESULT_LATE_MARKER
+                                    _category = MISSING_RESULT_LATE_MARKER
+                                elif _v2.category == MISSING_RESULT_LOG_STILL_GROWING:
+                                    _legacy_category = MISSING_RESULT_LOG_STILL_GROWING
+                                    _category = MISSING_RESULT_LOG_STILL_GROWING
+                                else:
+                                    _category = _v2.category
+                    # PR #67 (P3 hardening, Blocker 5):
+                    # ``missing_result_with_diff`` is a park
+                    # signal by default; the task may opt in
+                    # via ``x_allow_missing_result_with_diff=true``
+                    # to proceed to validation/review with a
+                    # warning. The default is the fail-closed
+                    # park; the opt-in flips the routing so
+                    # the executor did real work and the
+                    # reviewer can decide.
+                    if _v2 is not None and _v2.category == MISSING_RESULT_WITH_DIFF:
+                        _allow_with_diff = bool(
+                            task.metadata.get("x_allow_missing_result_with_diff")
+                        ) if hasattr(task, "metadata") else False
+                        if _allow_with_diff:
+                            self.state.event(
+                                roadmap.roadmap_id,
+                                task.id,
+                                attempt_id,
+                                "task.result_guard_missing_result_with_diff_allowed",
+                                {
+                                    "failure_category": MISSING_RESULT_WITH_DIFF,
+                                    "allow_missing_result_with_diff": True,
+                                },
+                            )
+                            runtime.missing_result_with_diff_warning = {
+                                "category": MISSING_RESULT_WITH_DIFF,
+                                "allow_missing_result_with_diff": True,
+                            }
+                            _category = None
+                            _legacy_category = None
                 # ``should_accept`` is the only accept
                 # signal. When the v2 classifier says
                 # ``real`` AND marker_payload is a dict,
@@ -2243,6 +2395,15 @@ class Orchestrator:
             # ``build_validation_subprocess_env`` returns
             # ``None`` when the contract is not declared;
             # the engine then inherits the parent env.
+            # PR #67 (P3 hardening, Blocker B): the
+            # validation-repair branch is now skipped when
+            # the baseline comparison returned
+            # ``ALLOW_REVIEW_WITH_WARNING``. The flag is
+            # declared before the comparison helper is
+            # called so the helper can flip it; the
+            # validation-repair branch consults it
+            # directly.
+            _baseline_allow_review_with_warning = False
             validation = ValidationEngine(
                 timeout_seconds=min(task.timeout_seconds, 1800),
                 env=validation_env,
@@ -2281,6 +2442,15 @@ class Orchestrator:
                 # park. The review packet plumbing reads
                 # ``runtime.validation_baseline_warning``
                 # so the warning reaches the reviewer.
+                # PR #67 (P3 hardening, Blocker B): the
+                # validation-repair branch below is now
+                # SKIPPED when this action fires, so the
+                # task does not get a duplicate executor
+                # repair attempt over an already-known
+                # failure. The local
+                # ``_baseline_allow_review_with_warning``
+                # flag is the single switch the repair
+                # branch consults.
                 self._record_roadmap_event(
                     roadmap,
                     "task.validation_baseline_known_failure",
@@ -2290,6 +2460,7 @@ class Orchestrator:
                 runtime.validation_baseline_warning = (
                     baseline_action.warning
                 )
+                _baseline_allow_review_with_warning = True
             elif baseline_action.action == "DIFFERENT_FAILURE":
                 # Baseline failed but post has a different
                 # fingerprint: the task introduced a new
@@ -2345,7 +2516,22 @@ class Orchestrator:
             )
 
             # Validation failure: deterministic repair first, then reviewer triage.
-            if (not result.ok and not executor_idle_partial_diff) or not validation.ok:
+            # PR #67 (P3 hardening, Blocker B): when the
+            # baseline comparison returned
+            # ``ALLOW_REVIEW_WITH_WARNING``, the
+            # ``validation.ok`` is allowed to be False;
+            # the known-baseline failure must not trigger
+            # an executor repair. We fall through to the
+            # review path so the reviewer sees the
+            # warning and the code diff.
+            _validation_failed_for_known_baseline = (
+                _baseline_allow_review_with_warning
+                and (not result.ok or not validation.ok)
+            )
+            if (
+                (not result.ok and not executor_idle_partial_diff)
+                or not validation.ok
+            ) and not _validation_failed_for_known_baseline:
                 if attempt_no < max_attempts:
                     runtime.repair_prompt = compiler.repair_prompt_from_validation(task, validation)
                     repair_path = artifact_store.write_text(
@@ -4118,6 +4304,44 @@ class Orchestrator:
             },
         )
         return True
+
+    def _compute_log_still_growing(
+        self,
+        *,
+        result: RunnerResult,
+        combined_log_path: Path | None,
+        grace_window_seconds: int | None = None,
+    ) -> bool:
+        """Return True when the executor's combined log is
+        still being written. Used by the result-guard v2
+        classifier to distinguish MISSING_RESULT_LOG_STILL_GROWING
+        (the marker may still appear) from
+        MISSING_RESULT_LATE_MARKER / MISSING_RESULT_NO_WORK
+        (the log is final; the marker is gone for good).
+
+        Signals checked, in order:
+
+        1. result.is_alive() returns True (the runner
+           still has the subprocess).
+        2. The combined log's mtime is within the grace
+           window (default 2s, never more than MAX_GRACE_SECONDS).
+        """
+        try:
+            if bool(getattr(result, "is_alive", lambda: False)()):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        if combined_log_path is None:
+            return False
+        try:
+            mtime = combined_log_path.stat().st_mtime
+        except OSError:
+            return False
+        window = grace_window_seconds
+        if window is None:
+            window = min(DEFAULT_GRACE_SECONDS, MAX_GRACE_SECONDS)
+        import time as _time
+        return (_time.time() - mtime) <= float(window)
 
     def _policy_for(self, roadmap: RoadmapConfig) -> PolicyEngine:
         return PolicyEngine(roadmap)
