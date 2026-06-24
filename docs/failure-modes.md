@@ -368,3 +368,84 @@ that walks through all of these failure modes end-to-end.
      handled it (set `review.self_fix: true`) or the operator
      must decide whether to merge as-is, revert, or relax a
      contract.
+
+## Result-guard v2 categories (PR #66)
+
+The v2 result guard introduces four new failure categories
+on top of the legacy `missing_result` and `template_result`.
+The intent is to stop the executor repair from re-running
+over already-completed work and to give the operator a
+clearer signal for each shape of failure.
+
+* **`missing_result_no_work`** — no marker in the log, no
+  worktree diff. The legacy retry path applies.
+* **`missing_result_with_diff`** — no marker but the
+  worktree diff is non-empty. The executor did real work
+  but did not emit a marker. The orchestrator parks the
+  task at `AWAITING_HUMAN` (unless
+  `x_allow_missing_result_with_diff=true`); **executor
+  repair is not queued**.
+* **`missing_result_late_marker`** — marker line is in
+  the log but the body is unparseable. The orchestrator
+  accepts the result and continues to diff/validation
+  instead of retrying.
+* **`missing_result_log_still_growing`** — the combined
+  log size is still changing and the marker is not yet
+  present. The orchestrator grants a bounded grace
+  window (`x_result_guard_grace_seconds`, default 120s,
+  cap 600s) before classifying.
+
+The full contract, including the grace window policy,
+is documented in `docs/p3-runtime-hardening.md` (Phase 6).
+
+## Validation env contract (PR #66)
+
+* **`validation_missing_env`** — a required validation
+  env var (declared via `x_validation_required_env`) is
+  not set in the parent process. The task is parked at
+  `AWAITING_HUMAN`. **Executor repair is not queued**
+  for this category: the bug is configuration, not
+  code. The operator playbook is to set the missing env
+  var and re-run; not to retry the executor.
+
+## Validation baseline (PR #66)
+
+* **`validation_baseline_known_failure`** — the task
+  opted in to `x_validation_baseline: true` and the
+  baseline signature matched the post-executor
+  signature. The failure is pre-existing; the task is
+  parked at `AWAITING_HUMAN` unless the task sets
+  `x_allow_review_with_baseline_failure=true`.
+* **`validation_baseline_different_failure`** — the
+  baseline failed but the post signature differs. The
+  task introduced a new failure. The normal
+  `validation_failed` path is left unchanged so
+  executor repair may still be queued.
+
+## Integration merge failure (PR #66)
+
+* **`integration_merge_failed`** — the multi-commit
+  no-ff merge path (or the legacy cherry-pick path)
+  hit a real conflict. The integration branch HEAD is
+  not advanced; the merge is rolled back via
+  `git merge --abort` / `git cherry-pick --abort`.
+  The task is parked at `MERGE_FAILED`. The
+  effective strategy is recorded on the `MERGED`
+  transition (`cherry_pick`, `no_ff`,
+  `no_ff_merge_multi_commit_branch`, or
+  `no_ff_merge_count_unavailable`).
+
+## Scope-creep detection (PR #66)
+
+* **`scope_creep_suspected`** — the executor's
+  combined log shows clear signs of out-of-scope
+  exploration (other workspaces, repeated tool
+  invocations on out-of-scope paths, etc.). The
+  orchestrator records this category and **refuses
+  to queue another executor repair**. The
+  suggested action is Codex takeover or operator
+  decision.
+
+See `docs/p3-runtime-hardening.md` for the full
+category list, the new roadmap / task config keys,
+and the recommended operator playbook for each.

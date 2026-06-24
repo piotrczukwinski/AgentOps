@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import MergePolicy, RepoConfig, ReviewConfig, RoadmapConfig, TaskConfig
+from .validation_env import validate_env_names
 
 # Canonical default for the per-task total executor attempts (initial +
 # repair attempts driven by ``REQUEST_CHANGES`` / validation failures).
@@ -286,6 +287,31 @@ def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
         _req_result_raw = item.get("require_executor_result", None)
         _require_executor_result = bool(_req_result_raw) if _req_result_raw is not None else None
 
+        # PR #66 (P3 hardening): validation env contract.
+        # Tasks can opt in to env passthrough / required
+        # env via the ``x_validation_*`` extension keys.
+        # Real top-level keys are deliberately not added
+        # in this PR to keep the schema-validation step
+        # green; the v2 plan promotes them. The
+        # ``validate_env_names`` call raises
+        # ``ValueError`` on an invalid name; we re-raise
+        # as ``ConfigError`` so the roadmap loader fails
+        # with a clear, greppable error.
+        try:
+            _passthrough = validate_env_names(
+                item.get("x_validation_env_passthrough")
+                or defaults.get("x_validation_env_passthrough")
+                or (),
+                field=f"{task_id}.x_validation_env_passthrough",
+            )
+            _required = validate_env_names(
+                item.get("x_validation_required_env")
+                or defaults.get("x_validation_required_env")
+                or (),
+                field=f"{task_id}.x_validation_required_env",
+            )
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
         tasks.append(
             TaskConfig(
                 id=task_id,
@@ -329,10 +355,6 @@ def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
                     defaults.get("executor_options"),
                     item.get("executor_options"),
                 ),
-                # AO-AUDIT-003 (B5): require_executor_result is tri-state.
-                # None = use the kind-based default (implementation tasks
-                # are guarded by default, others are not). An explicit
-                # True/False from the roadmap/task config wins.
                 require_executor_result=_require_executor_result,
                 metadata={k: v for k, v in item.items() if k.startswith("x_")},
                 executor_profile=_as_optional_str(
@@ -343,6 +365,8 @@ def load_roadmap(path: str | Path, *, strict: bool = False) -> RoadmapConfig:
                     item.get("executor_reasoning_effort"),
                     field=f"{task_id}.executor_reasoning_effort",
                 ),
+                validation_env_passthrough=_passthrough,
+                validation_required_env=_required,
             )
         )
 

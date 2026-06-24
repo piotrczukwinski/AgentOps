@@ -187,6 +187,21 @@ class TaskConfig:
     # Mirrors the reviewer ``reasoning_effort`` field. ``None`` falls
     # through to the roadmap / defaults / profile registry.
     executor_reasoning_effort: str | None = None
+    # PR #66 (P3 hardening) -- validation env contract. The
+    # validation subprocess can see ONLY the names in
+    # ``validation_env_passthrough`` (plus the safe defaults
+    # from :mod:`agentops.runners.executor_env`). When the
+    # parent process is missing one of
+    # ``validation_required_env``, the orchestrator parks the
+    # task with
+    # ``failure_category=validation_missing_env`` BEFORE
+    # running validation. The two fields are independent:
+    # passthrough is "what is allowed", required is
+    # "what must be present". The values default to empty
+    # tuples for backward compatibility with roadmaps that do
+    # not declare any env contract.
+    validation_env_passthrough: tuple[str, ...] = ()
+    validation_required_env: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -430,6 +445,47 @@ MISDIRECTED_WRITE_BLOCKING_CATEGORIES = frozenset(
     }
 )
 
+# PR #66 (P3 hardening): multi-commit branch merge failure. The
+# orchestrator transitions the task to ``MERGE_FAILED`` with this
+# failure category when ``merge_integration`` cannot complete the
+# no-ff merge (e.g. real merge conflict between dependent commits
+# in the task branch and the integration base). The category is
+# distinct from the legacy ``integration_branch_protected`` /
+# ``reviewer_safe_to_merge_false`` reasons so the runbook can
+# grep for it.
+INTEGRATION_MERGE_FAILED = "integration_merge_failed"
+
+# PR #66: audit-trail tag for the cherry-pick -> no-ff upgrade.
+# When ``merge_policy.strategy == "cherry_pick"`` but the task
+# branch has multiple commits since the integration base,
+# ``merge_integration`` upgrades to a no-ff merge and surfaces
+# this string in the event payload / MERGED transition so the
+# operator can grep for "we lost the head-only path here".
+NO_FF_MERGE_MULTI_COMMIT = "no_ff_merge_multi_commit_branch"
+NO_FF_MERGE_COUNT_UNAVAILABLE = "no_ff_merge_count_unavailable"
+
+# PR #66 (P3 hardening): result-guard v2 categories. The
+# orchestrator transitions the task to ``AWAITING_HUMAN`` with
+# one of these strings when the v2 result guard sees a
+# missing or template marker in the executor output. The
+# strings are stable grep targets for the runbook; changing
+# them is a breaking change.
+MISSING_RESULT_NO_WORK = "missing_result_no_work"
+MISSING_RESULT_WITH_DIFF = "missing_result_with_diff"
+MISSING_RESULT_LATE_MARKER = "missing_result_late_marker"
+MISSING_RESULT_LOG_STILL_GROWING = "missing_result_log_still_growing"
+
+# PR #66 (P3 hardening): scope-creep detector category.
+# When the executor's combined log shows clear signs of
+# out-of-scope exploration (other workspaces, repeated tool
+# invocations on out-of-scope paths, etc.) the orchestrator
+# records this category and refuses to queue another
+# executor repair. The suggested action is Codex takeover
+# or operator decision. The string is a stable grep target
+# for the runbook.
+SCOPE_CREEP_SUSPECTED = "scope_creep_suspected"
+
+
 # Canonical v1 default for ``ReviewConfig.max_executor_review_repairs``.
 # Codex owns repair reasoning; MiniMax / opencode may do at most one
 # large mechanical repair per task. After the budget is exhausted the
@@ -454,6 +510,34 @@ class DiffSnapshot:
     patch: str
     base_ref: str
     head_ref: str
+    # PR #66 (P3 hardening) -- explicit working-tree / staged layers
+    # so the review packet can show them side-by-side with the
+    # committed diff. The review-packet bug that motivated the
+    # split: ``Codex takeover`` may apply the fix in the working
+    # tree without committing; a reviewer that only looked at the
+    # committed diff would have re-requested the same change.
+    # The cumulative ``patch`` field above is the legacy contract
+    # (committed + working-tree since ``base_sha``) and is
+    # preserved; the new fields make the split visible to tests,
+    # the review prompt, and the operator runbook.
+    working_tree_patch: str = ""
+    working_tree_name_status: str = ""
+    working_tree_stat: str = ""
+    staged_patch: str = ""
+    staged_name_status: str = ""
+    staged_stat: str = ""
+    # ``has_working_tree_changes`` is True when the working tree
+    # carries changes that are NOT in the committed diff against
+    # ``base_sha``. The review prompt uses it to add the
+    # mandatory "Review committed and working-tree changes
+    # together" message and to surface the working-tree section
+    # so a reviewer can never miss uncommitted fixes again.
+    has_working_tree_changes: bool = False
+    # ``has_staged_changes`` is True when the index (staging area)
+    # carries changes beyond what HEAD has committed. Tests and
+    # the review packet use it to decide whether the staged
+    # section is worth surfacing.
+    has_staged_changes: bool = False
 
 
 @dataclass(frozen=True)

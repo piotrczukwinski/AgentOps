@@ -31,6 +31,7 @@ from .git_ops import (
     collect_diff,
     commit,
     copy_allowed_files_back,
+    count_commits_since,
     create_gitless_mirror,
     create_worktree,
     default_workspaces_root,
@@ -54,6 +55,9 @@ from .models import (
     EXECUTOR_NO_OUTPUT_STARTUP,
     EXECUTOR_REPAIR_BUDGET_EXCEEDED,
     EXECUTOR_WORKTREE_LEAK,
+    INTEGRATION_MERGE_FAILED,
+    NO_FF_MERGE_COUNT_UNAVAILABLE,
+    NO_FF_MERGE_MULTI_COMMIT,
     OPERATOR_DECISION_REQUIRED,
     REVIEW_CHURN_LIMIT,
     SELF_FIX_BLOCK,
@@ -64,6 +68,7 @@ from .models import (
     RoadmapConfig,
     TaskConfig,
     TaskState,
+    ValidationResult,
 )
 from .policy import PolicyEngine
 from .prompting import PromptCompiler
@@ -89,6 +94,17 @@ from .self_fix import (
 from .state import StateStore, utc_now
 from .usage import extract_usage_marker, normalize_usage
 from .validation import ValidationEngine
+from .validation_baseline import (
+    VALIDATION_BASELINE_DIFFERENT,
+    VALIDATION_BASELINE_KNOWN_FAILURE,
+    ValidationSignature,
+    compare_signatures,
+)
+from .validation_env import (
+    VALIDATION_MISSING_ENV_CATEGORY,
+    build_validation_subprocess_env,
+    resolve_validation_env_contract,
+)
 from .worktree_guard import (
     GitSnapshot,
     WorktreeDisciplineContext,
@@ -1478,6 +1494,26 @@ class Orchestrator:
             changed_path = artifact_store.write_text(
                 attempt_dir, "changed_files.txt", "\n".join(diff.changed_files)
             )
+            # PR #66 (P3 hardening): write the working-tree and
+            # staged diffs as separate artifacts so the reviewer
+            # (and the operator) can see the full state, not just
+            # the committed diff. ``working_tree.diff.patch`` and
+            # ``staged.diff.patch`` are the canonical filenames
+            # the runbook / ``agentops timeline`` greps for.
+            working_tree_patch_path = None
+            if diff.working_tree_patch:
+                working_tree_patch_path = artifact_store.write_text(
+                    attempt_dir,
+                    "working_tree.diff.patch",
+                    diff.working_tree_patch,
+                )
+            staged_patch_path = None
+            if diff.staged_patch:
+                staged_patch_path = artifact_store.write_text(
+                    attempt_dir,
+                    "staged.diff.patch",
+                    diff.staged_patch,
+                )
             for kind, path in [
                 ("diff_patch", diff_patch_path),
                 ("diff_stat", diff_stat_path),
@@ -1485,6 +1521,24 @@ class Orchestrator:
             ]:
                 self.state.record_artifact(
                     roadmap.roadmap_id, task.id, attempt_id, kind, path, artifact_store.sha256(path)
+                )
+            if working_tree_patch_path is not None:
+                self.state.record_artifact(
+                    roadmap.roadmap_id,
+                    task.id,
+                    attempt_id,
+                    "working_tree_diff_patch",
+                    working_tree_patch_path,
+                    artifact_store.sha256(working_tree_patch_path),
+                )
+            if staged_patch_path is not None:
+                self.state.record_artifact(
+                    roadmap.roadmap_id,
+                    task.id,
+                    attempt_id,
+                    "staged_diff_patch",
+                    staged_patch_path,
+                    artifact_store.sha256(staged_patch_path),
                 )
 
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.POLICY_CHECKING)
@@ -1808,9 +1862,63 @@ class Orchestrator:
                     )
                     return
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.VALIDATING)
+            # PR #66 (P3 hardening): build the validation env
+            # contract from the task config + defaults. The
+            # contract is resolved once per attempt; the
+            # ``missing`` list is recorded on the task state
+            # and a non-empty list short-circuits to
+            # ``AWAITING_HUMAN`` with
+            # ``failure_category=validation_missing_env`` so
+            # the runbook can grep for it.
+            env_contract = resolve_validation_env_contract(
+                passthrough=task.validation_env_passthrough,
+                required=task.validation_required_env,
+            )
+            if not env_contract.is_satisfied:
+                # Park the task; do NOT queue executor repair
+                # for a missing env (the bug is configuration,
+                # not code). The metadata records the names
+                # only -- values are NEVER written.
+                self._record_roadmap_event(
+                    roadmap,
+                    "task.validation_missing_env",
+                    task.id,
+                    extra=env_contract.to_metadata(),
+                )
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.AWAITING_HUMAN,
+                    {
+                        "reason": VALIDATION_MISSING_ENV_CATEGORY,
+                        "failure_category": VALIDATION_MISSING_ENV_CATEGORY,
+                        "missing_env": list(env_contract.missing),
+                        "required_env": list(env_contract.required),
+                    },
+                )
+                return
+            validation_env = build_validation_subprocess_env(env_contract)
+            # PR #66 (P3 hardening): validation baseline. When
+            # the task opts in via ``x_validation_baseline=true``,
+            # capture the baseline signatures on a clean copy
+            # of the worktree BEFORE the executor attempt and
+            # compare them against the post-attempt signatures.
+            # A pre-existing failure (same fingerprint) does
+            # NOT queue executor repair; the task is parked
+            # with ``validation_baseline_known_failure`` unless
+            # ``x_allow_review_with_baseline_failure=true`` is
+            # set, in which case the review packet carries a
+            # baseline-failed warning and the task proceeds.
+            baseline_signatures = self._capture_validation_baseline(
+                task, target_worktree, attempt_dir, env=validation_env,
+            )
             validation = ValidationEngine(
-                timeout_seconds=min(task.timeout_seconds, 1800)
+                timeout_seconds=min(task.timeout_seconds, 1800),
+                env=validation_env,
             ).run_all(task.validations, target_worktree, attempt_dir)
+            self._compare_validation_baseline(
+                roadmap, task, attempt_id, validation, baseline_signatures,
+            )
             for command_result in validation.commands:
                 self.state.record_validation(
                     roadmap.roadmap_id,
@@ -2978,8 +3086,37 @@ class Orchestrator:
             return _fallback("self_fix_noop")
 
         # 4. Re-run the task validations on the patched worktree.
+        # PR #66 (P3 hardening): same env contract on the
+        # pre-merge validation as the main attempt; missing-env
+        # here also parks the task with
+        # ``validation_missing_env``.
+        env_contract = resolve_validation_env_contract(
+            passthrough=task.validation_env_passthrough,
+            required=task.validation_required_env,
+        )
+        if not env_contract.is_satisfied:
+            self._record_roadmap_event(
+                roadmap,
+                "task.validation_missing_env",
+                task.id,
+                extra=env_contract.to_metadata(),
+            )
+            self.state.transition_task(
+                roadmap.roadmap_id,
+                task.id,
+                TaskState.AWAITING_HUMAN,
+                {
+                    "reason": VALIDATION_MISSING_ENV_CATEGORY,
+                    "failure_category": VALIDATION_MISSING_ENV_CATEGORY,
+                    "missing_env": list(env_contract.missing),
+                    "required_env": list(env_contract.required),
+                },
+            )
+            return
+        validation_env = build_validation_subprocess_env(env_contract)
         validation = ValidationEngine(
-            timeout_seconds=min(task.timeout_seconds, 1800)
+            timeout_seconds=min(task.timeout_seconds, 1800),
+            env=validation_env,
         ).run_all(task.validations, target_worktree, attempt_dir)
         if not validation.ok:
             self.state.event(
@@ -3188,7 +3325,33 @@ class Orchestrator:
                     )
                     return True
 
+        # PR #66 (P3 hardening): choose the right strategy for the
+        # task branch. ``merge_integration`` already upgrades
+        # ``cherry_pick`` -> ``no_ff`` when the task branch has
+        # multiple commits since the integration base; we record
+        # the *effective* strategy on the transition so the
+        # audit trail shows the upgrade.
+        effective_strategy = merge_policy.strategy
         try:
+            # Compute the commit count up-front so the audit
+            # trail records the upgrade decision before the
+            # merge is attempted. The value is also re-computed
+            # inside ``merge_integration``; this duplicate is
+            # intentional -- the orchestrator needs the label
+            # even when the merge raises before returning the
+            # new SHA.
+            if merge_policy.strategy == "cherry_pick":
+                _base_for_count = rev_parse(roadmap.repo.path, integration_branch)
+                _tip_for_count = rev_parse(roadmap.repo.path, branch)
+                _count = count_commits_since(
+                    roadmap.repo.path,
+                    base_ref=_base_for_count,
+                    target_ref=_tip_for_count,
+                )
+                if _count > 1:
+                    effective_strategy = NO_FF_MERGE_MULTI_COMMIT
+                elif _count < 0:
+                    effective_strategy = NO_FF_MERGE_COUNT_UNAVAILABLE
             new_sha = merge_integration(
                 roadmap.repo.path,
                 integration_branch,
@@ -3205,10 +3368,55 @@ class Orchestrator:
                 roadmap.roadmap_id,
                 task.id,
                 TaskState.MERGE_FAILED,
-                {"reason": "merge_conflict", "error": str(exc)},
+                {
+                    "reason": "merge_conflict",
+                    "error": str(exc),
+                    "failure_category": INTEGRATION_MERGE_FAILED,
+                    "effective_strategy": effective_strategy,
+                },
             )
-            self._record_roadmap_event(roadmap, "task.merge_failed", task.id)
+            self._record_roadmap_event(
+                roadmap,
+                "task.merge_failed",
+                task.id,
+                extra={
+                    "failure_category": INTEGRATION_MERGE_FAILED,
+                    "effective_strategy": effective_strategy,
+                },
+            )
             return False
+        except RuntimeError as exc:
+            # PR #66: ``_run_integration_merge`` raises RuntimeError
+            # for real merge conflicts (cherry-pick --abort / merge
+            # --abort already done). Map it to the
+            # ``integration_merge_failed`` category so the runbook
+            # can grep for it. Other RuntimeError instances
+            # (a missing git binary, a bug in our own helper) are
+            # still re-raised to avoid silently swallowing them.
+            msg = str(exc)
+            if "no_ff" in msg or "merge" in msg.lower() or "cherry-pick" in msg:
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.MERGE_FAILED,
+                    {
+                        "reason": "merge_conflict",
+                        "error": msg,
+                        "failure_category": INTEGRATION_MERGE_FAILED,
+                        "effective_strategy": effective_strategy,
+                    },
+                )
+                self._record_roadmap_event(
+                    roadmap,
+                    "task.merge_failed",
+                    task.id,
+                    extra={
+                        "failure_category": INTEGRATION_MERGE_FAILED,
+                        "effective_strategy": effective_strategy,
+                    },
+                )
+                return False
+            raise
 
         self.state.transition_task(
             roadmap.roadmap_id,
@@ -3220,14 +3428,205 @@ class Orchestrator:
                 "integration_branch": integration_branch,
                 "integration_head_sha": new_sha,
                 "strategy": merge_policy.strategy,
+                "effective_strategy": effective_strategy,
             },
         )
-        self._record_roadmap_event(roadmap, "task.merged_to_integration", task.id, extra={"integration_head_sha": new_sha})
+        self._record_roadmap_event(
+            roadmap,
+            "task.merged_to_integration",
+            task.id,
+            extra={
+                "integration_head_sha": new_sha,
+                "effective_strategy": effective_strategy,
+            },
+        )
         return True
 
     # ------------------------------------------------------------------
     # Small helpers
     # ------------------------------------------------------------------
+    def _capture_validation_baseline(
+        self,
+        task: TaskConfig,
+        target_worktree: Path,
+        attempt_dir: Path,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> tuple[ValidationSignature, ...]:
+        """Run validations on a clean copy of the worktree.
+
+        Returns a tuple of :class:`ValidationSignature` (one per
+        validation command, in order). The helper only runs
+        when the task opts in via ``x_validation_baseline=true``;
+        the empty tuple is a no-op signal for
+        :meth:`_compare_validation_baseline`.
+
+        The baseline is run on the current worktree, which is
+        expected to be a fresh worktree with no executor
+        changes (the orchestrator calls this helper on the
+        *first* attempt of the task). On retry attempts the
+        worktree carries the previous attempt's edits; we
+        still run the baseline (the executor may have made
+        changes) and the comparison is expected to flag
+        "different" -- which is the right behaviour because
+        the retry is a different snapshot of reality.
+
+        Baseline artifacts are written under
+        ``attempt_dir/validation/baseline/`` so the operator
+        can diff baseline vs post.
+        """
+        if not bool(task.metadata.get("x_validation_baseline")):
+            return ()
+        if not task.validations:
+            return ()
+        baseline_dir = attempt_dir / "validation" / "baseline"
+        baseline_dir.mkdir(parents=True, exist_ok=True)
+        # Use a fresh ValidationEngine with the same env
+        # contract so the baseline sees the same parent env
+        # the executor will see.
+        engine = ValidationEngine(
+            timeout_seconds=min(task.timeout_seconds, 1800),
+            env=env,
+        )
+        baseline_results = engine.run_all(
+            task.validations, target_worktree, baseline_dir
+        )
+        signatures: list[ValidationSignature] = []
+        for cr in baseline_results.commands:
+            try:
+                stderr_text = cr.stderr_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stderr_text = ""
+            try:
+                stdout_text = cr.stdout_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stdout_text = ""
+            signatures.append(
+                ValidationSignature.from_result(
+                    cr.command,
+                    exit_code=cr.exit_code,
+                    stderr_text=stderr_text,
+                    stdout_text=stdout_text,
+                )
+            )
+        return tuple(signatures)
+
+    def _compare_validation_baseline(
+        self,
+        roadmap: RoadmapConfig,
+        task: TaskConfig,
+        attempt_id: int,
+        validation: ValidationResult,
+        baseline_signatures: tuple[ValidationSignature, ...],
+    ) -> None:
+        """Compare baseline vs post validation signatures and
+        record the result.
+
+        Behaviour:
+
+        * ``baseline_signatures`` empty -> the task did not
+          opt in; nothing to do.
+        * baseline all green -> nothing to do; the post
+          validation is the canonical result.
+        * baseline failed and post failed with same
+          fingerprint -> record
+          ``task.validation_baseline_known_failure``; the
+          task is parked with ``AWAITING_HUMAN`` and
+          ``failure_category=validation_baseline_known_failure``
+          unless ``x_allow_review_with_baseline_failure=true``
+          is set on the task.
+        * baseline failed and post failed with different
+          fingerprint -> record
+          ``task.validation_baseline_different_failure``;
+          the normal validation-failed path is left
+          unchanged so executor repair may still be queued.
+        """
+        if not baseline_signatures:
+            return
+        if not validation.commands:
+            return
+        # Zip the post-exit-codes back onto the baseline
+        # signatures. The order matches because both helpers
+        # iterate ``task.validations`` in order.
+        post_signatures: list[ValidationSignature] = []
+        for cr in validation.commands:
+            try:
+                stderr_text = cr.stderr_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stderr_text = ""
+            try:
+                stdout_text = cr.stdout_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stdout_text = ""
+            post_signatures.append(
+                ValidationSignature.from_result(
+                    cr.command,
+                    exit_code=cr.exit_code,
+                    stderr_text=stderr_text,
+                    stdout_text=stdout_text,
+                )
+            )
+        # For each command, decide the relationship.
+        allow_review_with_baseline = bool(
+            task.metadata.get("x_allow_review_with_baseline_failure")
+        )
+        any_baseline_known = False
+        any_baseline_different = False
+        per_command: list[dict[str, object]] = []
+        for baseline, post in zip(baseline_signatures, post_signatures, strict=False):
+            relationship = compare_signatures(baseline, post)
+            entry = {
+                "command": baseline.command,
+                "relationship": relationship,
+                "baseline": baseline.to_metadata(),
+                "post": post.to_metadata(),
+            }
+            per_command.append(entry)
+            if relationship == "same":
+                any_baseline_known = True
+            elif relationship == "different":
+                any_baseline_different = True
+        if not (any_baseline_known or any_baseline_different):
+            return
+        # Record the comparison event. The post validation
+        # path is left to its existing logic; we only
+        # influence the *repair* decision (whether to queue
+        # executor repair) below.
+        event_extra: dict[str, object] = {
+            "per_command": per_command,
+            "allow_review_with_baseline_failure": allow_review_with_baseline,
+        }
+        if any_baseline_known:
+            event_extra["failure_category"] = VALIDATION_BASELINE_KNOWN_FAILURE
+            self._record_roadmap_event(
+                roadmap,
+                "task.validation_baseline_known_failure",
+                task.id,
+                extra=event_extra,
+            )
+            if not allow_review_with_baseline:
+                # Park the task. Do NOT queue executor
+                # repair: the failure is not ours.
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.AWAITING_HUMAN,
+                    {
+                        "reason": VALIDATION_BASELINE_KNOWN_FAILURE,
+                        "failure_category": VALIDATION_BASELINE_KNOWN_FAILURE,
+                        "allow_review_with_baseline_failure": allow_review_with_baseline,
+                    },
+                )
+                return
+        if any_baseline_different:
+            event_extra["failure_category"] = VALIDATION_BASELINE_DIFFERENT
+            self._record_roadmap_event(
+                roadmap,
+                "task.validation_baseline_different_failure",
+                task.id,
+                extra=event_extra,
+            )
+
     def _policy_for(self, roadmap: RoadmapConfig) -> PolicyEngine:
         return PolicyEngine(roadmap)
 

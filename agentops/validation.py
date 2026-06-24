@@ -12,10 +12,22 @@ def utc_now() -> str:
 
 
 class ValidationEngine:
-    def __init__(self, timeout_seconds: int = 1800):
+    def __init__(self, timeout_seconds: int = 1800, env: dict[str, str] | None = None):
         self.timeout_seconds = timeout_seconds
+        # PR #66 (P3 hardening): the validation subprocess can
+        # optionally run with a narrowed env contract built by
+        # :mod:`agentops.validation_env`. When ``env`` is None
+        # the engine inherits :func:`subprocess.run`'s default
+        # (the parent process env) so existing call sites keep
+        # working unchanged.
+        self.env = env
 
-    def run_all(self, commands: tuple[str, ...], cwd: Path, artifact_dir: Path) -> ValidationResult:
+    def run_all(
+        self,
+        commands: tuple[str, ...],
+        cwd: Path,
+        artifact_dir: Path,
+    ) -> ValidationResult:
         results: list[CommandResult] = []
         validation_dir = artifact_dir / "validation"
         validation_dir.mkdir(parents=True, exist_ok=True)
@@ -32,6 +44,7 @@ class ValidationEngine:
                     capture_output=True,
                     timeout=self.timeout_seconds,
                     check=False,
+                    env=self.env,
                 )
                 exit_code = proc.returncode
                 stdout_path.write_text(proc.stdout, encoding="utf-8", errors="replace")
