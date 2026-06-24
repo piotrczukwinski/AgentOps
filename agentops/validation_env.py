@@ -147,12 +147,27 @@ class ValidationEnvContract:
     actually found in ``os.environ`` when the contract was
     built. The orchestrator uses it to record the metadata
     without ever recording the value.
+
+    ``declared`` is True when EITHER list is non-empty.
+    When False, the contract is a no-op and the orchestrator
+    MUST keep the legacy ``env=None`` / parent-inherit
+    behaviour for the validation subprocess.
+
+    ``effective_passthrough`` is the union of the
+    passthrough and required lists. The validation
+    subprocess env builder uses this so a name declared
+    as ``required`` is automatically available to the
+    subprocess even if the passthrough list was empty
+    or only listed other vars. This fixes the
+    "required-but-not-passthrough" loophole (Blocker F).
     """
 
     passthrough: tuple[str, ...]
     required: tuple[str, ...]
     present: tuple[str, ...]
     missing: tuple[str, ...]
+    declared: bool = False
+    effective_passthrough: tuple[str, ...] = ()
 
     @property
     def is_satisfied(self) -> bool:
@@ -166,14 +181,21 @@ class ValidationEnvContract:
         only; values are NEVER included. The shape is
         stable for the runbook to grep on:
 
+        * ``env_declared`` -- True when any env contract
+          was set (passthrough or required non-empty)
         * ``env_passthrough`` -- sorted list of names
         * ``env_required`` -- sorted list of names
+        * ``env_effective_passthrough`` -- sorted list of
+          names actually forwarded to the validation
+          subprocess (union of passthrough + required)
         * ``env_present`` -- sorted list of names found
         * ``env_missing`` -- sorted list of names NOT found
         """
         return {
+            "env_declared": self.declared,
             "env_passthrough": list(self.passthrough),
             "env_required": list(self.required),
+            "env_effective_passthrough": list(self.effective_passthrough),
             "env_present": list(self.present),
             "env_missing": list(self.missing),
         }
@@ -210,11 +232,20 @@ def resolve_validation_env_contract(
             present.append(name)
         else:
             missing.append(name)
+    declared = bool(passthrough_tuple or required_tuple)
+    # ``effective_passthrough`` is the union of passthrough
+    # and required. Names declared as ``required`` MUST be
+    # forwarded to the subprocess so a task cannot pass
+    # the preflight only to fail validation because the
+    # required env was not passed (Blocker F).
+    effective = tuple(sorted(set(passthrough_tuple) | set(required_tuple)))
     return ValidationEnvContract(
         passthrough=passthrough_tuple,
         required=required_tuple,
         present=tuple(sorted(present)),
         missing=tuple(sorted(missing)),
+        declared=declared,
+        effective_passthrough=effective,
     )
 
 
@@ -222,55 +253,45 @@ def build_validation_subprocess_env(
     contract: ValidationEnvContract,
     *,
     base_env: dict[str, str] | None = None,
-) -> dict[str, str]:
+) -> dict[str, str] | None:
     """Build the env dict the validation subprocess will see.
 
-    ``base_env`` is the starting point (typically the
-    caller's own ``os.environ`` or a sanitised
-    :func:`agentops.runners.executor_env`). The function:
+    Returns ``None`` when the contract is *not declared*
+    (``declared=False``). ``None`` is the signal to the
+    caller that the legacy parent-inherit behaviour
+    applies (i.e. ``subprocess.run(..., env=None)``).
 
-    1. copies ``base_env`` (or ``os.environ`` when not
-       provided) into a fresh dict;
-    2. for each name in ``contract.passthrough``, copies
-       the value from ``os.environ`` so the list is a
-       positive allow-list on top of whatever ``base_env``
-       already contained;
-    3. never copies a name that is not in the allow-list;
-    4. never records a value into the returned dict
-       metadata; the metadata stays in the contract.
+    When the contract IS declared, the function builds a
+    narrowed env that contains:
 
-    The returned dict is safe to pass to
-    :class:`subprocess.Popen` / :func:`subprocess.run`.
+    1. the safe base env (``PATH``, ``HOME``, ``LANG``,
+       ``LC_ALL``, ``TMPDIR``) so the subprocess can
+       actually run;
+    2. every name in ``effective_passthrough`` (the
+       union of passthrough and required) copied from
+       ``os.environ``;
+    3. NOTHING from the parent env that is not in the
+       allow-list.
+
+    The ``required`` set is automatically included in
+    ``effective_passthrough`` so a task that declares
+    ``x_validation_required_env=["DATABASE_URL"]``
+    without a separate passthrough still has
+    ``DATABASE_URL`` visible to the validation
+    subprocess. This closes the "required-but-not-
+    passthrough" loophole (Blocker F).
     """
+    if not contract.declared:
+        return None
     source = base_env if base_env is not None else dict(os.environ)
-    out: dict[str, str] = dict(source)
-    allow = set(contract.passthrough)
-    # Strip names that are not in the allow-list (the allow-list
-    # is a positive filter on top of the caller's base env).
-    # The safe defaults in :mod:`agentops.runners.executor_env`
-    # already strip the most common provider tokens; this is a
-    # belt-and-braces narrowing so a roadmap that omits the
-    # allow-list still does not leak the parent env to the
-    # validation subprocess.
-    if allow:
-        # When the allow-list is non-empty we keep ONLY the
-        # allow-listed names from the parent env (the base_env
-        # entries that are not in the allow-list are stripped).
-        # This is the safe default for roadmaps that explicitly
-        # opt in to env passthrough.
-        env_section: dict[str, str] = {}
-        for name in allow:
-            value = os.environ.get(name)
-            if value is not None:
-                env_section[name] = value
-        # Re-apply the safe defaults that the caller's base_env
-        # may already have set (PATH, HOME, LANG, GIT_*, etc.).
-        for key, value in source.items():
-            if key in env_section:
-                continue
-            if key in {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}:
-                env_section[key] = value
-        return env_section
+    out: dict[str, str] = {}
+    for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"):
+        if key in source:
+            out[key] = source[key]
+    for name in contract.effective_passthrough:
+        value = os.environ.get(name)
+        if value is not None:
+            out[name] = value
     return out
 
 

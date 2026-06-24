@@ -132,11 +132,49 @@ class BuildValidationSubprocessEnvTests(unittest.TestCase):
         self.assertNotIn("AGENTOPS_TEST_OTHER", out)
 
     def test_empty_passthrough_keeps_base_env(self):
+        # Empty contract: declared=False, so the helper
+        # returns None to signal the legacy parent-inherit
+        # behaviour to the orchestrator.
         contract = resolve_validation_env_contract(passthrough=[])
+        self.assertFalse(contract.declared)
         out = build_validation_subprocess_env(
             contract, base_env={"FOO": "bar"}
         )
-        self.assertEqual(out.get("FOO"), "bar")
+        self.assertIsNone(out)
+
+    def test_required_without_passthrough_passes_required_to_subprocess(self):
+        # Blocker F: ``required`` names are automatically
+        # included in the subprocess env even when the
+        # passthrough list is empty.
+        sentinel = "AGENTOPS_TEST_REQUIRED_ONLY"
+        os.environ[sentinel] = "sentinel_value"
+        try:
+            contract = resolve_validation_env_contract(
+                required=[sentinel],
+            )
+            self.assertTrue(contract.declared)
+            self.assertIn(sentinel, contract.effective_passthrough)
+            out = build_validation_subprocess_env(contract)
+            self.assertIsNotNone(out)
+            self.assertEqual(out.get(sentinel), "sentinel_value")
+        finally:
+            os.environ.pop(sentinel, None)
+
+    def test_required_plus_passthrough_union_in_effective(self):
+        # ``effective_passthrough`` is the union of both
+        # lists; ``declared`` is True when either is set.
+        contract = resolve_validation_env_contract(
+            passthrough=["AGENTOPS_TEST_E1"],
+            required=["AGENTOPS_TEST_E2"],
+        )
+        self.assertTrue(contract.declared)
+        self.assertIn("AGENTOPS_TEST_E1", contract.effective_passthrough)
+        self.assertIn("AGENTOPS_TEST_E2", contract.effective_passthrough)
+
+    def test_declared_false_when_both_empty(self):
+        contract = resolve_validation_env_contract()
+        self.assertFalse(contract.declared)
+        self.assertEqual(contract.effective_passthrough, ())
 
     def test_safe_defaults_kept_when_allow_list_set(self):
         contract = resolve_validation_env_contract(

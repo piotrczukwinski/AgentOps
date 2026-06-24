@@ -117,6 +117,39 @@ class ResultGuardDecision:
     log_size: int
     notes: tuple[str, ...] = ()
 
+    @property
+    def should_accept(self) -> bool:
+        """True only when the marker is a parsed, non-template
+        JSON object. CRITICAL: the orchestrator MUST check
+        this flag before allowing the result to
+        short-circuit validation / review. An unparseable
+        marker that produces ``None`` is NEVER an accept.
+        """
+        return (
+            self.category == "real"
+            and isinstance(self.marker_payload, dict)
+        )
+
+    @property
+    def should_wait(self) -> bool:
+        """True when the orchestrator should grant the
+        bounded grace window (log still growing or
+        late-marker pre-parse grace).
+        """
+        return self.category in (
+            MISSING_RESULT_LOG_STILL_GROWING,
+            MISSING_RESULT_LATE_MARKER,
+        )
+
+    @property
+    def should_park(self) -> bool:
+        """True when the task should be parked instead of
+        retried. Used for ``missing_result_with_diff``
+        and the "late marker but log is no longer
+        growing" case.
+        """
+        return self.category == MISSING_RESULT_WITH_DIFF
+
 
 def _safe_log_size(path: Path) -> int:
     """Return the on-disk size of ``path`` or 0 when missing.

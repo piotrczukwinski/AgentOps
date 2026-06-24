@@ -126,6 +126,7 @@ class PromptCompiler:
         attempt: int | None = None,
         scope_deviation: dict[str, Any] | None = None,
         policy_advisory: tuple[dict[str, Any], ...] | None = None,
+        validation_baseline_warning: dict[str, Any] | None = None,
     ) -> str:
         validation_summary = [
             {
@@ -221,6 +222,9 @@ class PromptCompiler:
                 json.dumps(self.policy_engine.as_jsonable(policy), ensure_ascii=False, indent=2),
                 "# Validation result",
                 json.dumps({"ok": validation.ok, "commands": validation_summary}, ensure_ascii=False, indent=2),
+            ]
+            + _format_validation_baseline_warning(validation_baseline_warning)
+            + [
                 "# Diff name_status (matches the changed files list above)",
                 diff.name_status or "(none)",
                 "# Diff stat (matches the changed files list above)",
@@ -631,6 +635,42 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n\n[TRUNCATED by AgentOps at {limit} characters]"
+
+
+def _format_validation_baseline_warning(warning: dict[str, Any] | None) -> list[str]:
+    """Format the validation baseline warning for the review prompt.
+
+    Returns the list of prompt lines; callers join them
+    into the final prompt. When ``warning`` is ``None``
+    (no baseline opt-in, or the baseline was green) the
+    function returns an empty list so the review packet
+    stays compact.
+
+    The warning payload is built by
+    :func:`agentops.orchestrator.Orchestrator._compare_validation_baseline`
+    and contains the per-command fingerprint comparison.
+    """
+    if not warning:
+        return []
+    per_command = warning.get("per_command", [])
+    out: list[str] = []
+    out.append("")
+    out.append("## Validation baseline summary (PR #66)")
+    out.append(
+        "The task opted in to ``x_validation_baseline=true`` and the "
+        "baseline signature matched the post-executor signature. The "
+        "pre-existing failure is NOT the task's responsibility; the "
+        "operator set ``x_allow_review_with_baseline_failure=true`` "
+        "to let the review proceed with this warning. Do NOT block the "
+        "review solely on the baseline failure."
+    )
+    for entry in per_command:
+        cmd = entry.get("command", "?")
+        relationship = entry.get("relationship", "?")
+        out.append(
+            f"- command={cmd!r} relationship={relationship!r}"
+        )
+    return out
 
 
 def _working_tree_diff_sections(diff: DiffSnapshot) -> list[str]:
