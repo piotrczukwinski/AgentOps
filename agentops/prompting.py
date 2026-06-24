@@ -225,9 +225,16 @@ class PromptCompiler:
                 diff.name_status or "(none)",
                 "# Diff stat (matches the changed files list above)",
                 diff.stat or "(none)",
-                "# Patch",
+                "# Patch (cumulative diff since the task base -- includes committed + working tree)",
                 _truncate(diff.patch, 60000),
+                "# Working-tree changes (PR #66 P3 hardening)",
+                "The diff above is the cumulative diff since the task base.",
+                "The sections below split the cumulative view into committed,"
+                " staged (index), and working-tree (filesystem) layers so the"
+                " reviewer can see whether the executor / a Codex takeover"
+                " left uncommitted fixes in the worktree.",
             ]
+            + _working_tree_diff_sections(diff)
         )
 
     def self_fix_prompt(
@@ -624,6 +631,74 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n\n[TRUNCATED by AgentOps at {limit} characters]"
+
+
+def _working_tree_diff_sections(diff: DiffSnapshot) -> list[str]:
+    """Build the working-tree / staged sections of the review packet.
+
+    PR #66 (P3 hardening): the original P3 bug was a reviewer that
+    only saw the committed diff and re-requested fixes the executor
+    had already applied in the working tree. The fix is to split
+    the cumulative diff into three layers (committed / staged /
+    working tree) and tell the reviewer to consider all three
+    together.
+
+    The helper returns the list of prompt lines; callers join them
+    into the final prompt. The mandatory safety message is
+    included whenever ``has_working_tree_changes`` is True so the
+    reviewer can never miss uncommitted fixes.
+    """
+    sections: list[str] = []
+    has_working_tree = bool(getattr(diff, "has_working_tree_changes", False))
+    has_staged = bool(getattr(diff, "has_staged_changes", False))
+    working_tree_patch = str(getattr(diff, "working_tree_patch", "") or "")
+    working_tree_ns = str(getattr(diff, "working_tree_name_status", "") or "")
+    working_tree_stat = str(getattr(diff, "working_tree_stat", "") or "")
+    staged_patch = str(getattr(diff, "staged_patch", "") or "")
+    staged_ns = str(getattr(diff, "staged_name_status", "") or "")
+    staged_stat = str(getattr(diff, "staged_stat", "") or "")
+
+    if has_working_tree or has_staged:
+        sections.append("")
+        sections.append(
+            "## Reviewer safety note (mandatory)"
+        )
+        sections.append(
+            "Review committed and working-tree changes together. Do NOT"
+            " request changes for issues already fixed in the working-tree"
+            " diff below. The executor (or a Codex takeover) may have"
+            " applied the fix after the last commit; the committed diff"
+            " alone is not a complete picture."
+        )
+
+    if has_working_tree:
+        sections.append("")
+        sections.append("# Working-tree name_status (files modified but NOT yet committed)")
+        sections.append(working_tree_ns or "(none)")
+        sections.append("# Working-tree stat (matches the working-tree name_status above)")
+        sections.append(working_tree_stat or "(none)")
+        sections.append("# Working-tree patch (unstaged + untracked, since the task base)")
+        sections.append(_truncate(working_tree_patch, 30000))
+
+    if has_staged:
+        sections.append("")
+        sections.append("# Staged (index) name_status (git add -- files staged but NOT yet committed)")
+        sections.append(staged_ns or "(none)")
+        sections.append("# Staged (index) stat")
+        sections.append(staged_stat or "(none)")
+        sections.append("# Staged (index) patch")
+        sections.append(_truncate(staged_patch, 30000))
+
+    if not has_working_tree and not has_staged:
+        sections.append("")
+        sections.append(
+            "# Working-tree changes (PR #66)"
+        )
+        sections.append(
+            "(no working-tree or staged changes since the task base;"
+            " the cumulative diff above is the only diff to review)"
+        )
+    return sections
 
 
 def _format_policy_advisory(

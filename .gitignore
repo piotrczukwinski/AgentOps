@@ -30,3 +30,6 @@ dist/
 
 # Operator Run Harness durable run directories
 /.operator-runs/
+
+# Local request bundles (operator-only, not for commit)
+bundles/

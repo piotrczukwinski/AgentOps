@@ -78,6 +78,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .path_safety import (
+    safe_is_regular_file,
+)
+
 # ---------------------------------------------------------------------------
 # Canonical failure categories. Re-exported in agentops.models for tests
 # and reliability dashboards; the values here are the source of truth.
@@ -471,6 +475,12 @@ def _classify_sensitive(
 
 
 def _file_sha256(path: Path) -> str | None:
+    # PR #66 (P3 hardening): refuse to hash anything that is not a
+    # regular file. The misdirected-writes detector only runs against
+    # explicit file paths, but a future caller that walks a change
+    # list could hand us a directory and crash on ``open("rb")``.
+    if not safe_is_regular_file(path):
+        return None
     try:
         h = hashlib.sha256()
         with path.open("rb") as handle:
@@ -482,6 +492,12 @@ def _file_sha256(path: Path) -> str | None:
 
 
 def _file_size(path: Path) -> int | None:
+    # PR #66 (P3 hardening): a directory has ``st_size`` that does
+    # not reflect a real file. Reject non-files so the change list
+    # does not record a fake byte count for an entry that is not
+    # actually a regular file.
+    if not safe_is_regular_file(path):
+        return None
     try:
         return path.stat().st_size
     except OSError:
@@ -489,6 +505,14 @@ def _file_size(path: Path) -> int | None:
 
 
 def _is_probably_binary(path: Path, sniff_bytes: int = 8192) -> bool | None:
+    # PR #66 (P3 hardening): refuse to sniff a directory or a
+    # non-file. ``path.open("rb")`` on a directory raises
+    # ``IsADirectoryError`` on POSIX. ``safe_is_regular_file``
+    # closes that hole and returns ``None`` (unknown) so the
+    # caller can record the entry as ``kind="directory"`` without
+    # trying to binary-sniff it.
+    if not safe_is_regular_file(path):
+        return None
     try:
         with path.open("rb") as handle:
             sample = handle.read(sniff_bytes)
@@ -1118,7 +1142,13 @@ def quarantine_source_mutations(
                     if change.status in ("deleted",):
                         continue
                     abs_path = after.root / change.relpath
-                    if not abs_path.is_file():
+                    if not safe_is_regular_file(abs_path):
+                        # PR #66 (P3 hardening): directory or
+                        # non-file entry in the source change list
+                        # never reaches the zip writer. The
+                        # presence of the directory is still
+                        # recorded in ``misdirected-write/...`` via
+                        # the metadata block above.
                         continue
                     size = change.after_size
                     if size is not None and size > _FILE_BYTES_CAP:
@@ -1172,7 +1202,10 @@ def _worktree_file_differs(
     """
     worktree_path = worktree_root / relpath
     source_path = source_root / relpath
-    if not (worktree_path.is_file() and source_path.is_file()):
+    # PR #66 (P3 hardening): use safe_is_regular_file so a
+    # symlink-to-directory or a deleted file never reaches
+    # ``read_bytes()`` and raises ``IsADirectoryError``.
+    if not (safe_is_regular_file(worktree_path) and safe_is_regular_file(source_path)):
         return False
     try:
         wt_bytes = worktree_path.read_bytes()

@@ -382,3 +382,62 @@ working unchanged. See
 [`docs/model-profile-registry.md`](model-profile-registry.md) for
 the full precedence, the validation rules, and the migration
 guide.
+
+## P3 runtime hardening extension keys (PR #66)
+
+The following `x_*` extension keys are recognised by the
+config loader as of PR #66. They are kept under the
+`x_` prefix to keep the strict schema-validation step
+green; a future PR promotes them to real top-level
+keys.
+
+### Validation env contract
+
+* `x_validation_env_passthrough` — list of env var
+  names the validation subprocess is allowed to
+  inherit from the parent process. Names not in the
+  list are NOT passed.
+* `x_validation_required_env` — list of env var
+  names the parent process MUST have set or the
+  task is parked with
+  `failure_category=validation_missing_env`.
+
+Both keys are validated against
+`^[A-Z_][A-Z0-9_]{0,127}$`. An invalid name (e.g.
+`FOO; rm -rf /`) causes the loader to fail with a
+`ConfigError`. Values are NEVER written to events
+/ artifacts; only names.
+
+### Validation baseline (scope-aware failure)
+
+* `x_validation_baseline` — boolean (default
+  `false`). When `true`, the orchestrator captures a
+  pre-executor validation baseline and compares
+  post-executor signatures against it. Pre-existing
+  failures no longer queue executor repair.
+* `x_allow_review_with_baseline_failure` — boolean
+  (default `false`). When `true`, the review
+  proceeds even when the baseline signature
+  matches the post signature. Conservative default
+  is the safe one.
+
+### Result guard v2
+
+* `x_result_guard_grace_seconds` — integer
+  (default 120, cap 600). Bounded grace window
+  the orchestrator grants when the combined log
+  is still growing and the marker is not yet
+  present.
+* `x_allow_missing_result_with_diff` — boolean
+  (default `false`). When `true`, the task is
+  allowed to proceed when the executor did real
+  work but did not emit a marker.
+
+### Scope-creep detector
+
+* `x_disable_scope_creep_detector` — boolean
+  (default `false`). Opt out of the scope-creep
+  detector. Rare; default is on.
+
+The full policy and the operator playbook for each
+key is documented in `docs/p3-runtime-hardening.md`.
