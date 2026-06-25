@@ -24,9 +24,21 @@ new categories and a bounded grace window:
 * ``missing_result_late_marker`` -- the marker line is
   present in the combined log but the previous classifier
   could not extract a parseable JSON body (e.g. it was
-  emitted just after the result-guard timeout). The
-  helper extracts the marker, accepts the result, and
-  the orchestrator continues to diff/validation.
+  emitted just after the result-guard timeout). This is
+  NEVER a real result; an unparseable marker means the
+  body is broken. The orchestrator SHOULD grant a
+  bounded grace window via
+  ``wait_for_log_growth_or_marker`` and reclassify;
+  if the marker is still unparseable past the grace
+  window, the task is parked at ``AWAITING_HUMAN``
+  with ``failure_category=missing_result_late_marker``.
+  No executor retry and no Codex takeover are
+  scheduled; the work is parked so the operator can
+  recover the marker manually. The v2 decision exposes
+  ``should_wait=True`` so the orchestrator knows to
+  grant the grace window, and
+  ``ResultGuardDecision.should_accept`` is always
+  False for this category.
 * ``missing_result_log_still_growing`` -- the combined log
   is still being written (size > last seen size) and the
   marker is not yet present. The orchestrator grants a
@@ -116,6 +128,39 @@ class ResultGuardDecision:
     allow_retry: bool
     log_size: int
     notes: tuple[str, ...] = ()
+
+    @property
+    def should_accept(self) -> bool:
+        """True only when the marker is a parsed, non-template
+        JSON object. CRITICAL: the orchestrator MUST check
+        this flag before allowing the result to
+        short-circuit validation / review. An unparseable
+        marker that produces ``None`` is NEVER an accept.
+        """
+        return (
+            self.category == "real"
+            and isinstance(self.marker_payload, dict)
+        )
+
+    @property
+    def should_wait(self) -> bool:
+        """True when the orchestrator should grant the
+        bounded grace window (log still growing or
+        late-marker pre-parse grace).
+        """
+        return self.category in (
+            MISSING_RESULT_LOG_STILL_GROWING,
+            MISSING_RESULT_LATE_MARKER,
+        )
+
+    @property
+    def should_park(self) -> bool:
+        """True when the task should be parked instead of
+        retried. Used for ``missing_result_with_diff``
+        and the "late marker but log is no longer
+        growing" case.
+        """
+        return self.category == MISSING_RESULT_WITH_DIFF
 
 
 def _safe_log_size(path: Path) -> int:

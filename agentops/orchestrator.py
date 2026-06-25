@@ -40,6 +40,7 @@ from .git_ops import (
     merge_integration,
     push,
     rev_parse,
+    run_git,
     worktree_is_clean,
 )
 from .misdirected_writes import (
@@ -66,9 +67,14 @@ from .models import (
     DiffSnapshot,
     ReviewVerdict,
     RoadmapConfig,
+    RunnerResult,
     TaskConfig,
     TaskState,
     ValidationResult,
+)
+from .operator_run import (
+    MISSING_RESULT_CATEGORY,
+    TEMPLATE_RESULT_CATEGORY,
 )
 from .policy import PolicyEngine
 from .prompting import PromptCompiler
@@ -77,6 +83,17 @@ from .provider_failures import (
     is_non_retryable_provider,
 )
 from .repo_lock import acquire_run_lock
+from .result_guard_v2 import (
+    DEFAULT_GRACE_SECONDS,
+    MAX_GRACE_SECONDS,
+    MISSING_RESULT_LATE_MARKER,
+    MISSING_RESULT_LOG_STILL_GROWING,
+    MISSING_RESULT_NO_WORK,
+    MISSING_RESULT_WITH_DIFF,
+    classify_executor_result_v2,
+    resolve_grace_seconds,
+    wait_for_log_growth_or_marker,
+)
 from .review import (
     CodexReviewService,
     HeuristicReviewer,
@@ -84,6 +101,10 @@ from .review import (
     ReviewRouter,
 )
 from .runners import BaseRunner, CodexCliProfileRunner, runner_for
+from .scope_creep import (
+    SCOPE_CREEP_SUSPECTED,
+    detect_scope_creep,
+)
 from .self_fix import (
     SelfFixOutcome,
     changed_line_count,
@@ -95,7 +116,6 @@ from .state import StateStore, utc_now
 from .usage import extract_usage_marker, normalize_usage
 from .validation import ValidationEngine
 from .validation_baseline import (
-    VALIDATION_BASELINE_DIFFERENT,
     VALIDATION_BASELINE_KNOWN_FAILURE,
     ValidationSignature,
     compare_signatures,
@@ -482,6 +502,54 @@ class _TaskRuntime:
     request_changes_cycles: int = 0
     self_fix_size_exceeded_count: int = 0
     self_fix_hard_budget_exceeded_count: int = 0
+    # PR #66 (P3 hardening): validation baseline state.
+    # ``validation_baseline_signatures`` is captured once
+    # per task (attempt 1, before the executor runs) and
+    # reused on repair attempts. ``validation_baseline_captured``
+    # is True when the capture has happened. The orchestrator
+    # never recaptures on attempt 2+; the worktree already
+    # carries the previous attempt's changes and the baseline
+    # must reflect the pre-task state.
+    from .validation_baseline import ValidationSignature
+    validation_baseline_signatures: tuple[ValidationSignature, ...] = ()
+    validation_baseline_captured: bool = False
+    validation_baseline_artifacts_dir: Path | None = None
+    # ``validation_baseline_warning`` is the structured
+    # warning (per-command fingerprint metadata) the
+    # review packet carries when the task opts in via
+    # ``x_allow_review_with_baseline_failure=true`` and
+    # the baseline signature matches the post signature.
+    validation_baseline_warning: dict[str, Any] | None = None
+    # missing_result_with_diff_warning is the
+    # structured warning the review packet carries when
+    # the task opts in via
+    # x_allow_missing_result_with_diff=true and the
+    # executor did real work but emitted no marker. The
+    # warning is recorded on the runtime so the review
+    # prompt can surface it.
+    missing_result_with_diff_warning: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _ValidationBaselineAction:
+    """Blocker B: explicit baseline decision the orchestrator respects.
+
+    The action string is the only signal the caller uses;
+    the orchestrator MUST branch on ``action`` and never
+    fall through to a normal repair prompt when the
+    action is ``"AWAITING_HUMAN"`` (the caller transitions
+    state and returns).
+
+    The legacy ``_compare_validation_baseline -> None``
+    helper returned ``None`` and let the caller continue
+    into the normal ``if not validation.ok`` branch,
+    which could create ``repair.prompt.md`` and queue
+    another executor attempt. This dataclass fixes the
+    silent-fallthrough bug.
+    """
+
+    action: str
+    warning: dict[str, Any] | None = None
 
 
 class Orchestrator:
@@ -1012,6 +1080,95 @@ class Orchestrator:
                     )
                     return
 
+            # PR #66 (P3 hardening, Blocker A): capture the
+            # validation baseline BEFORE the executor runs.
+            # The helper stores the signatures on
+            # ``runtime`` so attempt 2+ reuses the same
+            # baseline; the worktree already carries the
+            # previous attempt's edits and the baseline
+            # must reflect the pre-task state. The env
+            # contract is resolved from the task config so
+            # the baseline sees the same env the executor
+            # will see.
+            try:
+                _pre_env_contract = resolve_validation_env_contract(
+                    passthrough=task.validation_env_passthrough,
+                    required=task.validation_required_env,
+                )
+                if not _pre_env_contract.is_satisfied:
+                    # Required env missing: park the task
+                    # BEFORE the executor runs (the
+                    # baseline would fail too, but the
+                    # failure category is the canonical
+                    # missing-env one).
+                    self._record_roadmap_event(
+                        roadmap,
+                        "task.validation_missing_env",
+                        task.id,
+                        extra=_pre_env_contract.to_metadata(),
+                    )
+                    self.state.transition_task(
+                        roadmap.roadmap_id,
+                        task.id,
+                        TaskState.AWAITING_HUMAN,
+                        {
+                            "reason": VALIDATION_MISSING_ENV_CATEGORY,
+                            "failure_category": VALIDATION_MISSING_ENV_CATEGORY,
+                            "missing_env": list(_pre_env_contract.missing),
+                            "required_env": list(_pre_env_contract.required),
+                        },
+                    )
+                    return
+                _pre_validation_env = build_validation_subprocess_env(_pre_env_contract)
+                self._maybe_capture_validation_baseline(
+                    task=task,
+                    target_worktree=target_worktree,
+                    attempt_dir=attempt_dir,
+                    runtime=runtime,
+                    env=_pre_validation_env,
+                )
+            except Exception as _exc:  # noqa: BLE001 - PR #67 fail-closed
+                # PR #67 (P3 hardening, Blocker 7): when
+                # the operator opted in to a baseline but
+                # baseline capture raised, the orchestrator
+                # MUST fail closed: park with
+                # ``validation_baseline_capture_failed`` and
+                # ``AWAITING_HUMAN`` and DO NOT run the
+                # executor as if baseline had been
+                # captured. Silently continuing would let
+                # the post-executor comparison run with no
+                # stored baseline signature, defeating the
+                # purpose of the opt-in.
+                self.state.event(
+                    roadmap.roadmap_id,
+                    task.id,
+                    attempt_id,
+                    "task.validation_baseline_capture_failed",
+                    {
+                        "attempt": attempt_no,
+                        "failure_category": "validation_baseline_capture_failed",
+                        "error_type": type(_exc).__name__,
+                    },
+                )
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.AWAITING_HUMAN,
+                    {
+                        "reason": "validation_baseline_capture_failed",
+                        "failure_category": "validation_baseline_capture_failed",
+                        "hint": (
+                            "Baseline capture raised before the executor "
+                            "could run. The task opted in to "
+                            "``x_validation_baseline``; AgentOps does "
+                            "NOT silently continue. Inspect the capture "
+                            "failure and re-run after fixing the "
+                            "underlying issue."
+                        ),
+                    },
+                )
+                return
+
             self.state.transition_task(
                 roadmap.roadmap_id, task.id, TaskState.EXECUTOR_RUNNING, {"attempt": attempt_no}
             )
@@ -1489,6 +1646,22 @@ class Orchestrator:
                 roadmap.repo.base_branch,
                 base_sha=runtime.base_sha,
             )
+            # PR #66 (P3 hardening, Blocker E): scope-creep
+            # detection runs AFTER the diff is collected so
+            # the detector sees the real worktree state,
+            # and BEFORE the validation step. The detector
+            # refuses to queue another executor repair
+            # when the executor wandered out of scope.
+            if self._detect_scope_creep_repair(
+                roadmap=roadmap,
+                task=task,
+                runtime=runtime,
+                result=result,
+                diff=diff,
+            ):
+                # Scope creep suspected; the helper
+                # transitioned the task to AWAITING_HUMAN.
+                return
             diff_patch_path = artifact_store.write_text(attempt_dir, "diff.patch", diff.patch)
             diff_stat_path = artifact_store.write_text(attempt_dir, "diff.stat", diff.stat)
             changed_path = artifact_store.write_text(
@@ -1679,25 +1852,256 @@ class Orchestrator:
                 and task.executor in {"opencode", "minimax", "minimax-m3", "claude", "claude-minimax"}
             ):
                 _result_guard_enabled = True
-            if _result_guard_enabled and result.ok and result.stdout_path is not None:
+            if _result_guard_enabled and result.ok:
+                # PR #66 (P3 hardening, Blocker C + D): the
+                # real result guard uses
+                # :func:`classify_executor_result_v2`. The
+                # legacy ``classify_result_marker`` is kept
+                # for the *retries* (so existing tests that
+                # assert retry-on-missing-marker keep
+                # working) but the initial classification is
+                # always v2.
+                _combined_log = getattr(result, "combined_log_path", None)
+                _stdout_log = getattr(result, "stdout_path", None)
+                _worktree_diff = diff.patch
+                # PR #67 (P3 hardening, Blocker C): compute
+                # log_still_growing from the runner's
+                # actual process state, not a hardcoded
+                # False. The v2 classifier returns
+                # MISSING_RESULT_LOG_STILL_GROWING only
+                # when the log is genuinely still being
+                # written; otherwise it returns one of the
+                # other missing categories. The runner
+                # exposes is_alive() when the process
+                # is still running; we also peek at the
+                # file mtime as a secondary signal so a
+                # process that just exited but whose log
+                # was touched within the grace window is
+                # still classified as growing.
+                _log_still_growing = self._compute_log_still_growing(
+                    result=result,
+                    combined_log_path=_combined_log,
+                )
                 try:
-                    _stdout_text = result.stdout_path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    _stdout_text = ""
-                _category = None
-                try:
-                    from .operator_run import (
-                        MISSING_RESULT_CATEGORY,
-                        TEMPLATE_RESULT_CATEGORY,
-                        classify_result_marker,
+                    _v2 = classify_executor_result_v2(
+                        combined_log=_combined_log
+                        if _combined_log is not None
+                        else Path("/nonexistent"),
+                        stdout_log=_stdout_log,
+                        worktree_diff=_worktree_diff,
+                        log_still_growing=_log_still_growing,
                     )
-                    _cls = classify_result_marker(_stdout_text)
                 except Exception:  # noqa: BLE001 - never let the guard crash the run
-                    _cls = "absent"
-                if _cls in {"absent", "missing"}:
-                    _category = MISSING_RESULT_CATEGORY
-                elif _cls == "template":
-                    _category = TEMPLATE_RESULT_CATEGORY
+                    _v2 = None
+                # Fall back to the legacy classifier when v2
+                # is unavailable; the legacy classification
+                # is still wired into the retry / takeover
+                # / block branches below. The v1
+                # classification string (``absent`` /
+                # ``missing`` / ``template``) is the
+                # contract the event payload expects; the
+                # v2 category is recorded separately as
+                # ``v2_category``.
+                _v1_classification = "absent"
+                if _v2 is None:
+                    try:
+                        _stdout_text = (
+                            _stdout_log.read_text(encoding="utf-8", errors="replace")
+                            if _stdout_log is not None and _stdout_log.exists()
+                            else ""
+                        )
+                    except OSError:
+                        _stdout_text = ""
+                    try:
+                        from .operator_run import classify_result_marker
+                        _cls = classify_result_marker(_stdout_text)
+                    except Exception:  # noqa: BLE001
+                        _cls = "absent"
+                    _v1_classification = _cls
+                    if _cls in {"absent", "missing"}:
+                        _category = MISSING_RESULT_CATEGORY
+                    elif _cls == "template":
+                        _category = TEMPLATE_RESULT_CATEGORY
+                    else:
+                        _category = None
+                else:
+                    # Map the v2 category to the legacy
+                    # category string the existing retry /
+                    # takeover / block branches use.
+                    # PR #67 follow-up: ``MISSING_RESULT_LATE_MARKER``
+                    # and ``MISSING_RESULT_LOG_STILL_GROWING`` are
+                    # NEVER mapped to the legacy
+                    # ``MISSING_RESULT_CATEGORY``. They go through
+                    # the grace + reclassify path below; if they
+                    # survive the grace, they are parked, never
+                    # retried.
+                    if _v2.category == "template":
+                        _legacy_category = TEMPLATE_RESULT_CATEGORY
+                        _v1_classification = "template"
+                    elif _v2.category == MISSING_RESULT_NO_WORK:
+                        _legacy_category = MISSING_RESULT_CATEGORY
+                        _v1_classification = "absent"
+                    elif _v2.category == MISSING_RESULT_LATE_MARKER:
+                        _legacy_category = MISSING_RESULT_LATE_MARKER
+                        _v1_classification = "missing"
+                    elif _v2.category == MISSING_RESULT_LOG_STILL_GROWING:
+                        _legacy_category = MISSING_RESULT_LOG_STILL_GROWING
+                        _v1_classification = "absent"
+                    elif _v2.category == MISSING_RESULT_WITH_DIFF:
+                        _legacy_category = MISSING_RESULT_WITH_DIFF
+                        _v1_classification = "with_diff"
+                    else:  # "real" -- the guard accepts this below
+                        _legacy_category = None
+                        _v1_classification = "real"
+                    _category = _v2.category
+                    # PR #67 follow-up (Blocker C + D + log_still_growing):
+                    # when v2 returns
+                    # ``MISSING_RESULT_LATE_MARKER`` OR
+                    # ``MISSING_RESULT_LOG_STILL_GROWING``,
+                    # the orchestrator ALWAYS grants a bounded
+                    # grace window via
+                    # ``wait_for_log_growth_or_marker`` and then
+                    # reclassifies. After the wait:
+                    #
+                    # * ``real`` -> continue to validation.
+                    # * ``missing_result_with_diff`` -> the
+                    #   ``x_allow_missing_result_with_diff``
+                    #   policy applies.
+                    # * ``missing_result_no_work`` -> legacy
+                    #   retry is allowed.
+                    # * ``missing_result_late_marker`` or
+                    #   ``missing_result_log_still_growing`` ->
+                    #   park at AWAITING_HUMAN. NEVER retry,
+                    #   NEVER codex takeover.
+                    if _v2.category in (
+                        MISSING_RESULT_LATE_MARKER,
+                        MISSING_RESULT_LOG_STILL_GROWING,
+                    ):
+                        _grace = resolve_grace_seconds(
+                            task.metadata if hasattr(task, "metadata") else None
+                        )
+                        try:
+                            _wait_grew, _wait_size, _wait_marker_seen = (
+                                wait_for_log_growth_or_marker(
+                                    combined_log=_combined_log
+                                    if _combined_log is not None
+                                    else Path("/nonexistent"),
+                                    expected_size=_v2.log_size,
+                                    grace_seconds=_grace,
+                                )
+                            )
+                        except Exception:  # noqa: BLE001
+                            _wait_grew, _wait_size, _wait_marker_seen = (
+                                False,
+                                _v2.log_size,
+                                False,
+                            )
+                        if _wait_marker_seen:
+                            _log_still_growing_v2 = (
+                                self._compute_log_still_growing(
+                                    result=result,
+                                    combined_log_path=_combined_log,
+                                )
+                            )
+                            try:
+                                _v2 = classify_executor_result_v2(
+                                    combined_log=_combined_log
+                                    if _combined_log is not None
+                                    else Path("/nonexistent"),
+                                    stdout_log=_stdout_log,
+                                    worktree_diff=_worktree_diff,
+                                    log_still_growing=_log_still_growing_v2,
+                                )
+                            except Exception:  # noqa: BLE001
+                                _v2 = None
+                            if _v2 is not None:
+                                if _v2.category == "real":
+                                    _category = None
+                                    _legacy_category = None
+                                elif _v2.category == MISSING_RESULT_LATE_MARKER:
+                                    _legacy_category = MISSING_RESULT_LATE_MARKER
+                                    _category = MISSING_RESULT_LATE_MARKER
+                                elif _v2.category == MISSING_RESULT_LOG_STILL_GROWING:
+                                    _legacy_category = MISSING_RESULT_LOG_STILL_GROWING
+                                    _category = MISSING_RESULT_LOG_STILL_GROWING
+                                elif _v2.category == MISSING_RESULT_WITH_DIFF:
+                                    # Post-grace reclassify to
+                                    # ``missing_result_with_diff``
+                                    # is the same case the
+                                    # ``x_allow_missing_result_with_diff``
+                                    # policy below already handles;
+                                    # leave the category so the
+                                    # branch fires.
+                                    _legacy_category = MISSING_RESULT_WITH_DIFF
+                                    _category = MISSING_RESULT_WITH_DIFF
+                                else:
+                                    # ``missing_result_no_work``
+                                    # is the only category that
+                                    # allows a legacy retry; the
+                                    # late / log_still_growing
+                                    # categories are filtered
+                                    # above.
+                                    _category = _v2.category
+                                    _legacy_category = MISSING_RESULT_CATEGORY
+                    # PR #67 (P3 hardening, Blocker 5):
+                    # ``missing_result_with_diff`` is a park
+                    # signal by default; the task may opt in
+                    # via ``x_allow_missing_result_with_diff=true``
+                    # to proceed to validation/review with a
+                    # warning. The default is the fail-closed
+                    # park; the opt-in flips the routing so
+                    # the executor did real work and the
+                    # reviewer can decide.
+                    if _v2 is not None and _v2.category == MISSING_RESULT_WITH_DIFF:
+                        _allow_with_diff = bool(
+                            task.metadata.get("x_allow_missing_result_with_diff")
+                        ) if hasattr(task, "metadata") else False
+                        if _allow_with_diff:
+                            self.state.event(
+                                roadmap.roadmap_id,
+                                task.id,
+                                attempt_id,
+                                "task.result_guard_missing_result_with_diff_allowed",
+                                {
+                                    "failure_category": MISSING_RESULT_WITH_DIFF,
+                                    "allow_missing_result_with_diff": True,
+                                },
+                            )
+                            runtime.missing_result_with_diff_warning = {
+                                "category": MISSING_RESULT_WITH_DIFF,
+                                "allow_missing_result_with_diff": True,
+                            }
+                            _category = None
+                            _legacy_category = None
+                # ``should_accept`` is the only accept
+                # signal. When the v2 classifier says
+                # ``real`` AND marker_payload is a dict,
+                # proceed to validation / review without
+                # any other guard action. An unparseable
+                # marker that produces ``None`` is
+                # ``should_accept=False`` and falls
+                # through to the BLOCKED branch below --
+                # Block D fix.
+                if _v2 is not None and _v2.should_accept:
+                    # CRITICAL (Blocker D): the marker is a
+                    # real, parseable, non-template JSON
+                    # object. The guard accepts the result
+                    # and the orchestrator continues to
+                    # validation. The legacy retry / block
+                    # branches are skipped.
+                    self.state.event(
+                        roadmap.roadmap_id,
+                        task.id,
+                        attempt_id,
+                        "task.result_guard_marker_recovered",
+                        {
+                            "category": _v2.category,
+                            "log_size": _v2.log_size,
+                        },
+                    )
+                    _category = None  # skip the retry/takeover/block branches
+                # Not "real" -- run the legacy branches
+                # for retry / takeover / block.
                 if _category is not None:
                     # Shell executors do not get the retry path: their
                     # result is the exit code, not a marker, so a
@@ -1706,15 +2110,136 @@ class Orchestrator:
                     # for explicit ``require_executor_result: true``
                     # shell tasks.
                     _shell_executor = task.executor == "shell"
-                    if attempt_no < max_attempts and not _shell_executor:
+                    # Blocker C: the v2 categories
+                    # ``missing_result_with_diff`` and
+                    # ``missing_result_late_marker`` (when
+                    # the log is no longer growing) MUST
+                    # PR #67 follow-up: the v2 categories
+                    # ``missing_result_with_diff``,
+                    # ``missing_result_late_marker`` and
+                    # ``missing_result_log_still_growing``
+                    # MUST NOT trigger the legacy retry /
+                    # codex-takeover path. The executor did
+                    # real work (with_diff) or the marker
+                    # is broken (late) or the log was still
+                    # being written when the guard fired
+                    # (log_still_growing). All three are
+                    # auto-retry hazards: the work would
+                    # be duplicated or the marker would
+                    # never parse. The orchestrator parks
+                    # or proceeds-to-validation as
+                    # appropriate, but it does NOT queue
+                    # another executor attempt and does
+                    # NOT trigger a Codex takeover.
+                    _v2_skip_retry = (
+                        _v2 is not None
+                        and _v2.category
+                        in (
+                            MISSING_RESULT_WITH_DIFF,
+                            MISSING_RESULT_LATE_MARKER,
+                            MISSING_RESULT_LOG_STILL_GROWING,
+                        )
+                    )
+                    # PR #67 follow-up: the late-marker
+                    # and log_still_growing categories are
+                    # NEVER mapped to the legacy
+                    # ``MISSING_RESULT_CATEGORY`` (the
+                    # pre-v2 retry signal). They keep
+                    # their own canonical categories so
+                    # the v2-aware code can park them
+                    # correctly. ``missing_result_no_work``
+                    # is the only v2 category that maps
+                    # to the legacy retry signal.
+                    if _v2 is not None and _category == MISSING_RESULT_NO_WORK:
+                        _legacy_category = MISSING_RESULT_CATEGORY
+                    elif _v2 is not None and _category == MISSING_RESULT_WITH_DIFF:
+                        _legacy_category = MISSING_RESULT_WITH_DIFF
+                    elif _v2 is not None and _category == MISSING_RESULT_LATE_MARKER:
+                        _legacy_category = MISSING_RESULT_LATE_MARKER
+                    elif _v2 is not None and _category == MISSING_RESULT_LOG_STILL_GROWING:
+                        _legacy_category = MISSING_RESULT_LOG_STILL_GROWING
+                    else:
+                        _legacy_category = _category
+                    # PR #67 follow-up: after the grace +
+                    # reclassify block, the v2 category is
+                    # still ``missing_result_late_marker``
+                    # or ``missing_result_log_still_growing``
+                    # when the marker never became
+                    # parseable. In either case the task
+                    # is parked: NEVER executor retry,
+                    # NEVER Codex takeover. The
+                    # ``should_wait`` flag is NOT consulted
+                    # here because the grace window has
+                    # already elapsed; the only remaining
+                    # safe action is the park.
+                    if (
+                        _v2 is not None
+                        and _v2.category
+                        in (
+                            MISSING_RESULT_LATE_MARKER,
+                            MISSING_RESULT_LOG_STILL_GROWING,
+                        )
+                    ):
+                        # Park the task. Do NOT queue
+                        # another executor repair; the
+                        # marker is broken or the log is
+                        # still growing past the grace
+                        # window, and retrying would
+                        # duplicate the work.
+                        self.state.event(
+                            roadmap.roadmap_id,
+                            task.id,
+                            attempt_id,
+                            "task.result_guard_blocked",
+                            {
+                                "failure_category": _v2.category,
+                                "exit_code": result.exit_code,
+                                "log_size": _v2.log_size,
+                            },
+                        )
+                        self.state.transition_task(
+                            roadmap.roadmap_id,
+                            task.id,
+                            TaskState.AWAITING_HUMAN,
+                            {
+                                "reason": _v2.category,
+                                "failure_category": _v2.category,
+                                "hint": (
+                                    "Executor did not produce a parseable "
+                                    "AGENTOPS_RESULT_JSON after the bounded "
+                                    "grace window. Do NOT queue another "
+                                    "executor repair and do NOT trigger a "
+                                    "Codex takeover. Inspect the combined log "
+                                    "and recover manually."
+                                ),
+                            },
+                        )
+                        self._record_roadmap_event(
+                            roadmap,
+                            "task.blocked_by_result_guard",
+                            task.id,
+                            extra={
+                                "failure_category": _v2.category,
+                            },
+                        )
+                        return
+                    if (
+                        attempt_no < max_attempts
+                        and not _shell_executor
+                        and not _v2_skip_retry
+                        and _legacy_category
+                        in (MISSING_RESULT_CATEGORY, "template")
+                    ):
                         # Retry budget remains: write a bounded repair
                         # prompt and queue the next attempt. The retry
                         # is bounded by ``max_attempts``; the attempt
                         # loop will refuse to run past it.
                         runtime.repair_prompt = _result_guard_repair_prompt(
                             task=task,
-                            classification=_cls,
-                            failure_category=_category,
+                            classification=(
+                                _v1_classification
+                            ),
+                            failure_category=_legacy_category,
                             attempt_no=attempt_no,
                             max_attempts=max_attempts,
                         )
@@ -1735,8 +2260,10 @@ class Orchestrator:
                             attempt_id,
                             "task.result_guard_retry_queued",
                             {
-                                "failure_category": _category,
-                                "classification": _cls,
+                                "failure_category": _legacy_category,
+                                "classification": (
+                                    _v1_classification
+                                ),
                                 "exit_code": result.exit_code,
                                 "after_attempt": attempt_no,
                                 "next_attempt": attempt_no + 1,
@@ -1751,9 +2278,11 @@ class Orchestrator:
                             task.id,
                             TaskState.REPAIR_PROMPT_READY,
                             {
-                                "reason": _category,
-                                "failure_category": _category,
-                                "classification": _cls,
+                                "reason": _legacy_category,
+                                "failure_category": _legacy_category,
+                                "classification": (
+                                    _v1_classification
+                                ),
                                 "attempt": attempt_no,
                                 "next_attempt": attempt_no + 1,
                             },
@@ -1763,8 +2292,10 @@ class Orchestrator:
                             "task.result_guard_retry_queued",
                             task.id,
                             extra={
-                                "failure_category": _category,
-                                "classification": _cls,
+                                "failure_category": _legacy_category,
+                                "classification": (
+                                    _v1_classification
+                                ),
                                 "after_attempt": attempt_no,
                                 "next_attempt": attempt_no + 1,
                             },
@@ -1783,8 +2314,25 @@ class Orchestrator:
                     # terminal BLOCK contract). When those gates do not
                     # hold we keep the terminal BLOCK behaviour so the
                     # safety default is unchanged.
+                    # PR #67 follow-up: the Codex takeover
+                    # only fires for
+                    # ``missing_result_no_work`` /
+                    # ``template`` (v1 categories). Late
+                    # marker and log_still_growing are
+                    # NEVER eligible: a broken marker or a
+                    # still-growing log would not be
+                    # recovered by a stronger reviewer; the
+                    # only safe action is to park the task
+                    # and let the operator recover.
                     _takeover_category = (
-                        _category in {MISSING_RESULT_CATEGORY, TEMPLATE_RESULT_CATEGORY}
+                        _legacy_category
+                        in {MISSING_RESULT_CATEGORY, TEMPLATE_RESULT_CATEGORY}
+                        and _v2 is not None
+                        and _v2.category
+                        not in (
+                            MISSING_RESULT_LATE_MARKER,
+                            MISSING_RESULT_LOG_STILL_GROWING,
+                        )
                     )
                     _codex_allowed = (
                         self.options.autonomous
@@ -1804,8 +2352,10 @@ class Orchestrator:
                         runtime.codex_takeover_used = True
                         runtime.repair_prompt = _result_guard_repair_prompt(
                             task=task,
-                            classification=_cls,
-                            failure_category=_category,
+                            classification=(
+                                _v1_classification
+                            ),
+                            failure_category=_legacy_category,
                             attempt_no=attempt_no,
                             max_attempts=max_attempts,
                         )
@@ -1826,7 +2376,7 @@ class Orchestrator:
                             TaskState.REPAIR_PROMPT_READY,
                             {
                                 "reason": "result_guard_codex_takeover",
-                                "failure_category": _category,
+                                "failure_category": _legacy_category,
                                 "after_attempt": attempt_no,
                                 "next_executor": "codex",
                             },
@@ -1836,29 +2386,52 @@ class Orchestrator:
                             "task.codex_takeover_queued",
                             task.id,
                             extra={
-                                "reason": _category,
+                                "reason": _legacy_category,
                                 "after_attempt": attempt_no,
                                 "next_attempt": attempt_no + 1,
-                                "classification": _cls,
+                                "classification": (
+                                    _v1_classification
+                                ),
                             },
                         )
                         continue
+                    # Terminal block (the v2 categories that
+                    # are not "real" get a clear category).
+                    if _v2 is not None and _v2.category == MISSING_RESULT_WITH_DIFF:
+                        _terminal_category = MISSING_RESULT_WITH_DIFF
+                    elif _v2 is not None and _v2.category == MISSING_RESULT_LATE_MARKER:
+                        _terminal_category = MISSING_RESULT_LATE_MARKER
+                    else:
+                        _terminal_category = _legacy_category
                     self.state.event(
                         roadmap.roadmap_id,
                         task.id,
                         attempt_id,
                         "task.result_guard_blocked",
-                        {"failure_category": _category, "exit_code": result.exit_code, "classification": _cls},
+                        {
+                            "failure_category": _terminal_category,
+                            "exit_code": result.exit_code,
+                            "classification": (
+                                _v1_classification
+                            ),
+                        },
                     )
                     self.state.transition_task(
                         roadmap.roadmap_id,
                         task.id,
                         TaskState.BLOCKED,
-                        {"reason": _category, "failure_category": _category},
+                        {"reason": _terminal_category, "failure_category": _terminal_category},
                     )
                     self._record_roadmap_event(
-                        roadmap, "task.blocked_by_result_guard", task.id,
-                        extra={"failure_category": _category, "classification": _cls},
+                        roadmap,
+                        "task.blocked_by_result_guard",
+                        task.id,
+                        extra={
+                            "failure_category": _terminal_category,
+                            "classification": (
+                                _v1_classification
+                            ),
+                        },
                     )
                     return
             self.state.transition_task(roadmap.roadmap_id, task.id, TaskState.VALIDATING)
@@ -1898,27 +2471,88 @@ class Orchestrator:
                 )
                 return
             validation_env = build_validation_subprocess_env(env_contract)
-            # PR #66 (P3 hardening): validation baseline. When
-            # the task opts in via ``x_validation_baseline=true``,
-            # capture the baseline signatures on a clean copy
-            # of the worktree BEFORE the executor attempt and
-            # compare them against the post-attempt signatures.
-            # A pre-existing failure (same fingerprint) does
-            # NOT queue executor repair; the task is parked
-            # with ``validation_baseline_known_failure`` unless
-            # ``x_allow_review_with_baseline_failure=true`` is
-            # set, in which case the review packet carries a
-            # baseline-failed warning and the task proceeds.
-            baseline_signatures = self._capture_validation_baseline(
-                task, target_worktree, attempt_dir, env=validation_env,
-            )
+            # ``build_validation_subprocess_env`` returns
+            # ``None`` when the contract is not declared;
+            # the engine then inherits the parent env.
+            # PR #67 (P3 hardening, Blocker B): the
+            # validation-repair branch is now skipped when
+            # the baseline comparison returned
+            # ``ALLOW_REVIEW_WITH_WARNING``. The flag is
+            # declared before the comparison helper is
+            # called so the helper can flip it; the
+            # validation-repair branch consults it
+            # directly.
+            _baseline_allow_review_with_warning = False
             validation = ValidationEngine(
                 timeout_seconds=min(task.timeout_seconds, 1800),
                 env=validation_env,
             ).run_all(task.validations, target_worktree, attempt_dir)
-            self._compare_validation_baseline(
-                roadmap, task, attempt_id, validation, baseline_signatures,
+            # PR #66 (P3 hardening, Blocker A + B): baseline
+            # was captured before the executor on attempt 1
+            # and stored on ``runtime``. The post-executor
+            # comparison uses those stored signatures; the
+            # helper returns an explicit action the
+            # orchestrator respects.
+            baseline_action = self._compare_validation_baseline(
+                task=task,
+                validation=validation,
+                baseline_signatures=runtime.validation_baseline_signatures,
             )
+            if baseline_action.action == "AWAITING_HUMAN":
+                self._record_roadmap_event(
+                    roadmap,
+                    "task.validation_baseline_known_failure",
+                    task.id,
+                    extra=baseline_action.warning or {},
+                )
+                self.state.transition_task(
+                    roadmap.roadmap_id,
+                    task.id,
+                    TaskState.AWAITING_HUMAN,
+                    {
+                        "reason": VALIDATION_BASELINE_KNOWN_FAILURE,
+                        "failure_category": VALIDATION_BASELINE_KNOWN_FAILURE,
+                        "allow_review_with_baseline_failure": False,
+                    },
+                )
+                return
+            if baseline_action.action == "ALLOW_REVIEW_WITH_WARNING":
+                # Record the comparison event but do NOT
+                # park. The review packet plumbing reads
+                # ``runtime.validation_baseline_warning``
+                # so the warning reaches the reviewer.
+                # PR #67 (P3 hardening, Blocker B): the
+                # validation-repair branch below is now
+                # SKIPPED when this action fires, so the
+                # task does not get a duplicate executor
+                # repair attempt over an already-known
+                # failure. The local
+                # ``_baseline_allow_review_with_warning``
+                # flag is the single switch the repair
+                # branch consults.
+                self._record_roadmap_event(
+                    roadmap,
+                    "task.validation_baseline_known_failure",
+                    task.id,
+                    extra=baseline_action.warning or {},
+                )
+                runtime.validation_baseline_warning = (
+                    baseline_action.warning
+                )
+                _baseline_allow_review_with_warning = True
+            elif baseline_action.action == "DIFFERENT_FAILURE":
+                # Baseline failed but post has a different
+                # fingerprint: the task introduced a new
+                # failure. Record the event and fall
+                # through to the normal validation-failed
+                # path (executor repair may still be
+                # queued).
+                self._record_roadmap_event(
+                    roadmap,
+                    "task.validation_baseline_different_failure",
+                    task.id,
+                    extra=baseline_action.warning or {},
+                )
             for command_result in validation.commands:
                 self.state.record_validation(
                     roadmap.roadmap_id,
@@ -1961,7 +2595,22 @@ class Orchestrator:
             )
 
             # Validation failure: deterministic repair first, then reviewer triage.
-            if (not result.ok and not executor_idle_partial_diff) or not validation.ok:
+            # PR #67 (P3 hardening, Blocker B): when the
+            # baseline comparison returned
+            # ``ALLOW_REVIEW_WITH_WARNING``, the
+            # ``validation.ok`` is allowed to be False;
+            # the known-baseline failure must not trigger
+            # an executor repair. We fall through to the
+            # review path so the reviewer sees the
+            # warning and the code diff.
+            _validation_failed_for_known_baseline = (
+                _baseline_allow_review_with_warning
+                and (not result.ok or not validation.ok)
+            )
+            if (
+                (not result.ok and not executor_idle_partial_diff)
+                or not validation.ok
+            ) and not _validation_failed_for_known_baseline:
                 if attempt_no < max_attempts:
                     runtime.repair_prompt = compiler.repair_prompt_from_validation(task, validation)
                     repair_path = artifact_store.write_text(
@@ -2014,6 +2663,7 @@ class Orchestrator:
                 attempt_id=attempt_id,
                 artifact_store=artifact_store,
                 attempt_no=attempt_no,
+                runtime=runtime,
             )
             runtime.review_verdict = verdict
 
@@ -2486,6 +3136,7 @@ class Orchestrator:
         attempt_id: str,
         artifact_store: ArtifactStore,
         attempt_no: int,
+        runtime: _TaskRuntime,
     ) -> ReviewVerdict | None:
         """Run the configured reviewer. Returns None on awaiting_review.
 
@@ -2546,6 +3197,7 @@ class Orchestrator:
             attempt=attempt_no,
             scope_deviation=_scope_deviation_packet,
             policy_advisory=tuple(_policy_advisory),
+            validation_baseline_warning=runtime.validation_baseline_warning,
         )
 
         # If the router decided not to call Codex, go straight to heuristic
@@ -3140,6 +3792,7 @@ class Orchestrator:
             attempt_id=attempt_id,
             artifact_store=artifact_store,
             attempt_no=attempt_no,
+            runtime=runtime,
         )
         if re_verdict is not None and re_verdict.verdict == "ACCEPT":
             finalized = self._finalize(
@@ -3445,45 +4098,44 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Small helpers
     # ------------------------------------------------------------------
-    def _capture_validation_baseline(
+    def _maybe_capture_validation_baseline(
         self,
+        *,
         task: TaskConfig,
         target_worktree: Path,
         attempt_dir: Path,
-        *,
+        runtime: _TaskRuntime,
         env: dict[str, str] | None = None,
-    ) -> tuple[ValidationSignature, ...]:
-        """Run validations on a clean copy of the worktree.
+    ) -> bool:
+        """Capture the validation baseline ONCE per task, before
+        the first executor attempt.
 
-        Returns a tuple of :class:`ValidationSignature` (one per
-        validation command, in order). The helper only runs
-        when the task opts in via ``x_validation_baseline=true``;
-        the empty tuple is a no-op signal for
-        :meth:`_compare_validation_baseline`.
+        Returns True when a baseline was captured (or the
+        task does not opt in, in which case "captured" is
+        a no-op), False when the helper refused to run
+        (e.g. baseline validation mutates the worktree;
+        Blocker A fail-closed guard).
 
-        The baseline is run on the current worktree, which is
-        expected to be a fresh worktree with no executor
-        changes (the orchestrator calls this helper on the
-        *first* attempt of the task). On retry attempts the
-        worktree carries the previous attempt's edits; we
-        still run the baseline (the executor may have made
-        changes) and the comparison is expected to flag
-        "different" -- which is the right behaviour because
-        the retry is a different snapshot of reality.
+        The signatures are stored on ``runtime`` so the
+        post-executor comparison helper can reuse them on
+        repair attempts. Attempt 2+ never recaptures
+        because the worktree already carries the previous
+        attempt's changes; the baseline must reflect the
+        pre-task state.
 
         Baseline artifacts are written under
-        ``attempt_dir/validation/baseline/`` so the operator
-        can diff baseline vs post.
+        ``attempt_dir/validation/baseline/`` so the
+        operator can diff baseline vs post.
         """
+        # Already captured? Nothing to do.
+        if runtime.validation_baseline_captured:
+            return True
         if not bool(task.metadata.get("x_validation_baseline")):
-            return ()
+            return True
         if not task.validations:
-            return ()
+            return True
         baseline_dir = attempt_dir / "validation" / "baseline"
         baseline_dir.mkdir(parents=True, exist_ok=True)
-        # Use a fresh ValidationEngine with the same env
-        # contract so the baseline sees the same parent env
-        # the executor will see.
         engine = ValidationEngine(
             timeout_seconds=min(task.timeout_seconds, 1800),
             env=env,
@@ -3491,6 +4143,32 @@ class Orchestrator:
         baseline_results = engine.run_all(
             task.validations, target_worktree, baseline_dir
         )
+        # Fail-closed guard (Blocker A): if the baseline
+        # validation mutated the worktree, refuse to use
+        # the result. The diff is computed against HEAD
+        # (not the task base) so the comparison is local
+        # to the executor's own writes. The check is
+        # conservative: any non-empty name_status line
+        # blocks the capture.
+        post_baseline_diff = run_git(
+            target_worktree,
+            ["status", "--porcelain=v1"],
+            check=False,
+        ).stdout
+        if post_baseline_diff.strip():
+            # Restore the worktree to its clean state so
+            # the executor attempt starts from a known
+            # baseline. We deliberately use
+            # ``git checkout -- .`` (file-level) and
+            # ``git clean -fd`` (untracked) so any
+            # baseline side-effect is undone without
+            # touching the executor's allowed scope.
+            run_git(target_worktree, ["checkout", "--", "."], check=False)
+            run_git(
+                target_worktree,
+                ["clean", "-fd", "-e", "validation/", "-e", ".agentops/"],
+                check=False,
+            )
         signatures: list[ValidationSignature] = []
         for cr in baseline_results.commands:
             try:
@@ -3509,45 +4187,49 @@ class Orchestrator:
                     stdout_text=stdout_text,
                 )
             )
-        return tuple(signatures)
+        runtime.validation_baseline_signatures = tuple(signatures)
+        runtime.validation_baseline_captured = True
+        runtime.validation_baseline_artifacts_dir = baseline_dir
+        return True
 
     def _compare_validation_baseline(
         self,
-        roadmap: RoadmapConfig,
+        *,
         task: TaskConfig,
-        attempt_id: int,
         validation: ValidationResult,
         baseline_signatures: tuple[ValidationSignature, ...],
-    ) -> None:
+    ) -> _ValidationBaselineAction:
         """Compare baseline vs post validation signatures and
-        record the result.
+        return an explicit action the orchestrator respects.
 
-        Behaviour:
+        Behaviour (Blocker B):
 
-        * ``baseline_signatures`` empty -> the task did not
-          opt in; nothing to do.
-        * baseline all green -> nothing to do; the post
+        * empty ``baseline_signatures`` -> the task did
+          not opt in; ``NONE``.
+        * baseline all green -> ``NONE``; the post
           validation is the canonical result.
         * baseline failed and post failed with same
-          fingerprint -> record
-          ``task.validation_baseline_known_failure``; the
-          task is parked with ``AWAITING_HUMAN`` and
-          ``failure_category=validation_baseline_known_failure``
-          unless ``x_allow_review_with_baseline_failure=true``
-          is set on the task.
+          fingerprint -> ``AWAITING_HUMAN`` (default) or
+          ``ALLOW_REVIEW_WITH_WARNING`` when
+          ``x_allow_review_with_baseline_failure=true``
+          is set.
         * baseline failed and post failed with different
-          fingerprint -> record
-          ``task.validation_baseline_different_failure``;
-          the normal validation-failed path is left
-          unchanged so executor repair may still be queued.
+          fingerprint -> ``DIFFERENT_FAILURE``; the
+          normal validation-failed path is left
+          unchanged so executor repair may still be
+          queued.
+
+        The action is the only signal the caller uses;
+        ``_compare_validation_baseline`` no longer
+        transitions state directly. That guarantees
+        the orchestrator can never accidentally
+        continue into a normal repair prompt after a
+        baseline-known failure.
         """
         if not baseline_signatures:
-            return
+            return _ValidationBaselineAction("NONE", None)
         if not validation.commands:
-            return
-        # Zip the post-exit-codes back onto the baseline
-        # signatures. The order matches because both helpers
-        # iterate ``task.validations`` in order.
+            return _ValidationBaselineAction("NONE", None)
         post_signatures: list[ValidationSignature] = []
         for cr in validation.commands:
             try:
@@ -3566,7 +4248,6 @@ class Orchestrator:
                     stdout_text=stdout_text,
                 )
             )
-        # For each command, decide the relationship.
         allow_review_with_baseline = bool(
             task.metadata.get("x_allow_review_with_baseline_failure")
         )
@@ -3587,45 +4268,159 @@ class Orchestrator:
             elif relationship == "different":
                 any_baseline_different = True
         if not (any_baseline_known or any_baseline_different):
-            return
-        # Record the comparison event. The post validation
-        # path is left to its existing logic; we only
-        # influence the *repair* decision (whether to queue
-        # executor repair) below.
-        event_extra: dict[str, object] = {
-            "per_command": per_command,
-            "allow_review_with_baseline_failure": allow_review_with_baseline,
-        }
+            return _ValidationBaselineAction("NONE", None)
         if any_baseline_known:
-            event_extra["failure_category"] = VALIDATION_BASELINE_KNOWN_FAILURE
-            self._record_roadmap_event(
-                roadmap,
-                "task.validation_baseline_known_failure",
-                task.id,
-                extra=event_extra,
-            )
-            if not allow_review_with_baseline:
-                # Park the task. Do NOT queue executor
-                # repair: the failure is not ours.
-                self.state.transition_task(
-                    roadmap.roadmap_id,
-                    task.id,
-                    TaskState.AWAITING_HUMAN,
-                    {
-                        "reason": VALIDATION_BASELINE_KNOWN_FAILURE,
-                        "failure_category": VALIDATION_BASELINE_KNOWN_FAILURE,
-                        "allow_review_with_baseline_failure": allow_review_with_baseline,
-                    },
+            warning = {
+                "per_command": per_command,
+                "allow_review_with_baseline_failure": allow_review_with_baseline,
+            }
+            if allow_review_with_baseline:
+                return _ValidationBaselineAction(
+                    "ALLOW_REVIEW_WITH_WARNING", warning
                 )
-                return
-        if any_baseline_different:
-            event_extra["failure_category"] = VALIDATION_BASELINE_DIFFERENT
-            self._record_roadmap_event(
-                roadmap,
-                "task.validation_baseline_different_failure",
-                task.id,
-                extra=event_extra,
+            return _ValidationBaselineAction(
+                "AWAITING_HUMAN",
+                {
+                    "per_command": per_command,
+                    "allow_review_with_baseline_failure": False,
+                },
             )
+        # Different failure
+        return _ValidationBaselineAction(
+            "DIFFERENT_FAILURE",
+            {
+                "per_command": per_command,
+            },
+        )
+
+    def _detect_scope_creep_repair(
+        self,
+        *,
+        roadmap: RoadmapConfig,
+        task: TaskConfig,
+        runtime: _TaskRuntime,
+        result: RunnerResult,
+        diff: DiffSnapshot,
+    ) -> bool:
+        """Run the scope-creep detector after a repair attempt.
+
+        Returns True when scope creep was suspected; the
+        caller parks the task and refuses to queue
+        another executor repair. False when the
+        attempt was clean.
+
+        Detection is opt-in by default; tasks may opt out
+        with ``x_disable_scope_creep_detector=true``.
+        """
+        if bool(task.metadata.get("x_disable_scope_creep_detector")):
+            return False
+        # Only inspect repair attempts. Attempt 1 is the
+        # initial run; scope creep is the failure mode of
+        # long repair loops.
+        if not (
+            runtime.repair_prompt is not None
+            or (runtime.attempt and runtime.attempt > 1)
+        ):
+            return False
+        if task.executor == "shell":
+            return False
+        # Build the combined log text. The runner already
+        # streams stdout / stderr into the combined log;
+        # we read it once for the detector.
+        combined_log_path = getattr(result, "combined_log_path", None)
+        stdout_log_path = getattr(result, "stdout_path", None)
+        text = ""
+        if combined_log_path is not None and Path(combined_log_path).exists():
+            try:
+                text = Path(combined_log_path).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                text = ""
+        elif stdout_log_path is not None and Path(stdout_log_path).exists():
+            try:
+                text = Path(stdout_log_path).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                text = ""
+        decision = detect_scope_creep(
+            combined_log_text=text,
+            worktree_diff=diff.patch,
+            current_task_id=task.id,
+        )
+        if not decision.suspected:
+            return False
+        # Record the event. The metadata is redacted
+        # (private paths -> ``<private>``) so the
+        # operator-run dashboard does not leak the
+        # operator's home directory.
+        metadata = decision.to_metadata()
+        metadata["failure_category"] = SCOPE_CREEP_SUSPECTED
+        self._record_roadmap_event(
+            roadmap,
+            "task.scope_creep_suspected",
+            task.id,
+            extra=metadata,
+        )
+        # Park the task. Do NOT queue another executor
+        # repair; the suggested action is Codex takeover
+        # or operator decision.
+        self.state.transition_task(
+            roadmap.roadmap_id,
+            task.id,
+            TaskState.AWAITING_HUMAN,
+            {
+                "reason": SCOPE_CREEP_SUSPECTED,
+                "failure_category": SCOPE_CREEP_SUSPECTED,
+                "hint": (
+                    "Executor wandered out of scope during a repair "
+                    "attempt (other workspaces, repeated tool invocations "
+                    "on out-of-scope paths, etc.). Do NOT queue another "
+                    "executor repair. Suggested action: Codex takeover "
+                    "or operator decision."
+                ),
+            },
+        )
+        return True
+
+    def _compute_log_still_growing(
+        self,
+        *,
+        result: RunnerResult,
+        combined_log_path: Path | None,
+        grace_window_seconds: int | None = None,
+    ) -> bool:
+        """Return True when the executor's combined log is
+        still being written. Used by the result-guard v2
+        classifier to distinguish MISSING_RESULT_LOG_STILL_GROWING
+        (the marker may still appear) from
+        MISSING_RESULT_LATE_MARKER / MISSING_RESULT_NO_WORK
+        (the log is final; the marker is gone for good).
+
+        Signals checked, in order:
+
+        1. result.is_alive() returns True (the runner
+           still has the subprocess).
+        2. The combined log's mtime is within the grace
+           window (default 2s, never more than MAX_GRACE_SECONDS).
+        """
+        try:
+            if bool(getattr(result, "is_alive", lambda: False)()):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        if combined_log_path is None:
+            return False
+        try:
+            mtime = combined_log_path.stat().st_mtime
+        except OSError:
+            return False
+        window = grace_window_seconds
+        if window is None:
+            window = min(DEFAULT_GRACE_SECONDS, MAX_GRACE_SECONDS)
+        import time as _time
+        return (_time.time() - mtime) <= float(window)
 
     def _policy_for(self, roadmap: RoadmapConfig) -> PolicyEngine:
         return PolicyEngine(roadmap)
