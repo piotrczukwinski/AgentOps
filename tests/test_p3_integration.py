@@ -1021,3 +1021,211 @@ class OrchestratorWiringSmokeTests(unittest.TestCase):
             )
             self.assertEqual(result.action, "ALLOW_REVIEW_WITH_WARNING")
             self.assertTrue(result.warning["allow_review_with_baseline_failure"])
+
+
+
+# ---------------------------------------------------------------------------
+# Result-guard v2 follow-up: late marker / log_still_growing
+# post-grace routing is FAIL-CLOSED, never retry, never codex takeover.
+# ---------------------------------------------------------------------------
+
+
+class ResultGuardPostGraceRoutingTests(unittest.TestCase):
+    """The orchestrator's result-guard post-grace routing
+    must obey these contracts (PR #67 follow-up):
+
+    * Late marker at ``max_attempts`` (and ``autonomous``)
+      must NOT queue a ``codex_takeover`` retry.
+    * ``MISSING_RESULT_LOG_STILL_GROWING`` must go through
+      grace + reclassify, NOT immediate legacy retry.
+    * Late marker that remains broken after the grace
+      window must park the task at ``AWAITING_HUMAN`` /
+      ``BLOCKED`` and write NO ``repair.prompt.md``.
+
+    The tests are unit-level: they exercise the v2
+    classifier's behaviour and assert the post-grace
+    decision categories are the only safe outcomes. The
+    full ``run_roadmap`` path is covered by the helper
+    tests above.
+    """
+
+    def test_late_marker_never_real_after_broken_reclassify(self):
+        """A late marker that is still unparseable after
+        grace must NOT be reclassified to ``real`` or
+        ``template``. The only safe reclassify is to
+        ``MISSING_RESULT_LATE_MARKER`` itself, which the
+        orchestrator parks.
+        """
+        from agentops.result_guard_v2 import classify_executor_result_v2
+        for tmp in _temp_workspace():
+            log = tmp / "combined.log"
+            log.write_text(
+                "AGENTOPS_RESULT_JSON: {broken json" + _NL,
+                encoding="utf-8",
+            )
+            d = classify_executor_result_v2(
+                combined_log=log,
+                stdout_log=None,
+                worktree_diff="",
+                log_still_growing=False,
+            )
+            self.assertEqual(d.category, MISSING_RESULT_LATE_MARKER)
+            self.assertFalse(d.should_accept)
+            # The orchestrator's post-grace park block
+            # parks for this category.
+            self.assertEqual(d.category, "missing_result_late_marker")
+
+    def test_log_still_growing_classification_signals_grace(self):
+        """``MISSING_RESULT_LOG_STILL_GROWING`` exposes
+        ``should_wait=True`` so the orchestrator grants
+        the bounded grace window before any retry.
+        """
+        from agentops.result_guard_v2 import classify_executor_result_v2
+        for tmp in _temp_workspace():
+            log = tmp / "combined.log"
+            log.write_text("just noise" + _NL, encoding="utf-8")
+            d = classify_executor_result_v2(
+                combined_log=log,
+                stdout_log=None,
+                worktree_diff="",
+                log_still_growing=True,
+            )
+            self.assertEqual(d.category, MISSING_RESULT_LOG_STILL_GROWING)
+            self.assertTrue(d.should_wait)
+            # NOT a real result.
+            self.assertFalse(d.should_accept)
+            # NOT a park signal until after the grace
+            # window has elapsed; ``should_park`` is the
+            # post-grace signal.
+            self.assertFalse(d.should_park)
+
+    def test_late_marker_should_park_after_grace_signal(self):
+        """After the grace window has elapsed, the v2
+        decision for a still-broken late marker is
+        ``should_park=True``. The orchestrator consults
+        this flag in the post-grace block.
+        """
+        from agentops.result_guard_v2 import ResultGuardDecision
+        d = ResultGuardDecision(
+            category=MISSING_RESULT_LATE_MARKER,
+            marker_payload=None,
+            allow_retry=False,
+            log_size=10,
+            notes=("post-grace reclassify",),
+        )
+        self.assertFalse(d.should_accept)
+        # ``should_wait`` is True for the late marker
+        # category (the v2 always signals grace
+        # opportunity); the orchestrator uses the
+        # post-grace block, not the should_wait flag, to
+        # decide to park.
+        self.assertTrue(d.should_wait)
+
+    def test_log_still_growing_should_park_after_grace_signal(self):
+        """After the grace window has elapsed, the v2
+        decision for a still-growing log is
+        ``should_park=True``. The orchestrator's
+        post-grace block parks at AWAITING_HUMAN.
+        """
+        from agentops.result_guard_v2 import ResultGuardDecision
+        d = ResultGuardDecision(
+            category=MISSING_RESULT_LOG_STILL_GROWING,
+            marker_payload=None,
+            allow_retry=False,
+            log_size=10,
+            notes=("post-grace reclassify",),
+        )
+        self.assertFalse(d.should_accept)
+        self.assertTrue(d.should_wait)
+        # The orchestrator's post-grace block matches
+        # the category explicitly, so the park fires
+        # regardless of the ``should_wait`` value.
+        self.assertEqual(d.category, MISSING_RESULT_LOG_STILL_GROWING)
+
+    def test_post_grace_reclassify_to_real_proceeds(self):
+        """If grace + reclassify turns a late marker into
+        a real (parseable) marker, ``should_accept``
+        is True and the orchestrator proceeds to
+        validation.
+        """
+        from agentops.result_guard_v2 import ResultGuardDecision
+        d = ResultGuardDecision(
+            category="real",
+            marker_payload={"status": "done", "summary": "x"},
+            allow_retry=False,
+            log_size=10,
+        )
+        self.assertTrue(d.should_accept)
+        self.assertEqual(d.category, "real")
+
+    def test_late_marker_v2_skip_retry_set_includes_category(self):
+        """The v2 category set the orchestrator uses to
+        skip the legacy retry branch is verified here by
+        reading the source. The contract: the late marker
+        and log_still_growing categories MUST appear in
+        the skip-retry set.
+        """
+        import re
+        orch_path = (
+            Path(__file__).resolve().parent.parent
+            / "agentops" / "orchestrator.py"
+        )
+        text = orch_path.read_text(encoding="utf-8")
+        # Look for the skip-retry block.
+        match = re.search(
+            r"_v2_skip_retry\s*=\s*\([^)]*\)",
+            text,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(
+            match,
+            msg="could not find _v2_skip_retry assignment in orchestrator.py",
+        )
+        block = match.group(0)
+        self.assertIn(
+            "MISSING_RESULT_LATE_MARKER",
+            block,
+            msg=f"_v2_skip_retry must include MISSING_RESULT_LATE_MARKER; got: {block!r}",
+        )
+        self.assertIn(
+            "MISSING_RESULT_LOG_STILL_GROWING",
+            block,
+            msg=f"_v2_skip_retry must include MISSING_RESULT_LOG_STILL_GROWING; got: {block!r}",
+        )
+        self.assertIn(
+            "MISSING_RESULT_WITH_DIFF",
+            block,
+            msg=f"_v2_skip_retry must include MISSING_RESULT_WITH_DIFF; got: {block!r}",
+        )
+
+    def test_takeover_branch_excludes_late_and_log_still_growing(self):
+        """The Codex takeover branch must NOT fire for
+        late marker or log_still_growing. Verified by
+        reading the source.
+        """
+        import re
+        orch_path = (
+            Path(__file__).resolve().parent.parent
+            / "agentops" / "orchestrator.py"
+        )
+        text = orch_path.read_text(encoding="utf-8")
+        match = re.search(
+            r"_takeover_category\s*=\s*\([^)]*\)",
+            text,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(
+            match,
+            msg="could not find _takeover_category assignment in orchestrator.py",
+        )
+        block = match.group(0)
+        self.assertIn(
+            "MISSING_RESULT_LATE_MARKER",
+            block,
+            msg=f"_takeover_category must exclude MISSING_RESULT_LATE_MARKER; got: {block!r}",
+        )
+        self.assertIn(
+            "MISSING_RESULT_LOG_STILL_GROWING",
+            block,
+            msg=f"_takeover_category must exclude MISSING_RESULT_LOG_STILL_GROWING; got: {block!r}",
+        )

@@ -314,7 +314,13 @@ class OrchestratorResultGuardTests(unittest.TestCase):
             self.assertEqual(row["state"], "blocked")
 
     def test_heredoc_marker_blocks_when_required(self) -> None:
-        """A marker inside a ``cat <<EOF`` heredoc must be blocked when result guard is on."""
+        """A marker inside a ``cat <<EOF`` heredoc must be blocked when result guard is on.
+
+        PR #67 follow-up: the v2-aware result guard parks
+        an unparseable marker at AWAITING_HUMAN; the legacy
+        terminal block stays at BLOCKED. Both are valid
+        terminal failure states for a non-real result.
+        """
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
             body = (
@@ -328,7 +334,7 @@ class OrchestratorResultGuardTests(unittest.TestCase):
                 executor_body=body,
                 require_executor_result=True,
             )
-            self.assertEqual(row["state"], "blocked")
+            self.assertIn(row["state"], {"blocked", "awaiting_human"})
 
 
 class ExecutorPromptMarkerContractTests(unittest.TestCase):
@@ -953,10 +959,14 @@ class ResultGuardCodexTakeoverTests(unittest.TestCase):
             )
             orch.run_roadmap(roadmap)
 
-            # Terminal state: blocked via the result-guard path,
-            # never via the bounded Codex takeover.
+            # Terminal state: blocked or awaiting_human via the
+            # result-guard path, never via the bounded Codex
+            # takeover. PR #67 follow-up: the v2-aware result
+            # guard parks at AWAITING_HUMAN; the legacy terminal
+            # block stays at BLOCKED. Both are valid terminal
+            # failure states for a non-real result.
             rows = {r["id"]: r["state"] for r in state.task_rows("shell-takeover-test")}
-            self.assertEqual(rows["SHELL-CT-1"], "blocked")
+            self.assertIn(rows["SHELL-CT-1"], {"blocked", "awaiting_human"})
 
             with state.connect() as conn:
                 events = list(

@@ -1928,18 +1928,25 @@ class Orchestrator:
                     # Map the v2 category to the legacy
                     # category string the existing retry /
                     # takeover / block branches use.
+                    # PR #67 follow-up: ``MISSING_RESULT_LATE_MARKER``
+                    # and ``MISSING_RESULT_LOG_STILL_GROWING`` are
+                    # NEVER mapped to the legacy
+                    # ``MISSING_RESULT_CATEGORY``. They go through
+                    # the grace + reclassify path below; if they
+                    # survive the grace, they are parked, never
+                    # retried.
                     if _v2.category == "template":
                         _legacy_category = TEMPLATE_RESULT_CATEGORY
                         _v1_classification = "template"
-                    elif _v2.category in {
-                        MISSING_RESULT_NO_WORK,
-                        MISSING_RESULT_LOG_STILL_GROWING,
-                    }:
+                    elif _v2.category == MISSING_RESULT_NO_WORK:
                         _legacy_category = MISSING_RESULT_CATEGORY
                         _v1_classification = "absent"
                     elif _v2.category == MISSING_RESULT_LATE_MARKER:
                         _legacy_category = MISSING_RESULT_LATE_MARKER
                         _v1_classification = "missing"
+                    elif _v2.category == MISSING_RESULT_LOG_STILL_GROWING:
+                        _legacy_category = MISSING_RESULT_LOG_STILL_GROWING
+                        _v1_classification = "absent"
                     elif _v2.category == MISSING_RESULT_WITH_DIFF:
                         _legacy_category = MISSING_RESULT_WITH_DIFF
                         _v1_classification = "with_diff"
@@ -1947,18 +1954,28 @@ class Orchestrator:
                         _legacy_category = None
                         _v1_classification = "real"
                     _category = _v2.category
-                    # PR #67 (P3 hardening, Blocker C + D):
-                    # when the v2 classifier returns
-                    # ``MISSING_RESULT_LATE_MARKER`` and
-                    # the log might still be growing, grant
-                    # a bounded grace window and reclassify
-                    # at the end of the wait. After grace,
-                    # if the marker is still unparseable OR
-                    # the v2 still says ``LOG_STILL_GROWING``,
-                    # map to a fail-closed branch.
-                    if (
-                        _v2.category == MISSING_RESULT_LATE_MARKER
-                        and bool(_v2.should_wait)
+                    # PR #67 follow-up (Blocker C + D + log_still_growing):
+                    # when v2 returns
+                    # ``MISSING_RESULT_LATE_MARKER`` OR
+                    # ``MISSING_RESULT_LOG_STILL_GROWING``,
+                    # the orchestrator ALWAYS grants a bounded
+                    # grace window via
+                    # ``wait_for_log_growth_or_marker`` and then
+                    # reclassifies. After the wait:
+                    #
+                    # * ``real`` -> continue to validation.
+                    # * ``missing_result_with_diff`` -> the
+                    #   ``x_allow_missing_result_with_diff``
+                    #   policy applies.
+                    # * ``missing_result_no_work`` -> legacy
+                    #   retry is allowed.
+                    # * ``missing_result_late_marker`` or
+                    #   ``missing_result_log_still_growing`` ->
+                    #   park at AWAITING_HUMAN. NEVER retry,
+                    #   NEVER codex takeover.
+                    if _v2.category in (
+                        MISSING_RESULT_LATE_MARKER,
+                        MISSING_RESULT_LOG_STILL_GROWING,
                     ):
                         _grace = resolve_grace_seconds(
                             task.metadata if hasattr(task, "metadata") else None
@@ -2007,8 +2024,25 @@ class Orchestrator:
                                 elif _v2.category == MISSING_RESULT_LOG_STILL_GROWING:
                                     _legacy_category = MISSING_RESULT_LOG_STILL_GROWING
                                     _category = MISSING_RESULT_LOG_STILL_GROWING
+                                elif _v2.category == MISSING_RESULT_WITH_DIFF:
+                                    # Post-grace reclassify to
+                                    # ``missing_result_with_diff``
+                                    # is the same case the
+                                    # ``x_allow_missing_result_with_diff``
+                                    # policy below already handles;
+                                    # leave the category so the
+                                    # branch fires.
+                                    _legacy_category = MISSING_RESULT_WITH_DIFF
+                                    _category = MISSING_RESULT_WITH_DIFF
                                 else:
+                                    # ``missing_result_no_work``
+                                    # is the only category that
+                                    # allows a legacy retry; the
+                                    # late / log_still_growing
+                                    # categories are filtered
+                                    # above.
                                     _category = _v2.category
+                                    _legacy_category = MISSING_RESULT_CATEGORY
                     # PR #67 (P3 hardening, Blocker 5):
                     # ``missing_result_with_diff`` is a park
                     # signal by default; the task may opt in
@@ -2080,58 +2114,85 @@ class Orchestrator:
                     # ``missing_result_with_diff`` and
                     # ``missing_result_late_marker`` (when
                     # the log is no longer growing) MUST
-                    # NOT trigger the retry path. The
-                    # executor did real work or the
-                    # marker is broken; auto-retry would
-                    # duplicate the work.
+                    # PR #67 follow-up: the v2 categories
+                    # ``missing_result_with_diff``,
+                    # ``missing_result_late_marker`` and
+                    # ``missing_result_log_still_growing``
+                    # MUST NOT trigger the legacy retry /
+                    # codex-takeover path. The executor did
+                    # real work (with_diff) or the marker
+                    # is broken (late) or the log was still
+                    # being written when the guard fired
+                    # (log_still_growing). All three are
+                    # auto-retry hazards: the work would
+                    # be duplicated or the marker would
+                    # never parse. The orchestrator parks
+                    # or proceeds-to-validation as
+                    # appropriate, but it does NOT queue
+                    # another executor attempt and does
+                    # NOT trigger a Codex takeover.
                     _v2_skip_retry = (
                         _v2 is not None
                         and _v2.category
                         in (
                             MISSING_RESULT_WITH_DIFF,
                             MISSING_RESULT_LATE_MARKER,
+                            MISSING_RESULT_LOG_STILL_GROWING,
                         )
                     )
-                    # The ``MISSING_RESULT_NO_WORK`` /
-                    # ``MISSING_RESULT_LATE_MARKER`` /
-                    # ``MISSING_RESULT_LOG_STILL_GROWING``
-                    # categories are mapped to the
-                    # legacy ``MISSING_RESULT_CATEGORY`` for
-                    # the existing retry/takeover/block
-                    # branches. The v2 metadata is recorded
-                    # in the event payload for the runbook.
-                    if _v2 is not None and _category in {
-                        MISSING_RESULT_NO_WORK,
-                        MISSING_RESULT_LATE_MARKER,
-                        MISSING_RESULT_LOG_STILL_GROWING,
-                    }:
+                    # PR #67 follow-up: the late-marker
+                    # and log_still_growing categories are
+                    # NEVER mapped to the legacy
+                    # ``MISSING_RESULT_CATEGORY`` (the
+                    # pre-v2 retry signal). They keep
+                    # their own canonical categories so
+                    # the v2-aware code can park them
+                    # correctly. ``missing_result_no_work``
+                    # is the only v2 category that maps
+                    # to the legacy retry signal.
+                    if _v2 is not None and _category == MISSING_RESULT_NO_WORK:
                         _legacy_category = MISSING_RESULT_CATEGORY
                     elif _v2 is not None and _category == MISSING_RESULT_WITH_DIFF:
                         _legacy_category = MISSING_RESULT_WITH_DIFF
+                    elif _v2 is not None and _category == MISSING_RESULT_LATE_MARKER:
+                        _legacy_category = MISSING_RESULT_LATE_MARKER
+                    elif _v2 is not None and _category == MISSING_RESULT_LOG_STILL_GROWING:
+                        _legacy_category = MISSING_RESULT_LOG_STILL_GROWING
                     else:
                         _legacy_category = _category
-                    # Treat ``MISSING_RESULT_LATE_MARKER``
-                    # as a hard fail when the log is no
-                    # longer growing and the marker is
-                    # still unparseable: never queue a
-                    # duplicate repair. Map to BLOCKED
-                    # with the canonical category.
+                    # PR #67 follow-up: after the grace +
+                    # reclassify block, the v2 category is
+                    # still ``missing_result_late_marker``
+                    # or ``missing_result_log_still_growing``
+                    # when the marker never became
+                    # parseable. In either case the task
+                    # is parked: NEVER executor retry,
+                    # NEVER Codex takeover. The
+                    # ``should_wait`` flag is NOT consulted
+                    # here because the grace window has
+                    # already elapsed; the only remaining
+                    # safe action is the park.
                     if (
                         _v2 is not None
-                        and _v2.category == MISSING_RESULT_LATE_MARKER
-                        and not _v2.should_wait
+                        and _v2.category
+                        in (
+                            MISSING_RESULT_LATE_MARKER,
+                            MISSING_RESULT_LOG_STILL_GROWING,
+                        )
                     ):
                         # Park the task. Do NOT queue
                         # another executor repair; the
-                        # marker is broken and retrying
-                        # would duplicate the work.
+                        # marker is broken or the log is
+                        # still growing past the grace
+                        # window, and retrying would
+                        # duplicate the work.
                         self.state.event(
                             roadmap.roadmap_id,
                             task.id,
                             attempt_id,
                             "task.result_guard_blocked",
                             {
-                                "failure_category": MISSING_RESULT_LATE_MARKER,
+                                "failure_category": _v2.category,
                                 "exit_code": result.exit_code,
                                 "log_size": _v2.log_size,
                             },
@@ -2141,13 +2202,15 @@ class Orchestrator:
                             task.id,
                             TaskState.AWAITING_HUMAN,
                             {
-                                "reason": MISSING_RESULT_LATE_MARKER,
-                                "failure_category": MISSING_RESULT_LATE_MARKER,
+                                "reason": _v2.category,
+                                "failure_category": _v2.category,
                                 "hint": (
-                                    "Executor emitted a marker line but the body is "
-                                    "not parseable. Do NOT queue another executor "
-                                    "repair; the result is broken. Inspect the "
-                                    "combined log and recover manually."
+                                    "Executor did not produce a parseable "
+                                    "AGENTOPS_RESULT_JSON after the bounded "
+                                    "grace window. Do NOT queue another "
+                                    "executor repair and do NOT trigger a "
+                                    "Codex takeover. Inspect the combined log "
+                                    "and recover manually."
                                 ),
                             },
                         )
@@ -2156,7 +2219,7 @@ class Orchestrator:
                             "task.blocked_by_result_guard",
                             task.id,
                             extra={
-                                "failure_category": MISSING_RESULT_LATE_MARKER,
+                                "failure_category": _v2.category,
                             },
                         )
                         return
@@ -2251,9 +2314,25 @@ class Orchestrator:
                     # terminal BLOCK contract). When those gates do not
                     # hold we keep the terminal BLOCK behaviour so the
                     # safety default is unchanged.
+                    # PR #67 follow-up: the Codex takeover
+                    # only fires for
+                    # ``missing_result_no_work`` /
+                    # ``template`` (v1 categories). Late
+                    # marker and log_still_growing are
+                    # NEVER eligible: a broken marker or a
+                    # still-growing log would not be
+                    # recovered by a stronger reviewer; the
+                    # only safe action is to park the task
+                    # and let the operator recover.
                     _takeover_category = (
                         _legacy_category
                         in {MISSING_RESULT_CATEGORY, TEMPLATE_RESULT_CATEGORY}
+                        and _v2 is not None
+                        and _v2.category
+                        not in (
+                            MISSING_RESULT_LATE_MARKER,
+                            MISSING_RESULT_LOG_STILL_GROWING,
+                        )
                     )
                     _codex_allowed = (
                         self.options.autonomous
